@@ -445,6 +445,14 @@ In `proxy` mode a request to an admin route passes only if both hold:
 Any inbound copy of `AUTH_USER_HEADER` arriving from an untrusted peer is
 stripped before routing, so a direct caller cannot self-assert an identity.
 
+**Peer resolution is injected.** The middleware receives a `PeerResolver`
+function rather than reading the server binding directly. `@hono/node-server`
+populates `c.env.incoming` only for requests that arrive over a real socket; it
+is `undefined` under Hono's in-process `app.request()`, which is how the
+route-level tests in §12 run. Injection is what makes the auth matrix testable
+without opening sockets, and an unresolvable peer is treated as untrusted and
+denied — verified 2026-09-08 against `@hono/node-server` 2.1.1.
+
 **The drain endpoint is exempt**, because it authenticates by HMAC and Vercel
 cannot present an SSO identity. This inversion is the deployment footgun worth
 documenting prominently: the proxy must enforce SSO on `/` and `/api/admin/*`
@@ -526,10 +534,16 @@ Everything else lives in `config.json`.
 `docker-compose.example.yml` runs the service plus Loki, Grafana, and Caddy —
 Caddy specifically to demonstrate the SSO split described in §9.
 
-Runtime dependencies: `hono`, `@hono/node-server`, `zod`, `pino`. CIDR matching
-uses the built-in `net.BlockList`; ID generation uses `node:crypto`. Front end:
-`react`, `react-dom`, built by `vite`. Exact versions are resolved during
-implementation.
+Runtime dependencies: `hono` 4.13, `@hono/node-server` 2.1, `zod` 4.5, `pino`
+10.3. CIDR matching uses the built-in `net.BlockList`; ID generation uses
+`node:crypto`. Front end: `react` 19.2, built by `vite` 8.2. Tooling:
+`typescript` 7.0, `vitest` 5.0, `eslint` 10.10 with `@typescript-eslint` 8.70,
+`prettier` 3.9. Versions verified against the registry on 2026-09-08.
+
+Because `zod` 4 can express recursive JSON with `z.lazy` plus `.catchall()`, the
+event schema validates unknown passthrough fields as a `JsonValue` union rather
+than typing them `unknown` — which also satisfies the project's prohibition on
+`any` and `unknown`.
 
 ## 12. Testing strategy
 
