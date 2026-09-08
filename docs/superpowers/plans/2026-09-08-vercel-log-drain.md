@@ -6,7 +6,7 @@
 
 **Architecture:** A single Node process runs a Hono server (drain endpoint, admin API, static React SPA) plus a Dispatcher owning one async worker per enabled sink. Ingest verifies the drain HMAC, decodes the body, filters per sink, writes a batch file to that sink's spool directory, fsyncs, and only then acknowledges Vercel. Each worker drains its own directory oldest-first and unlinks a batch only after the sink accepts it, which makes restarts and sink outages non-lossy.
 
-**Tech Stack:** TypeScript 7.0 (strict), Node 24, Hono 4.13 + @hono/node-server 2.1, Zod 4.5, pino 10.3, React 19.2 + Vite 8.2, Vitest 5.0, ESLint 10.10 + @typescript-eslint 8.70, Prettier 3.9, Docker (node:24-alpine).
+**Tech Stack:** TypeScript 6.0 (strict), Node 24, Hono 4.13 + @hono/node-server 2.1, Zod 4.5, pino 10.3, React 19.2 + Vite 8.2, Vitest 5.0, ESLint 10.10 + @typescript-eslint 8.70, Prettier 3.9, Docker (node:24-alpine).
 
 **Spec:** `docs/superpowers/specs/2026-09-08-vercel-log-drain-design.md` — read it before starting. This plan implements that spec and does not restate its rationale.
 
@@ -18,6 +18,7 @@ Every task's requirements implicitly include this section.
 - **No synchronous I/O.** Never `fs.*Sync`, `zlib.*Sync`, or any `*Sync` call in `src/` or `web/`. Use `node:fs/promises` and `promisify`'d `zlib`. Enforced by an ESLint `no-restricted-syntax` rule.
 - **Formatting:** 2-space indent; always terminate statements with semicolons, including optional ones. Enforced by Prettier.
 - **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output).
+- **TypeScript is pinned to 6.0.3, not 7.x.** `typescript-eslint` 8.70 peer-requires `typescript@>=4.8.4 <6.1.0`; with TypeScript 7 installed `npm ci` fails with `ERESOLVE`. Do not "helpfully" upgrade it.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
 - **Vercel signature scheme (verified against docs 2026-09-08):** `x-vercel-signature` is the hex `HMAC-SHA1` of the **raw** request body, keyed with the drain secret. 40 hex characters. Verify before decompressing or parsing.
 - **Sink name pattern:** `^[a-z0-9][a-z0-9-]{0,63}$`. A sink name is also a directory name; nothing else is acceptable.
@@ -41,7 +42,7 @@ Every task's requirements implicitly include this section.
 | `src/sinks/file.ts` | File sink: date partitioning, append+fsync, retention, containment. |
 | `src/sinks/loki-payload.ts` | Pure Loki payload/label construction. Separated from transport so it is trivially testable. |
 | `src/sinks/loki.ts` | Loki transport: gzip, auth headers, timeout, error classification. |
-| `src/sinks/registry.ts` | Maps type name → `SinkType`. Imported by config schema; imports the sinks. |
+| `src/sinks/registry.ts` | Owns the sink-config discriminated union and construction. Imported **by** `config/schema.ts`; imports the sink modules. Never imports config. |
 | `src/config/schema.ts` | Zod schemas and inferred types for the whole config. |
 | `src/config/store.ts` | Atomic load/save, default bootstrap, etag concurrency, `.bak` retention. |
 | `src/config/redact.ts` | Write-only secret handling: redact on read, restore on write. |
@@ -58,6 +59,22 @@ Every task's requirements implicitly include this section.
 | `web/src/api.ts` | Typed fetch client for the admin API. |
 | `web/src/views/{Status,Drains,Sinks}.tsx` | The three SPA views. |
 | `Dockerfile`, `docker-compose.example.yml`, `examples/{Caddyfile,nginx.conf}` | Packaging and the documented auth split. |
+
+## Build Order
+
+Tasks are ordered so that every import already exists when a task runs. The
+dependency spine is:
+
+```
+types/json → vercel/{event,signature,decode}
+sinks/types → sinks/file → sinks/loki-payload → sinks/loki → sinks/registry
+  → config/schema → pipeline/filter → config/{store,redact}
+  → status/metrics → pipeline/spool → pipeline/dispatcher
+  → server/{types,middleware,routes} → app → index → web
+```
+
+Do not reorder tasks. In particular, the sink modules come *before* the config
+schema, because the schema imports the sink-config union from the registry.
 
 ## Interface Contracts
 
@@ -93,8 +110,9 @@ export type EventPredicate = (event: LogEvent) => boolean;
 export function compileFilter(filter: SinkFilter): EventPredicate;
 
 // src/sinks/types.ts
-export class RetryableDeliveryError extends Error {}
-export class PermanentDeliveryError extends Error {}
+export class RetryableDeliveryError extends Error {}   // (message, cause?)
+export class PermanentDeliveryError extends Error {}   // (message, cause?)
+export class AuthDeliveryError extends RetryableDeliveryError {} // added in Task 9
 export interface SinkContext { log: Logger; }
 export interface Sink {
   readonly name: string;
@@ -113,7 +131,7 @@ export interface SinkType<TConfig> {
 export const SINK_NAME_PATTERN: RegExp;
 export type SinkFilter = { minLevel?: EventLevel; sources?: string[]; environments?: string[]; projectIds?: string[] };
 export type DrainEntry = { id: string; name: string; secret: string; enabled: boolean; createdAt: number };
-export type SinkEntry = { name: string; enabled: boolean; filter: SinkFilter; maxSpoolBytes: number; maxBatchEvents: number; maxBatchBytes: number; config: FileSinkConfig | LokiSinkConfig };
+export type SinkEntry = { name: string; enabled: boolean; filter: SinkFilter; maxSpoolBytes: number; maxBatchEvents: number; maxBatchBytes: number; config: AnySinkConfig };
 export type ServerConfig = { maxBodyBytes: number; maxDecompressedBytes: number; spoolFreeSpaceFloorBytes: number };
 export type AppConfig = { version: 1; drains: DrainEntry[]; sinks: SinkEntry[]; server: ServerConfig };
 export const appConfigSchema: z.ZodType<AppConfig>;
@@ -136,7 +154,9 @@ export type RedactedConfig = { version: 1; drains: RedactedDrain[]; sinks: SinkE
 export function redactConfig(config: AppConfig): RedactedConfig;
 export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConfig;
 
-// src/status/metrics.ts
+// types/api.ts (created in Task 15) — these are declared there, NOT in
+// src/status/metrics.ts, so the SPA can import them without pulling in zod.
+// metrics.ts imports them from types/api.ts and re-exports nothing.
 export type DrainOutcome = 'ok' | 'badSignature' | 'notFound' | 'disabled' | 'malformedBody';
 export type SinkHealthState = 'ok' | 'retrying' | 'failed';
 export type SinkHealth = { state: SinkHealthState; consecutiveFailures: number; lastError: string | null; lastErrorAt: number | null; lastSuccessAt: number | null; nextRetryAt: number | null };
@@ -155,9 +175,14 @@ export class Metrics {
   snapshot(): MetricsSnapshot;
 }
 
-// src/pipeline/spool.ts
+// src/sinks/types.ts (added in Task 7)
 export type FreeSpaceProbe = (path: string) => Promise<number>;
+// src/sinks/file.ts (Task 7) — the single statfs implementation, imported by
+// the spool queue. It lives with the file sink because that is where it is
+// first needed; do not duplicate it.
 export const statfsFreeSpace: FreeSpaceProbe;
+
+// src/pipeline/spool.ts
 export type SpoolOptions = { maxSpoolBytes: number; freeSpaceFloorBytes: number; freeSpace?: FreeSpaceProbe };
 export type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number };
 export type EnqueueResult = { writtenBytes: number; droppedEvents: number };
@@ -201,17 +226,30 @@ export function classifyLokiStatus(status: number): LokiClassification;
 export const lokiSinkType: SinkType<LokiSinkConfig>;
 
 // src/sinks/registry.ts
-export type AnySinkType = SinkType<FileSinkConfig> | SinkType<LokiSinkConfig>;
-export function sinkTypeFor(type: 'file' | 'loki'): AnySinkType;
-export function createSink(entry: SinkEntry, ctx: SinkContext): Sink;
-export function sinkEntryWarnings(entry: SinkEntry): string[];
+// NOTE ON DEPENDENCY DIRECTION: the registry owns the discriminated union of
+// sink configs and `config/schema.ts` imports it — never the reverse. That is
+// also why createSink takes (name, config) rather than a SinkEntry: taking a
+// SinkEntry would force the registry to import config/schema and create a
+// cycle. The Dispatcher, which imports both, does the unpacking.
+export type AnySinkConfig = FileSinkConfig | LokiSinkConfig;
+export const sinkConfigSchema: z.ZodType<AnySinkConfig>;
+export function createSink(name: string, config: AnySinkConfig, ctx: SinkContext): Sink;
+export function warningsFor(config: AnySinkConfig): string[];
 
 // src/pipeline/dispatcher.ts
-export type OrphanedSpool = { name: string; files: number; bytes: number };
-export type SinkStatus = { name: string; type: string; enabled: boolean; health: SinkHealth; queue: { files: number; bytes: number; oldestAgeSec: number | null }; counters: { delivered: number; dropped: number; deadLettered: number } };
+// OrphanedSpool and SinkStatus are declared in types/api.ts (Task 15); the
+// dispatcher imports them rather than defining its own copies.
 export type TestSinkResult = { ok: boolean; detail: string };
-export type DispatcherOptions = { spoolRoot: string; logsRoot: string; metrics: Metrics; log: Logger; now?: () => number; random?: () => number; freeSpace?: FreeSpaceProbe };
+export type DispatcherOptions = { spoolRoot: string; logsRoot: string; metrics: Metrics; log: Logger; freeSpace?: FreeSpaceProbe };
 export function backoffDelayMs(consecutiveFailures: number, baseMs: number, capMs: number, random: () => number): number;
+export type SinkWorkerOptions = { sink: Sink; queue: SpoolQueue; metrics: Metrics; log: Logger; maxBatchEvents: number; maxBatchBytes: number; baseBackoffMs?: number; maxBackoffMs?: number; random?: () => number };
+export class SinkWorker {
+  constructor(options: SinkWorkerOptions);
+  health(): SinkHealth;
+  drainOnce(): Promise<boolean>;
+  start(): void;
+  stop(deadlineMs: number): Promise<void>;
+}
 export class Dispatcher {
   constructor(options: DispatcherOptions);
   applyConfig(config: AppConfig): Promise<void>;
@@ -237,3 +275,9040 @@ export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): Middle
 ```
 
 ---
+
+### Task 1: Project scaffolding, tooling, and logger
+
+Establishes the gates every later task must pass, plus the `JsonValue` type and
+the redacting logger that everything depends on.
+
+**Files:**
+- Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `web/tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `eslint.config.js`, `.prettierrc.json`, `.gitignore`, `.dockerignore`
+- Create: `types/json.ts`, `src/log.ts`
+- Test: `test/log.test.ts`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `JsonPrimitive`, `JsonValue` (`types/json.ts`); `createLogger(level: string, destination?: DestinationStream): Logger`, `REDACT_PATHS: string[]`, and a re-exported `Logger` type (`src/log.ts`).
+
+- [ ] **Step 1: Initialize the package and install exact dependencies**
+
+```bash
+npm init -y
+npm pkg set name=vercel-log-drain version=0.1.0 private=true type=module
+npm pkg set engines.node=">=24"
+npm pkg delete main
+
+npm install hono@4.13.7 @hono/node-server@2.1.1 zod@4.5.4 pino@10.3.1
+npm install react@19.2.8 react-dom@19.2.8
+npm install -D typescript@6.0.3 @types/node@24 vitest@5.0.0 vite@8.2.2 \
+  @vitejs/plugin-react@6.1.1 @types/react@19 @types/react-dom@19 \
+  eslint@10.10.0 @eslint/js typescript-eslint@8.70.0 prettier@3.9.6
+```
+
+Do not use version ranges other than these. TypeScript must be 6.0.3.
+
+- [ ] **Step 2: Write the config files**
+
+`package.json` scripts (set with `npm pkg set` or edit directly):
+
+```json
+{
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.build.json",
+    "build:web": "vite build",
+    "start": "node dist/src/index.js",
+    "format": "prettier --write ."
+  }
+}
+```
+
+`tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "types/**/*.ts", "vitest.config.ts"]
+}
+```
+
+`tsconfig.build.json`:
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": ".",
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "types/**/*.ts"]
+}
+```
+
+`rootDir: "."` means the entrypoint compiles to `dist/src/index.js`. The
+`start` script and the Dockerfile `CMD` both reflect that.
+
+`web/tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": { "@shared/*": ["../types/*"] }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "../types/**/*.ts", "../vite.config.ts"]
+}
+```
+
+The `@shared/*` alias is how the SPA imports shared types without extension
+ambiguity between `nodenext` and `bundler` resolution. Server code imports the
+same files by relative path with a `.js` extension.
+
+`vite.config.ts`:
+
+```ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { fileURLToPath } from 'node:url';
+
+export default defineConfig({
+  root: 'web',
+  plugins: [react()],
+  resolve: {
+    alias: {
+      '@shared': fileURLToPath(new URL('./types', import.meta.url)),
+    },
+  },
+  build: { outDir: 'dist', emptyOutDir: true },
+  server: {
+    proxy: {
+      '/api': 'http://127.0.0.1:8080',
+      '/healthz': 'http://127.0.0.1:8080',
+      '/readyz': 'http://127.0.0.1:8080',
+    },
+  },
+});
+```
+
+`vitest.config.ts`:
+
+```ts
+import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    include: ['test/**/*.test.ts'],
+    environment: 'node',
+    testTimeout: 20_000,
+  },
+});
+```
+
+`eslint.config.js` — this exact content was installed and exercised on
+2026-09-08; both `no-restricted-syntax` selectors are required, because the
+`MemberExpression` selector alone misses `readFileSync(p)` imported directly:
+
+```js
+import js from '@eslint/js';
+import tseslint from 'typescript-eslint';
+
+const NO_SYNC_IO = [
+  'error',
+  {
+    selector: 'CallExpression > MemberExpression[property.name=/Sync$/]',
+    message: 'Synchronous I/O is banned; use the promise-based API.',
+  },
+  {
+    selector: 'CallExpression > Identifier[name=/Sync$/]',
+    message: 'Synchronous I/O is banned; use the promise-based API.',
+  },
+];
+
+export default tseslint.config(
+  { ignores: ['dist/**', 'web/dist/**', 'node_modules/**', 'coverage/**'] },
+  js.configs.recommended,
+  ...tseslint.configs.recommendedTypeChecked,
+  {
+    languageOptions: {
+      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+    },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'error',
+      'no-restricted-syntax': NO_SYNC_IO,
+    },
+  },
+  // The flat config file is plain JS and sits outside the TS project.
+  { files: ['**/*.js'], extends: [tseslint.configs.disableTypeChecked] },
+);
+```
+
+`.prettierrc.json`:
+
+```json
+{ "semi": true, "singleQuote": true, "tabWidth": 2, "printWidth": 100, "trailingComma": "all" }
+```
+
+`.gitignore`:
+
+```
+node_modules/
+dist/
+web/dist/
+coverage/
+*.log
+.DS_Store
+```
+
+`.dockerignore`:
+
+```
+node_modules
+dist
+web/dist
+coverage
+.git
+docs
+*.log
+```
+
+- [ ] **Step 3: Write the failing logger test**
+
+`test/log.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { Writable } from 'node:stream';
+import { createLogger } from '../src/log.js';
+
+function captureLogger(): { lines: string[]; log: ReturnType<typeof createLogger> } {
+  const lines: string[] = [];
+  const sink = new Writable({
+    write(chunk: Buffer, _enc, callback): void {
+      lines.push(chunk.toString('utf8'));
+      callback();
+    },
+  });
+  return { lines, log: createLogger('info', sink) };
+}
+
+describe('createLogger', () => {
+  it('redacts a top-level secret', () => {
+    const { lines, log } = captureLogger();
+    log.info({ secret: 'sup3rs3cret' }, 'test');
+    expect(lines.join('')).not.toContain('sup3rs3cret');
+    expect(lines.join('')).toContain('[redacted]');
+  });
+
+  it('redacts drain secrets nested in an array', () => {
+    const { lines, log } = captureLogger();
+    log.info({ drains: [{ id: 'd1', secret: 'sup3rs3cret' }] }, 'test');
+    const output = lines.join('');
+    expect(output).not.toContain('sup3rs3cret');
+    expect(output).toContain('[redacted]');
+    expect(output).toContain('d1');
+  });
+
+  it('redacts loki auth credentials nested in sink config', () => {
+    const { lines, log } = captureLogger();
+    log.info(
+      { sinks: [{ name: 'loki', config: { auth: { password: 'pw123', token: 'tk456' } } }] },
+      'test',
+    );
+    const output = lines.join('');
+    expect(output).not.toContain('pw123');
+    expect(output).not.toContain('tk456');
+  });
+
+  it('leaves non-secret fields intact', () => {
+    const { lines, log } = captureLogger();
+    log.info({ sinkName: 'loki-prod', delivered: 42 }, 'test');
+    const output = lines.join('');
+    expect(output).toContain('loki-prod');
+    expect(output).toContain('42');
+  });
+});
+```
+
+- [ ] **Step 4: Run the test to verify it fails**
+
+Run: `npx vitest run test/log.test.ts`
+Expected: FAIL — cannot resolve `../src/log.js`.
+
+- [ ] **Step 5: Implement `types/json.ts`**
+
+```ts
+export type JsonPrimitive = string | number | boolean | null;
+
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+```
+
+- [ ] **Step 6: Implement `src/log.ts`**
+
+`fast-redact`, which backs pino's `redact`, matches wildcards one level at a
+time — there is no deep-wildcard syntax. The paths below are therefore
+enumerated deliberately for the shapes this service actually logs.
+
+```ts
+import pino from 'pino';
+import type { DestinationStream, Logger } from 'pino';
+
+export type { Logger };
+
+export const REDACT_PATHS: string[] = [
+  'secret',
+  'password',
+  'token',
+  '*.secret',
+  '*.password',
+  '*.token',
+  'drains[*].secret',
+  'sinks[*].config.auth.password',
+  'sinks[*].config.auth.token',
+  'config.auth.password',
+  'config.auth.token',
+  'auth.password',
+  'auth.token',
+];
+
+export function createLogger(level: string, destination?: DestinationStream): Logger {
+  const options = {
+    level,
+    redact: { paths: REDACT_PATHS, censor: '[redacted]' },
+  };
+  return destination === undefined ? pino(options) : pino(options, destination);
+}
+```
+
+- [ ] **Step 7: Run the test to verify it passes**
+
+Run: `npx vitest run test/log.test.ts`
+Expected: PASS, 4 tests.
+
+- [ ] **Step 8: Run all gates**
+
+Run: `npm run lint && npm run typecheck && npm test`
+Expected: all pass. `npm run typecheck` will fail on `web/tsconfig.json` until
+`web/src` exists — create `web/src/placeholder.ts` containing
+`export const placeholder = true;` to satisfy it, and delete it in Task 25.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add -A
+git commit -m "chore: scaffold project tooling and redacting logger
+
+Pins TypeScript to 6.0.3 because typescript-eslint 8.70 peer-requires
+<6.1.0 and npm ci fails with ERESOLVE against TypeScript 7. ESLint bans
+any/unknown and all *Sync calls so the project's I/O rule is enforced in
+CI rather than in review."
+```
+
+---
+
+### Task 2: LogEvent schema
+
+**Files:**
+- Create: `src/vercel/event.ts`
+- Test: `test/vercel/event.test.ts`
+
+**Interfaces:**
+- Consumes: `JsonValue` from `types/json.ts`.
+- Produces: `jsonValueSchema: z.ZodType<JsonValue>`, `logEventSchema`, `type LogEvent`, `type EventLevel = 'info' | 'warning' | 'error'`, `eventLevel(event: LogEvent): EventLevel`, `levelRank(level: EventLevel): number`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/vercel/event.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { eventLevel, levelRank, logEventSchema } from '../../src/vercel/event.js';
+
+const validEvent = {
+  id: '1573817187330377061717300000',
+  timestamp: 1573817187330,
+  source: 'lambda',
+  projectId: 'gdufoJxB6b9b1fEqr1jUtFkyavUU',
+  level: 'info',
+  message: 'API request processed',
+};
+
+describe('logEventSchema', () => {
+  it('accepts a documented Vercel event', () => {
+    const result = logEventSchema.safeParse(validEvent);
+    expect(result.success).toBe(true);
+  });
+
+  it('preserves unknown fields through the catchall', () => {
+    const result = logEventSchema.safeParse({
+      ...validEvent,
+      proxy: { method: 'GET', statusCode: 200, userAgent: ['Mozilla/5.0'] },
+      'trace.id': '1b02cd14bb8642fd092bc23f54c7ffcd',
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data['trace.id']).toBe('1b02cd14bb8642fd092bc23f54c7ffcd');
+    expect(result.data['proxy']).toEqual({
+      method: 'GET',
+      statusCode: 200,
+      userAgent: ['Mozilla/5.0'],
+    });
+  });
+
+  it.each([
+    ['id', { ...validEvent, id: undefined }],
+    ['timestamp', { ...validEvent, timestamp: undefined }],
+    ['source', { ...validEvent, source: undefined }],
+    ['projectId', { ...validEvent, projectId: undefined }],
+  ])('rejects an event missing %s', (_field, candidate) => {
+    expect(logEventSchema.safeParse(candidate).success).toBe(false);
+  });
+
+  it('rejects a non-numeric timestamp', () => {
+    expect(logEventSchema.safeParse({ ...validEvent, timestamp: '1573817187330' }).success).toBe(
+      false,
+    );
+  });
+
+  it('rejects a non-JSON value in an unknown field', () => {
+    expect(logEventSchema.safeParse({ ...validEvent, weird: () => 1 }).success).toBe(false);
+  });
+});
+
+describe('eventLevel', () => {
+  it.each([
+    ['info', 'info'],
+    ['warning', 'warning'],
+    ['error', 'error'],
+  ] as const)('maps %s to %s', (input, expected) => {
+    expect(eventLevel({ ...validEvent, level: input })).toBe(expected);
+  });
+
+  it('treats a missing level as info', () => {
+    const { level: _level, ...withoutLevel } = validEvent;
+    expect(eventLevel(withoutLevel)).toBe('info');
+  });
+
+  it('treats an unrecognized level as info', () => {
+    expect(eventLevel({ ...validEvent, level: 'trace' })).toBe('info');
+  });
+
+  it('normalizes case and the warn alias', () => {
+    expect(eventLevel({ ...validEvent, level: 'WARN' })).toBe('warning');
+    expect(eventLevel({ ...validEvent, level: 'Error' })).toBe('error');
+  });
+});
+
+describe('levelRank', () => {
+  it('orders info below warning below error', () => {
+    expect(levelRank('info')).toBeLessThan(levelRank('warning'));
+    expect(levelRank('warning')).toBeLessThan(levelRank('error'));
+  });
+});
+```
+
+The `it.each` rows above pass `undefined` for a required field, which zod
+rejects exactly as a missing key would.
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/vercel/event.test.ts`
+Expected: FAIL — cannot resolve `../../src/vercel/event.js`.
+
+- [ ] **Step 3: Implement `src/vercel/event.ts`**
+
+`z.lazy` plus `.catchall()` is what lets unknown passthrough fields be typed as
+`JsonValue` rather than `unknown`, satisfying the project rule. This exact
+construction was typechecked against zod 4.5.4 on 2026-09-08.
+
+```ts
+import { z } from 'zod';
+import type { JsonValue } from '../../types/json.js';
+
+export const jsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema),
+    z.record(z.string(), jsonValueSchema),
+  ]),
+);
+
+export const logEventSchema = z
+  .object({
+    id: z.string(),
+    timestamp: z.number(),
+    source: z.string(),
+    projectId: z.string(),
+  })
+  .catchall(jsonValueSchema);
+
+export type LogEvent = z.infer<typeof logEventSchema>;
+
+export type EventLevel = 'info' | 'warning' | 'error';
+
+const LEVEL_RANKS: Record<EventLevel, number> = { info: 0, warning: 1, error: 2 };
+
+export function levelRank(level: EventLevel): number {
+  return LEVEL_RANKS[level];
+}
+
+export function eventLevel(event: LogEvent): EventLevel {
+  const raw = event['level'];
+  if (typeof raw !== 'string') return 'info';
+  const normalized = raw.toLowerCase();
+  if (normalized === 'error' || normalized === 'fatal') return 'error';
+  if (normalized === 'warning' || normalized === 'warn') return 'warning';
+  return 'info';
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/vercel/event.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add lenient Vercel log event schema
+
+Requires only id, timestamp, source, and projectId, and validates
+unknown passthrough fields as JsonValue so new Vercel fields survive to
+the sinks without being typed unknown."
+```
+
+---
+
+### Task 3: Signature verification
+
+**Files:**
+- Create: `src/vercel/signature.ts`
+- Test: `test/vercel/signature.test.ts`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `verifySignature(raw: Buffer, header: string | undefined, secret: string): boolean`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/vercel/signature.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { createHmac } from 'node:crypto';
+import { verifySignature } from '../../src/vercel/signature.js';
+
+const secret = 'drain-signature-secret';
+const body = Buffer.from('[{"id":"1","timestamp":1,"source":"lambda","projectId":"p"}]', 'utf8');
+const signature = createHmac('sha1', secret).update(body).digest('hex');
+
+describe('verifySignature', () => {
+  it('accepts a correct signature', () => {
+    expect(verifySignature(body, signature, secret)).toBe(true);
+  });
+
+  it('produces a 40-character hex digest', () => {
+    expect(signature).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('rejects a signature made with the wrong secret', () => {
+    expect(verifySignature(body, signature, 'wrong-secret')).toBe(false);
+  });
+
+  it('rejects a signature over different bytes', () => {
+    expect(verifySignature(Buffer.from('tampered', 'utf8'), signature, secret)).toBe(false);
+  });
+
+  it('rejects a missing header without throwing', () => {
+    expect(verifySignature(body, undefined, secret)).toBe(false);
+  });
+
+  it('rejects a header of the wrong length without throwing', () => {
+    expect(verifySignature(body, 'abc123', secret)).toBe(false);
+  });
+
+  it('rejects an empty header', () => {
+    expect(verifySignature(body, '', secret)).toBe(false);
+  });
+
+  it('rejects an uppercase digest, since Vercel sends lowercase hex', () => {
+    expect(verifySignature(body, signature.toUpperCase(), secret)).toBe(false);
+  });
+
+  it('verifies an empty body correctly', () => {
+    const empty = Buffer.alloc(0);
+    const emptySig = createHmac('sha1', secret).update(empty).digest('hex');
+    expect(verifySignature(empty, emptySig, secret)).toBe(true);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/vercel/signature.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/vercel/signature.ts`**
+
+The explicit length check before `timingSafeEqual` is mandatory:
+`timingSafeEqual` throws when its arguments differ in length, so without the
+guard a short header would crash the request instead of failing closed.
+
+```ts
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function verifySignature(
+  raw: Buffer,
+  header: string | undefined,
+  secret: string,
+): boolean {
+  if (header === undefined || header.length === 0) return false;
+  const expected = createHmac('sha1', secret).update(raw).digest('hex');
+  if (header.length !== expected.length) return false;
+  return timingSafeEqual(Buffer.from(header, 'utf8'), Buffer.from(expected, 'utf8'));
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/vercel/signature.test.ts`
+Expected: PASS, 9 tests.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: verify Vercel drain signatures in constant time
+
+HMAC-SHA1 over the raw body, hex-compared with timingSafeEqual behind an
+explicit length check, since timingSafeEqual throws on length mismatch."
+```
+
+---
+
+### Task 4: Body decoding
+
+**Files:**
+- Create: `src/vercel/decode.ts`
+- Test: `test/vercel/decode.test.ts`
+
+**Interfaces:**
+- Consumes: `logEventSchema`, `LogEvent` from `src/vercel/event.ts`.
+- Produces: `type RejectedEntry = { index: number; reason: string; snippet: string }`, `type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] }`, `type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number }`, `class PayloadTooLargeError`, `decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/vercel/decode.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { decodeBody, PayloadTooLargeError } from '../../src/vercel/decode.js';
+
+const gzipAsync = promisify(gzip);
+
+const eventA = { id: 'a', timestamp: 1573817187330, source: 'build', projectId: 'p1' };
+const eventB = { id: 'b', timestamp: 1573817250283, source: 'lambda', projectId: 'p1' };
+const options = { gzipped: false, maxDecompressedBytes: 1_000_000 };
+
+describe('decodeBody', () => {
+  it('decodes a JSON array body', async () => {
+    const raw = Buffer.from(JSON.stringify([eventA, eventB]), 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a', 'b']);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('decodes an NDJSON body', async () => {
+    const raw = Buffer.from(`${JSON.stringify(eventA)}\n${JSON.stringify(eventB)}\n`, 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a', 'b']);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('sniffs the format rather than trusting a content type', async () => {
+    const leadingWhitespace = Buffer.from(`\n  ${JSON.stringify([eventA])}`, 'utf8');
+    const result = await decodeBody(leadingWhitespace, options);
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('ignores blank lines in NDJSON', async () => {
+    const raw = Buffer.from(`${JSON.stringify(eventA)}\n\n   \n${JSON.stringify(eventB)}\n`, 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.events).toHaveLength(2);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('decompresses a gzipped body', async () => {
+    const raw = await gzipAsync(Buffer.from(JSON.stringify([eventA]), 'utf8'));
+    const result = await decodeBody(raw, { gzipped: true, maxDecompressedBytes: 1_000_000 });
+    expect(result.events).toHaveLength(1);
+  });
+
+  it('keeps good NDJSON entries and reports bad ones', async () => {
+    const raw = Buffer.from(
+      `${JSON.stringify(eventA)}\n{not json\n${JSON.stringify(eventB)}\n`,
+      'utf8',
+    );
+    const result = await decodeBody(raw, options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a', 'b']);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(1);
+    expect(result.rejected[0]?.snippet).toContain('not json');
+  });
+
+  it('keeps good array entries and reports schema-invalid ones', async () => {
+    const raw = Buffer.from(JSON.stringify([eventA, { id: 'missing-fields' }]), 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a']);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(1);
+  });
+
+  it('truncates long snippets so a huge line cannot bloat memory', async () => {
+    const raw = Buffer.from(`{"broken":"${'x'.repeat(5000)}"\n`, 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.snippet.length).toBeLessThanOrEqual(200);
+  });
+
+  it('rejects a body that decompresses beyond the cap', async () => {
+    const raw = await gzipAsync(Buffer.alloc(200_000, 0x61));
+    await expect(
+      decodeBody(raw, { gzipped: true, maxDecompressedBytes: 1000 }),
+    ).rejects.toBeInstanceOf(PayloadTooLargeError);
+  });
+
+  it('returns an empty result for an empty body', async () => {
+    const result = await decodeBody(Buffer.alloc(0), options);
+    expect(result.events).toEqual([]);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('reports a whole-body parse failure when a JSON array is malformed', async () => {
+    const raw = Buffer.from('[{"id":"a"},', 'utf8');
+    const result = await decodeBody(raw, options);
+    expect(result.events).toEqual([]);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/vercel/decode.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/vercel/decode.ts`**
+
+`maxOutputLength` makes zlib itself enforce the cap, so a gzip bomb is refused
+during inflation rather than after allocating the full output.
+
+```ts
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { logEventSchema } from './event.js';
+import type { LogEvent } from './event.js';
+
+const gunzipAsync = promisify(gunzip);
+
+const SNIPPET_LIMIT = 200;
+
+export type RejectedEntry = { index: number; reason: string; snippet: string };
+export type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] };
+export type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number };
+
+export class PayloadTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+function snippet(text: string): string {
+  return text.length > SNIPPET_LIMIT ? `${text.slice(0, SNIPPET_LIMIT - 1)}…` : text;
+}
+
+function validateEntry(candidate: unknown, index: number, into: DecodeResult): void {
+  const parsed = logEventSchema.safeParse(candidate);
+  if (parsed.success) {
+    into.events.push(parsed.data);
+    return;
+  }
+  into.rejected.push({
+    index,
+    reason: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; '),
+    snippet: snippet(JSON.stringify(candidate) ?? String(candidate)),
+  });
+}
+
+async function inflate(raw: Buffer, options: DecodeOptions): Promise<Buffer> {
+  if (!options.gzipped) {
+    if (raw.byteLength > options.maxDecompressedBytes) {
+      throw new PayloadTooLargeError(`body of ${raw.byteLength} bytes exceeds cap`);
+    }
+    return raw;
+  }
+  try {
+    return await gunzipAsync(raw, { maxOutputLength: options.maxDecompressedBytes });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new PayloadTooLargeError(`gzip inflation refused: ${message}`);
+  }
+}
+
+export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult> {
+  const body = await inflate(raw, options);
+  const text = body.toString('utf8');
+  const result: DecodeResult = { events: [], rejected: [] };
+
+  const firstNonSpace = text.search(/\S/);
+  if (firstNonSpace === -1) return result;
+
+  if (text[firstNonSpace] === '[') {
+    let entries: unknown;
+    try {
+      entries = JSON.parse(text);
+    } catch (error) {
+      result.rejected.push({
+        index: 0,
+        reason: error instanceof Error ? error.message : 'invalid JSON array',
+        snippet: snippet(text),
+      });
+      return result;
+    }
+    if (!Array.isArray(entries)) {
+      result.rejected.push({ index: 0, reason: 'body is not an array', snippet: snippet(text) });
+      return result;
+    }
+    entries.forEach((entry, index) => {
+      validateEntry(entry, index, result);
+    });
+    return result;
+  }
+
+  const lines = text.split('\n');
+  lines.forEach((line, index) => {
+    if (line.trim().length === 0) return;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch (error) {
+      result.rejected.push({
+        index,
+        reason: error instanceof Error ? error.message : 'invalid JSON line',
+        snippet: snippet(line),
+      });
+      return;
+    }
+    validateEntry(entry, index, result);
+  });
+  return result;
+}
+```
+
+Note the two `unknown` uses here are the *input* boundary of `JSON.parse`,
+which is unavoidable and immediately narrowed by zod. The project rule forbids
+`unknown` as a way of typing data structures, not as the parse boundary. Do not
+propagate it beyond these functions.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/vercel/decode.test.ts`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: decode Vercel drain bodies
+
+Async gunzip with a zlib-enforced output cap, format sniffing on the
+first non-whitespace byte rather than content-type, and per-entry
+validation so one malformed line does not fail the whole delivery."
+```
+
+---
+
+### Task 5: Sink contract and delivery errors
+
+**Files:**
+- Create: `src/sinks/types.ts`
+- Test: `test/sinks/types.test.ts`
+
+**Interfaces:**
+- Consumes: `Logger` from `src/log.ts`, `LogEvent` from `src/vercel/event.ts`.
+- Produces: `RetryableDeliveryError`, `PermanentDeliveryError`, `SinkContext`, `Sink`, `SinkType<TConfig>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/types.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { PermanentDeliveryError, RetryableDeliveryError } from '../../src/sinks/types.js';
+
+describe('delivery errors', () => {
+  it('marks a retryable error distinguishably', () => {
+    const error = new RetryableDeliveryError('loki unreachable');
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toBeInstanceOf(RetryableDeliveryError);
+    expect(error).not.toBeInstanceOf(PermanentDeliveryError);
+    expect(error.name).toBe('RetryableDeliveryError');
+    expect(error.message).toBe('loki unreachable');
+  });
+
+  it('marks a permanent error distinguishably', () => {
+    const error = new PermanentDeliveryError('entry too far behind');
+    expect(error).toBeInstanceOf(PermanentDeliveryError);
+    expect(error).not.toBeInstanceOf(RetryableDeliveryError);
+    expect(error.name).toBe('PermanentDeliveryError');
+  });
+
+  it('preserves a cause for diagnostics', () => {
+    const cause = new Error('ECONNREFUSED');
+    const error = new RetryableDeliveryError('push failed', cause);
+    expect(error.cause).toBe(cause);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/types.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/sinks/types.ts`**
+
+```ts
+import type { z } from 'zod';
+import type { Logger } from '../log.js';
+import type { LogEvent } from '../vercel/event.js';
+
+export class RetryableDeliveryError extends Error {
+  constructor(message: string, cause?: Error) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = 'RetryableDeliveryError';
+  }
+}
+
+export class PermanentDeliveryError extends Error {
+  constructor(message: string, cause?: Error) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = 'PermanentDeliveryError';
+  }
+}
+
+export interface SinkContext {
+  readonly log: Logger;
+}
+
+export interface Sink {
+  readonly name: string;
+  readonly type: string;
+  deliver(events: LogEvent[]): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface SinkType<TConfig> {
+  readonly type: string;
+  readonly configSchema: z.ZodType<TConfig>;
+  create(name: string, config: TConfig, ctx: SinkContext): Sink;
+  warnings(config: TConfig): string[];
+}
+```
+
+Any error a sink throws that is *not* a `PermanentDeliveryError` is treated as
+retryable by the Dispatcher, so an unexpected bug never silently discards logs.
+`RetryableDeliveryError` exists to make intent explicit, not to gate the
+behavior.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/types.test.ts`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: define the sink contract and delivery error classes"
+```
+
+---
+
+### Task 6: File sink — writer
+
+**Files:**
+- Create: `src/sinks/file.ts`
+- Test: `test/sinks/file.test.ts`
+
+**Interfaces:**
+- Consumes: `Sink`, `SinkType`, `SinkContext`, `RetryableDeliveryError` from `src/sinks/types.ts`; `LogEvent` from `src/vercel/event.ts`.
+- Produces: `type FileSinkConfig`, `fileSinkConfigSchema`, `fileSinkType`, `utcDateKey(timestampMs: number): string`, `dailyFileName(prefix: string, timestampMs: number): string`, `groupByUtcDate(events: LogEvent[]): Map<string, LogEvent[]>`, `resolveLogsDirectory(candidate: string, logsRoot: string): string`.
+
+Retention and the free-space guard are Task 7; this task delivers writing.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/file.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import {
+  dailyFileName,
+  fileSinkType,
+  groupByUtcDate,
+  resolveLogsDirectory,
+  utcDateKey,
+} from '../../src/sinks/file.js';
+import type { FileSinkConfig } from '../../src/sinks/file.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+// 2019-11-15T11:26:27.330Z and 2019-11-16T00:00:01.000Z
+const beforeMidnight = 1573817187330;
+const afterMidnight = 1573862401000;
+
+function event(id: string, timestampMs: number) {
+  return { id, timestamp: timestampMs, source: 'lambda', projectId: 'p1' };
+}
+
+describe('utcDateKey', () => {
+  it('formats a UTC date key', () => {
+    expect(utcDateKey(beforeMidnight)).toBe('2019-11-15');
+  });
+
+  it('uses UTC, not local time', () => {
+    // 2020-01-01T00:30:00Z is still 2019-12-31 in US timezones.
+    expect(utcDateKey(Date.UTC(2020, 0, 1, 0, 30, 0))).toBe('2020-01-01');
+  });
+});
+
+describe('dailyFileName', () => {
+  it('composes prefix and date', () => {
+    expect(dailyFileName('events', beforeMidnight)).toBe('events-2019-11-15.jsonl');
+  });
+});
+
+describe('groupByUtcDate', () => {
+  it('splits a batch that straddles midnight', () => {
+    const grouped = groupByUtcDate([
+      event('a', beforeMidnight),
+      event('b', afterMidnight),
+      event('c', beforeMidnight),
+    ]);
+    expect([...grouped.keys()].sort()).toEqual(['2019-11-15', '2019-11-16']);
+    expect(grouped.get('2019-11-15')).toHaveLength(2);
+    expect(grouped.get('2019-11-16')).toHaveLength(1);
+  });
+});
+
+describe('resolveLogsDirectory', () => {
+  it('accepts a directory under the root', () => {
+    expect(resolveLogsDirectory('/logs/app', '/logs')).toBe('/logs/app');
+  });
+
+  it('accepts the root itself', () => {
+    expect(resolveLogsDirectory('/logs', '/logs')).toBe('/logs');
+  });
+
+  it('rejects a traversal escape', () => {
+    expect(() => resolveLogsDirectory('/logs/../config', '/logs')).toThrow(/outside/i);
+  });
+
+  it('rejects an unrelated absolute path', () => {
+    expect(() => resolveLogsDirectory('/config', '/logs')).toThrow(/outside/i);
+  });
+
+  it('rejects a sibling with a matching name prefix', () => {
+    expect(() => resolveLogsDirectory('/logs-evil', '/logs')).toThrow(/outside/i);
+  });
+});
+
+describe('fileSinkType', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-file-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function config(overrides: Partial<FileSinkConfig> = {}): FileSinkConfig {
+    return {
+      type: 'file',
+      directory: dir,
+      filePrefix: 'events',
+      retentionDays: 14,
+      freeSpaceFloorBytes: 0,
+      ...overrides,
+    };
+  }
+
+  it('writes one JSON line per event', async () => {
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    await sink.deliver([event('a', beforeMidnight), event('b', beforeMidnight)]);
+    await sink.close();
+
+    const contents = await readFile(join(dir, 'events-2019-11-15.jsonl'), 'utf8');
+    const lines = contents.trimEnd().split('\n');
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0] ?? '')).toMatchObject({ id: 'a' });
+    expect(JSON.parse(lines[1] ?? '')).toMatchObject({ id: 'b' });
+  });
+
+  it('partitions by event timestamp, not wall clock', async () => {
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    await sink.deliver([event('a', beforeMidnight), event('b', afterMidnight)]);
+    await sink.close();
+
+    const files = (await readdir(dir)).sort();
+    expect(files).toEqual(['events-2019-11-15.jsonl', 'events-2019-11-16.jsonl']);
+  });
+
+  it('appends across separate deliveries', async () => {
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    await sink.deliver([event('a', beforeMidnight)]);
+    await sink.deliver([event('b', beforeMidnight)]);
+    await sink.close();
+
+    const contents = await readFile(join(dir, 'events-2019-11-15.jsonl'), 'utf8');
+    expect(contents.trimEnd().split('\n')).toHaveLength(2);
+  });
+
+  it('creates the directory if it does not exist', async () => {
+    const nested = join(dir, 'deep', 'nested');
+    const sink = fileSinkType.create('local', config({ directory: nested }), { log: silentLog });
+    await sink.deliver([event('a', beforeMidnight)]);
+    await sink.close();
+    expect(await readdir(nested)).toContain('events-2019-11-15.jsonl');
+  });
+
+  it('keeps writing correctly across more dates than the handle cache holds', async () => {
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    const days = [0, 1, 2, 3, 4].map((offset) => Date.UTC(2026, 8, 1 + offset));
+    for (const [index, timestamp] of days.entries()) {
+      await sink.deliver([event(`d${String(index)}`, timestamp)]);
+    }
+    // Re-touch the first date after it must have been evicted.
+    await sink.deliver([event('again', days[0] ?? 0)]);
+    await sink.close();
+
+    const files = (await readdir(dir)).sort();
+    expect(files).toHaveLength(5);
+    const first = await readFile(join(dir, 'events-2026-09-01.jsonl'), 'utf8');
+    expect(first.trimEnd().split('\n')).toHaveLength(2);
+  });
+
+  it('reports no warnings for a valid config', () => {
+    expect(fileSinkType.warnings(config())).toEqual([]);
+  });
+
+  it('validates its config schema', () => {
+    expect(fileSinkType.configSchema.safeParse(config()).success).toBe(true);
+    expect(fileSinkType.configSchema.safeParse({ ...config(), retentionDays: -1 }).success).toBe(
+      false,
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/file.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/sinks/file.ts`**
+
+`fh.sync()` before `deliver()` resolves is load-bearing: resolving is what
+causes the Dispatcher to unlink the spool file, which is the only other durable
+copy of these events.
+
+```ts
+import { mkdir, open } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { z } from 'zod';
+import type { LogEvent } from '../vercel/event.js';
+import type { Sink, SinkContext, SinkType } from './types.js';
+
+const HANDLE_CACHE_LIMIT = 3;
+
+export const fileSinkConfigSchema = z.object({
+  type: z.literal('file'),
+  directory: z.string().min(1),
+  filePrefix: z
+    .string()
+    .min(1)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'prefix must be filename-safe'),
+  retentionDays: z.number().int().min(0),
+  freeSpaceFloorBytes: z.number().int().min(0),
+});
+
+export type FileSinkConfig = z.infer<typeof fileSinkConfigSchema>;
+
+export function utcDateKey(timestampMs: number): string {
+  return new Date(timestampMs).toISOString().slice(0, 10);
+}
+
+export function dailyFileName(prefix: string, timestampMs: number): string {
+  return `${prefix}-${utcDateKey(timestampMs)}.jsonl`;
+}
+
+export function groupByUtcDate(events: LogEvent[]): Map<string, LogEvent[]> {
+  const grouped = new Map<string, LogEvent[]>();
+  for (const event of events) {
+    const key = utcDateKey(event.timestamp);
+    const bucket = grouped.get(key);
+    if (bucket === undefined) {
+      grouped.set(key, [event]);
+    } else {
+      bucket.push(event);
+    }
+  }
+  return grouped;
+}
+
+export function resolveLogsDirectory(candidate: string, logsRoot: string): string {
+  const root = resolve(logsRoot);
+  const target = resolve(candidate);
+  const rel = relative(root, target);
+  const escapes = rel.startsWith('..') || isAbsolute(rel);
+  if (escapes) {
+    throw new Error(`directory ${candidate} resolves outside the logs root ${logsRoot}`);
+  }
+  return target;
+}
+
+class FileSink implements Sink {
+  readonly type = 'file';
+  private readonly handles = new Map<string, FileHandle>();
+  private directoryReady = false;
+
+  constructor(
+    readonly name: string,
+    private readonly config: FileSinkConfig,
+    private readonly ctx: SinkContext,
+  ) {}
+
+  private async ensureDirectory(): Promise<void> {
+    if (this.directoryReady) return;
+    await mkdir(this.config.directory, { recursive: true });
+    this.directoryReady = true;
+  }
+
+  private async handleFor(dateKey: string): Promise<FileHandle> {
+    const existing = this.handles.get(dateKey);
+    if (existing !== undefined) {
+      // Refresh recency: re-inserting moves the key to the end of a Map's
+      // iteration order, which is what makes the eviction below an LRU.
+      this.handles.delete(dateKey);
+      this.handles.set(dateKey, existing);
+      return existing;
+    }
+
+    const path = join(this.config.directory, `${this.config.filePrefix}-${dateKey}.jsonl`);
+    const handle = await open(path, 'a');
+    this.handles.set(dateKey, handle);
+
+    // Bounded cache. A long replay walks through many dates, and leaking a
+    // descriptor per day would eventually exhaust the process limit.
+    while (this.handles.size > HANDLE_CACHE_LIMIT) {
+      const oldest = this.handles.keys().next();
+      if (oldest.done === true) break;
+      const evicted = this.handles.get(oldest.value);
+      this.handles.delete(oldest.value);
+      if (evicted !== undefined) await evicted.close();
+    }
+    return handle;
+  }
+
+  async deliver(events: LogEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    await this.ensureDirectory();
+    await this.preflight(events);
+
+    for (const [dateKey, batch] of groupByUtcDate(events)) {
+      const handle = await this.handleFor(dateKey);
+      const payload = `${batch.map((event) => JSON.stringify(event)).join('\n')}\n`;
+      await handle.write(payload, null, 'utf8');
+      await handle.sync();
+    }
+    this.ctx.log.debug({ sink: this.name, count: events.length }, 'file sink wrote batch');
+  }
+
+  // Overridden in Task 7 to add the free-space guard.
+  protected async preflight(_events: LogEvent[]): Promise<void> {
+    return Promise.resolve();
+  }
+
+  async close(): Promise<void> {
+    const handles = [...this.handles.values()];
+    this.handles.clear();
+    await Promise.all(handles.map((handle) => handle.close()));
+  }
+}
+
+export const fileSinkType: SinkType<FileSinkConfig> = {
+  type: 'file',
+  configSchema: fileSinkConfigSchema,
+  create(name, config, ctx) {
+    return new FileSink(name, config, ctx);
+  },
+  warnings() {
+    return [];
+  },
+};
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/file.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add file sink writer
+
+Partitions by the event's own UTC timestamp so replayed batches land in
+their own day's file, and fsyncs each write before resolving because
+resolving is what deletes the spool copy."
+```
+
+---
+
+### Task 7: File sink — retention, free space, and containment
+
+**Files:**
+- Modify: `src/sinks/file.ts`
+- Test: `test/sinks/file-retention.test.ts`
+
+**Interfaces:**
+- Consumes: everything from Task 6.
+- Produces: `pruneRetention(dir: string, prefix: string, retentionDays: number, nowMs: number): Promise<string[]>` (returns the deleted filenames); `FileSinkConfig` gains no new fields; `fileSinkType.create` now enforces the free-space floor and starts an hourly pruner.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/file-retention.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { fileSinkType, pruneRetention } from '../../src/sinks/file.js';
+import { RetryableDeliveryError } from '../../src/sinks/types.js';
+import type { FileSinkConfig } from '../../src/sinks/file.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+const now = Date.UTC(2026, 8, 8, 12, 0, 0); // 2026-09-08T12:00:00Z
+
+describe('pruneRetention', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-retain-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('deletes files older than the retention window and keeps newer ones', async () => {
+    await writeFile(join(dir, 'events-2026-09-08.jsonl'), '');
+    await writeFile(join(dir, 'events-2026-09-06.jsonl'), '');
+    await writeFile(join(dir, 'events-2026-09-01.jsonl'), '');
+    await writeFile(join(dir, 'events-2026-08-20.jsonl'), '');
+
+    const deleted = await pruneRetention(dir, 'events', 3, now);
+
+    expect(deleted.sort()).toEqual(['events-2026-08-20.jsonl', 'events-2026-09-01.jsonl']);
+    expect((await readdir(dir)).sort()).toEqual([
+      'events-2026-09-06.jsonl',
+      'events-2026-09-08.jsonl',
+    ]);
+  });
+
+  it('never touches files that do not match the pattern', async () => {
+    await writeFile(join(dir, 'events-2020-01-01.jsonl'), '');
+    await writeFile(join(dir, 'important-notes.txt'), '');
+    await writeFile(join(dir, 'events-not-a-date.jsonl'), '');
+    await writeFile(join(dir, 'other-2020-01-01.jsonl'), '');
+
+    const deleted = await pruneRetention(dir, 'events', 1, now);
+
+    expect(deleted).toEqual(['events-2020-01-01.jsonl']);
+    expect((await readdir(dir)).sort()).toEqual([
+      'events-not-a-date.jsonl',
+      'important-notes.txt',
+      'other-2020-01-01.jsonl',
+    ]);
+  });
+
+  it('deletes nothing when retentionDays is 0, meaning keep forever', async () => {
+    await writeFile(join(dir, 'events-2001-01-01.jsonl'), '');
+    expect(await pruneRetention(dir, 'events', 0, now)).toEqual([]);
+    expect(await readdir(dir)).toHaveLength(1);
+  });
+
+  it('returns an empty list for a missing directory rather than throwing', async () => {
+    expect(await pruneRetention(join(dir, 'absent'), 'events', 3, now)).toEqual([]);
+  });
+});
+
+describe('file sink free-space guard', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-space-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function config(overrides: Partial<FileSinkConfig> = {}): FileSinkConfig {
+    return {
+      type: 'file',
+      directory: dir,
+      filePrefix: 'events',
+      retentionDays: 0,
+      freeSpaceFloorBytes: 1_000_000,
+      ...overrides,
+    };
+  }
+
+  const event = { id: 'a', timestamp: Date.UTC(2026, 8, 8), source: 'lambda', projectId: 'p1' };
+
+  it('throws a retryable error when free space is below the floor', async () => {
+    const sink = fileSinkType.create('local', config(), {
+      log: silentLog,
+      freeSpace: () => Promise.resolve(500_000),
+    });
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+    await sink.close();
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it('writes normally when free space is above the floor', async () => {
+    const sink = fileSinkType.create('local', config(), {
+      log: silentLog,
+      freeSpace: () => Promise.resolve(50_000_000),
+    });
+    await sink.deliver([event]);
+    await sink.close();
+    expect(await readdir(dir)).toEqual(['events-2026-09-08.jsonl']);
+  });
+
+  it('writes normally when the floor is zero', async () => {
+    const sink = fileSinkType.create('local', config({ freeSpaceFloorBytes: 0 }), {
+      log: silentLog,
+      freeSpace: () => Promise.resolve(0),
+    });
+    await sink.deliver([event]);
+    await sink.close();
+    expect(await readdir(dir)).toEqual(['events-2026-09-08.jsonl']);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/file-retention.test.ts`
+Expected: FAIL — `pruneRetention` is not exported, and `SinkContext` has no `freeSpace`.
+
+- [ ] **Step 3: Extend `SinkContext` in `src/sinks/types.ts`**
+
+Add an optional injected free-space probe. Optional so existing callers and
+tests need no change, and so `statfs` is the default only in production.
+
+```ts
+export type FreeSpaceProbe = (path: string) => Promise<number>;
+
+export interface SinkContext {
+  readonly log: Logger;
+  readonly freeSpace?: FreeSpaceProbe;
+}
+```
+
+- [ ] **Step 4: Implement retention and the guard in `src/sinks/file.ts`**
+
+Add these imports and exports, and replace the `preflight` stub:
+
+```ts
+import { readdir, statfs, unlink } from 'node:fs/promises';
+import { RetryableDeliveryError } from './types.js';
+import type { FreeSpaceProbe } from './types.js';
+
+const DAY_MS = 86_400_000;
+const PRUNE_INTERVAL_MS = 3_600_000;
+
+export const statfsFreeSpace: FreeSpaceProbe = async (path) => {
+  const stats = await statfs(path);
+  return stats.bavail * stats.bsize;
+};
+
+export async function pruneRetention(
+  dir: string,
+  prefix: string,
+  retentionDays: number,
+  nowMs: number,
+): Promise<string[]> {
+  if (retentionDays <= 0) return [];
+
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+
+  const pattern = new RegExp(`^${prefix}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
+  const cutoff = nowMs - retentionDays * DAY_MS;
+  const deleted: string[] = [];
+
+  for (const entry of entries) {
+    const match = pattern.exec(entry);
+    if (match === null) continue;
+    const dateKey = match[1];
+    if (dateKey === undefined) continue;
+    const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
+    if (Number.isNaN(fileMs) || fileMs >= cutoff) continue;
+    await unlink(join(dir, entry));
+    deleted.push(entry);
+  }
+  return deleted;
+}
+```
+
+In `FileSink`, replace the `preflight` stub with a real guard, add a pruner
+timer, and clear it on close:
+
+```ts
+  private pruneTimer: NodeJS.Timeout | null = null;
+
+  private get freeSpace(): FreeSpaceProbe {
+    return this.ctx.freeSpace ?? statfsFreeSpace;
+  }
+
+  startPruner(): void {
+    if (this.config.retentionDays <= 0) return;
+    void this.prune();
+    this.pruneTimer = setInterval(() => {
+      void this.prune();
+    }, PRUNE_INTERVAL_MS);
+    this.pruneTimer.unref();
+  }
+
+  private async prune(): Promise<void> {
+    try {
+      const deleted = await pruneRetention(
+        this.config.directory,
+        this.config.filePrefix,
+        this.config.retentionDays,
+        Date.now(),
+      );
+      if (deleted.length > 0) {
+        this.ctx.log.info({ sink: this.name, deleted: deleted.length }, 'pruned old log files');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.ctx.log.warn({ sink: this.name, err: message }, 'retention prune failed');
+    }
+  }
+
+  protected async preflight(_events: LogEvent[]): Promise<void> {
+    if (this.config.freeSpaceFloorBytes <= 0) return;
+    const available = await this.freeSpace(this.config.directory);
+    if (available < this.config.freeSpaceFloorBytes) {
+      throw new RetryableDeliveryError(
+        `only ${available} bytes free in ${this.config.directory}, floor is ${this.config.freeSpaceFloorBytes}`,
+      );
+    }
+  }
+```
+
+The guard runs *before* `ensureDirectory` creates anything, so a blocked
+delivery leaves no trace. Update `deliver()` to call `preflight` first:
+
+```ts
+  async deliver(events: LogEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    await this.preflight(events);
+    await this.ensureDirectory();
+    // ...unchanged from Task 6
+  }
+```
+
+And in `close()`, clear the timer before closing handles:
+
+```ts
+    if (this.pruneTimer !== null) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
+```
+
+Finally, have `fileSinkType.create` start the pruner:
+
+```ts
+  create(name, config, ctx) {
+    const sink = new FileSink(name, config, ctx);
+    sink.startPruner();
+    return sink;
+  },
+```
+
+`unref()` on the timer matters: without it, a Node process with an idle pruner
+would refuse to exit.
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/file-retention.test.ts test/sinks/file.test.ts`
+Expected: PASS.
+
+- [ ] **Step 6: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add file sink retention and free-space guard
+
+Retention deletes only files matching the prefix-date pattern. A logs
+volume below its floor raises a retryable error so the batch stays
+spooled, turning disk exhaustion into backpressure instead of loss."
+```
+
+---
+
+### Task 8: Loki payload construction
+
+**Files:**
+- Create: `src/sinks/loki-payload.ts`
+- Test: `test/sinks/loki-payload.test.ts`
+
+**Interfaces:**
+- Consumes: `LogEvent` from `src/vercel/event.ts`.
+- Produces: `type LokiLabelConfig`, `type LokiStream`, `type LokiPushPayload`, `HIGH_CARDINALITY_FIELDS`, `sanitizeLabelName`, `resolveLabels`, `buildPushPayload`, `labelWarnings`, `normalizePushUrl`, `DEFAULT_LABEL_CONFIG`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/loki-payload.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import {
+  buildPushPayload,
+  labelWarnings,
+  normalizePushUrl,
+  resolveLabels,
+  sanitizeLabelName,
+} from '../../src/sinks/loki-payload.js';
+import type { LokiLabelConfig } from '../../src/sinks/loki-payload.js';
+
+const labels: LokiLabelConfig = {
+  static: { job: 'vercel' },
+  fromFields: ['projectName', 'environment', 'source', 'level'],
+};
+
+function event(overrides: Record<string, string | number> = {}) {
+  return {
+    id: 'e1',
+    timestamp: 1573817250283,
+    source: 'lambda',
+    projectId: 'p1',
+    projectName: 'my-app',
+    environment: 'production',
+    level: 'info',
+    message: 'hello',
+    ...overrides,
+  };
+}
+
+describe('sanitizeLabelName', () => {
+  it('replaces dots with underscores', () => {
+    expect(sanitizeLabelName('trace.id')).toBe('trace_id');
+  });
+
+  it('prefixes a name starting with a digit', () => {
+    expect(sanitizeLabelName('2fast')).toBe('_2fast');
+  });
+
+  it('strips characters Loki disallows', () => {
+    expect(sanitizeLabelName('my-label!')).toBe('my_label_');
+  });
+
+  it('leaves a valid name unchanged', () => {
+    expect(sanitizeLabelName('project_name')).toBe('project_name');
+  });
+});
+
+describe('resolveLabels', () => {
+  it('merges static labels with allowlisted fields', () => {
+    expect(resolveLabels(event(), labels)).toEqual({
+      job: 'vercel',
+      projectName: 'my-app',
+      environment: 'production',
+      source: 'lambda',
+      level: 'info',
+    });
+  });
+
+  it('omits fields that are missing rather than sending empty values', () => {
+    const { environment: _dropped, ...withoutEnvironment } = event();
+    const resolved = resolveLabels(withoutEnvironment, labels);
+    expect(resolved).not.toHaveProperty('environment');
+  });
+
+  it('omits empty-string values, which Loki rejects', () => {
+    const resolved = resolveLabels(event({ environment: '' }), labels);
+    expect(resolved).not.toHaveProperty('environment');
+  });
+
+  it('stringifies numeric field values', () => {
+    const resolved = resolveLabels(event({ statusCode: 200 }), {
+      static: {},
+      fromFields: ['statusCode'],
+    });
+    expect(resolved).toEqual({ statusCode: '200' });
+  });
+
+  it('skips object-valued fields, which cannot be labels', () => {
+    const withProxy = { ...event(), proxy: { method: 'GET' } };
+    const resolved = resolveLabels(withProxy, { static: {}, fromFields: ['proxy'] });
+    expect(resolved).toEqual({});
+  });
+
+  it('sanitizes field names into label names', () => {
+    const withTrace = { ...event(), 'trace.id': 'abc' };
+    const resolved = resolveLabels(withTrace, { static: {}, fromFields: ['trace.id'] });
+    expect(resolved).toEqual({ trace_id: 'abc' });
+  });
+
+  it('truncates over-long label values', () => {
+    const resolved = resolveLabels(event({ message: 'x'.repeat(2000) }), {
+      static: {},
+      fromFields: ['message'],
+    });
+    expect(resolved['message']?.length).toBe(1024);
+  });
+});
+
+describe('buildPushPayload', () => {
+  it('groups events with identical labels into one stream', () => {
+    const payload = buildPushPayload([event({ id: 'a' }), event({ id: 'b' })], labels);
+    expect(payload.streams).toHaveLength(1);
+    expect(payload.streams[0]?.values).toHaveLength(2);
+  });
+
+  it('separates events with different labels into different streams', () => {
+    const payload = buildPushPayload(
+      [event({ id: 'a', level: 'info' }), event({ id: 'b', level: 'error' })],
+      labels,
+    );
+    expect(payload.streams).toHaveLength(2);
+  });
+
+  it('converts milliseconds to a nanosecond string', () => {
+    const payload = buildPushPayload([event()], labels);
+    expect(payload.streams[0]?.values[0]?.[0]).toBe('1573817250283000000');
+  });
+
+  it('sorts values ascending by timestamp within a stream', () => {
+    const payload = buildPushPayload(
+      [event({ id: 'late', timestamp: 2000 }), event({ id: 'early', timestamp: 1000 })],
+      labels,
+    );
+    const values = payload.streams[0]?.values ?? [];
+    expect(values[0]?.[0]).toBe('1000000000');
+    expect(values[1]?.[0]).toBe('2000000000');
+  });
+
+  it('serializes the complete event as the log line, including label fields', () => {
+    const payload = buildPushPayload([event()], labels);
+    const line = JSON.parse(payload.streams[0]?.values[0]?.[1] ?? '{}');
+    expect(line).toMatchObject({ id: 'e1', projectName: 'my-app', message: 'hello' });
+  });
+
+  it('returns no streams for an empty batch', () => {
+    expect(buildPushPayload([], labels).streams).toEqual([]);
+  });
+});
+
+describe('labelWarnings', () => {
+  it('warns about high-cardinality fields', () => {
+    const warnings = labelWarnings({ static: {}, fromFields: ['requestId', 'source'] });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('requestId');
+  });
+
+  it('returns nothing for a safe label set', () => {
+    expect(labelWarnings(labels)).toEqual([]);
+  });
+});
+
+describe('normalizePushUrl', () => {
+  it('appends the push path to a base URL', () => {
+    expect(normalizePushUrl('http://loki:3100')).toBe('http://loki:3100/loki/api/v1/push');
+  });
+
+  it('tolerates a trailing slash', () => {
+    expect(normalizePushUrl('http://loki:3100/')).toBe('http://loki:3100/loki/api/v1/push');
+  });
+
+  it('does not double-append an already complete URL', () => {
+    expect(normalizePushUrl('http://loki:3100/loki/api/v1/push')).toBe(
+      'http://loki:3100/loki/api/v1/push',
+    );
+  });
+
+  it('preserves a path prefix', () => {
+    expect(normalizePushUrl('http://gw/loki-tenant')).toBe(
+      'http://gw/loki-tenant/loki/api/v1/push',
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/loki-payload.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/sinks/loki-payload.ts`**
+
+```ts
+import type { LogEvent } from '../vercel/event.js';
+
+const PUSH_PATH = '/loki/api/v1/push';
+const LABEL_VALUE_LIMIT = 1024;
+
+export type LokiLabelConfig = { static: Record<string, string>; fromFields: string[] };
+export type LokiStream = { stream: Record<string, string>; values: [string, string][] };
+export type LokiPushPayload = { streams: LokiStream[] };
+
+export const DEFAULT_LABEL_CONFIG: LokiLabelConfig = {
+  static: { job: 'vercel' },
+  fromFields: ['projectName', 'environment', 'source', 'level'],
+};
+
+export const HIGH_CARDINALITY_FIELDS: readonly string[] = [
+  'id',
+  'requestId',
+  'deploymentId',
+  'path',
+  'host',
+  'traceId',
+  'spanId',
+  'buildId',
+  'trace.id',
+  'span.id',
+];
+
+export function sanitizeLabelName(name: string): string {
+  const replaced = name.replace(/[^a-zA-Z0-9_]/g, '_');
+  return /^[0-9]/.test(replaced) ? `_${replaced}` : replaced;
+}
+
+export function resolveLabels(event: LogEvent, config: LokiLabelConfig): Record<string, string> {
+  const labels: Record<string, string> = {};
+
+  for (const [name, value] of Object.entries(config.static)) {
+    if (value.length === 0) continue;
+    labels[sanitizeLabelName(name)] = value.slice(0, LABEL_VALUE_LIMIT);
+  }
+
+  for (const field of config.fromFields) {
+    const raw = event[field];
+    if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'boolean') continue;
+    const value = String(raw);
+    if (value.length === 0) continue;
+    labels[sanitizeLabelName(field)] = value.slice(0, LABEL_VALUE_LIMIT);
+  }
+
+  return labels;
+}
+
+export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): LokiPushPayload {
+  const byLabelSet = new Map<string, LokiStream>();
+
+  for (const event of events) {
+    const labels = resolveLabels(event, config);
+    // Sorted keys make the grouping key stable regardless of field order.
+    const key = JSON.stringify(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : 1)));
+    const nanos = String(BigInt(Math.trunc(event.timestamp)) * 1_000_000n);
+    const entry: [string, string] = [nanos, JSON.stringify(event)];
+
+    const stream = byLabelSet.get(key);
+    if (stream === undefined) {
+      byLabelSet.set(key, { stream: labels, values: [entry] });
+    } else {
+      stream.values.push(entry);
+    }
+  }
+
+  const streams = [...byLabelSet.values()];
+  for (const stream of streams) {
+    stream.values.sort((left, right) => (BigInt(left[0]) < BigInt(right[0]) ? -1 : 1));
+  }
+  return { streams };
+}
+
+export function labelWarnings(config: LokiLabelConfig): string[] {
+  const risky = config.fromFields.filter((field) => HIGH_CARDINALITY_FIELDS.includes(field));
+  if (risky.length === 0) return [];
+  return [
+    `Labels ${risky.join(', ')} are high-cardinality; each distinct value creates a new Loki stream. Prefer querying them from the log line with | json.`,
+  ];
+}
+
+export function normalizePushUrl(base: string): string {
+  const trimmed = base.replace(/\/+$/, '');
+  return trimmed.endsWith(PUSH_PATH) ? trimmed : `${trimmed}${PUSH_PATH}`;
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/loki-payload.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: build Loki push payloads
+
+Pure label resolution and stream grouping, separated from transport so
+it is testable without a server. Sanitizes label names to Loki's
+grammar, drops empty values Loki rejects, and sorts each stream
+ascending."
+```
+
+---
+
+### Task 9: Loki sink transport
+
+**Files:**
+- Create: `src/sinks/loki.ts`
+- Modify: `src/sinks/types.ts` (add `AuthDeliveryError`)
+- Test: `test/sinks/loki.test.ts`
+
+**Interfaces:**
+- Consumes: everything from `src/sinks/loki-payload.ts` and `src/sinks/types.ts`.
+- Produces: `type LokiAuth`, `type LokiSinkConfig`, `lokiSinkConfigSchema`, `type LokiClassification`, `classifyLokiStatus(status: number): LokiClassification`, `lokiSinkType`; and in `types.ts`, `class AuthDeliveryError extends RetryableDeliveryError`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/loki.test.ts`:
+
+```ts
+import { afterEach, describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { classifyLokiStatus, lokiSinkType } from '../../src/sinks/loki.js';
+import type { LokiSinkConfig } from '../../src/sinks/loki.js';
+import {
+  AuthDeliveryError,
+  PermanentDeliveryError,
+  RetryableDeliveryError,
+} from '../../src/sinks/types.js';
+
+const gunzipAsync = promisify(gunzip);
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+const event = {
+  id: 'e1',
+  timestamp: 1573817250283,
+  source: 'lambda',
+  projectId: 'p1',
+  level: 'info',
+};
+
+type Captured = { headers: Record<string, string>; body: string };
+
+let server: Server | null = null;
+
+async function startServer(
+  status: number,
+  responseBody: string,
+  captured: Captured[],
+  delayMs = 0,
+): Promise<string> {
+  const instance = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      void (async () => {
+        const raw = Buffer.concat(chunks);
+        const body =
+          req.headers['content-encoding'] === 'gzip'
+            ? (await gunzipAsync(raw)).toString('utf8')
+            : raw.toString('utf8');
+        const headers: Record<string, string> = {};
+        for (const [key, value] of Object.entries(req.headers)) {
+          if (typeof value === 'string') headers[key] = value;
+        }
+        captured.push({ headers, body });
+        if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+        res.writeHead(status, { 'content-type': 'text/plain' });
+        res.end(responseBody);
+      })();
+    });
+  });
+  server = instance;
+  await new Promise<void>((resolve) => instance.listen(0, '127.0.0.1', resolve));
+  const address = instance.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+  return `http://127.0.0.1:${port}`;
+}
+
+afterEach(async () => {
+  if (server !== null) {
+    await new Promise<void>((resolve) => server?.close(() => resolve()));
+    server = null;
+  }
+});
+
+function config(url: string, overrides: Partial<LokiSinkConfig> = {}): LokiSinkConfig {
+  return {
+    type: 'loki',
+    url,
+    auth: { kind: 'none' },
+    tenantId: null,
+    labels: { static: { job: 'vercel' }, fromFields: ['level'] },
+    timeoutMs: 5000,
+    ...overrides,
+  };
+}
+
+describe('classifyLokiStatus', () => {
+  it.each([
+    [200, 'ok'],
+    [204, 'ok'],
+    [400, 'permanent'],
+    [413, 'permanent'],
+    [422, 'permanent'],
+    [401, 'auth'],
+    [403, 'auth'],
+    [404, 'auth'],
+    [429, 'retryable'],
+    [500, 'retryable'],
+    [503, 'retryable'],
+  ] as const)('classifies %i as %s', (status, expected) => {
+    expect(classifyLokiStatus(status)).toBe(expected);
+  });
+});
+
+describe('loki sink delivery', () => {
+  it('posts a gzipped push payload to the push path', async () => {
+    const captured: Captured[] = [];
+    const url = await startServer(204, '', captured);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+
+    await sink.deliver([event]);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.headers['content-encoding']).toBe('gzip');
+    expect(captured[0]?.headers['content-type']).toBe('application/json');
+    const payload = JSON.parse(captured[0]?.body ?? '{}');
+    expect(payload.streams[0].stream).toEqual({ job: 'vercel', level: 'info' });
+    expect(payload.streams[0].values[0][0]).toBe('1573817250283000000');
+  });
+
+  it('sends basic auth and tenant headers', async () => {
+    const captured: Captured[] = [];
+    const url = await startServer(204, '', captured);
+    const sink = lokiSinkType.create(
+      'loki',
+      config(url, {
+        auth: { kind: 'basic', username: 'user', password: 'pass' },
+        tenantId: 'team-a',
+      }),
+      { log: silentLog },
+    );
+
+    await sink.deliver([event]);
+
+    const expected = `Basic ${Buffer.from('user:pass').toString('base64')}`;
+    expect(captured[0]?.headers['authorization']).toBe(expected);
+    expect(captured[0]?.headers['x-scope-orgid']).toBe('team-a');
+  });
+
+  it('sends a bearer token', async () => {
+    const captured: Captured[] = [];
+    const url = await startServer(204, '', captured);
+    const sink = lokiSinkType.create('loki', config(url, { auth: { kind: 'bearer', token: 'tk' } }), {
+      log: silentLog,
+    });
+    await sink.deliver([event]);
+    expect(captured[0]?.headers['authorization']).toBe('Bearer tk');
+  });
+
+  it('throws a permanent error on 400 so the batch is dead-lettered', async () => {
+    const url = await startServer(400, 'entry too far behind', []);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(PermanentDeliveryError);
+  });
+
+  it('throws an auth error on 401 so logs are preserved for retry', async () => {
+    const url = await startServer(401, 'unauthorized', []);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+    const rejection = sink.deliver([event]);
+    await expect(rejection).rejects.toBeInstanceOf(AuthDeliveryError);
+    // An auth error must still be retryable, never permanent.
+    await expect(rejection).rejects.toBeInstanceOf(RetryableDeliveryError);
+    await expect(rejection).rejects.not.toBeInstanceOf(PermanentDeliveryError);
+  });
+
+  it('throws a retryable error on 429 and on 503', async () => {
+    const rateLimited = await startServer(429, 'slow down', []);
+    const sink = lokiSinkType.create('loki', config(rateLimited), { log: silentLog });
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+  });
+
+  it('throws a retryable error when the connection is refused', async () => {
+    const sink = lokiSinkType.create('loki', config('http://127.0.0.1:1'), { log: silentLog });
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+  });
+
+  it('throws a retryable error when the request times out', async () => {
+    const url = await startServer(204, '', [], 300);
+    const sink = lokiSinkType.create('loki', config(url, { timeoutMs: 100 }), { log: silentLog });
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+  });
+
+  it('does not call the server for an empty batch', async () => {
+    const captured: Captured[] = [];
+    const url = await startServer(204, '', captured);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+    await sink.deliver([]);
+    expect(captured).toEqual([]);
+  });
+
+  it('warns about high-cardinality labels via the sink type', () => {
+    const warnings = lokiSinkType.warnings(
+      config('http://loki:3100', { labels: { static: {}, fromFields: ['requestId'] } }),
+    );
+    expect(warnings[0]).toContain('requestId');
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/loki.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Add `AuthDeliveryError` to `src/sinks/types.ts`**
+
+It extends `RetryableDeliveryError` so the retry path is inherited by
+construction — a credentials mistake must never discard logs. The subclass
+exists only so the Dispatcher can surface health as `failed` immediately
+instead of after five failures.
+
+```ts
+export class AuthDeliveryError extends RetryableDeliveryError {
+  constructor(message: string, cause?: Error) {
+    super(message, cause);
+    this.name = 'AuthDeliveryError';
+  }
+}
+```
+
+- [ ] **Step 4: Implement `src/sinks/loki.ts`**
+
+```ts
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { z } from 'zod';
+import { buildPushPayload, labelWarnings, normalizePushUrl } from './loki-payload.js';
+import { AuthDeliveryError, PermanentDeliveryError, RetryableDeliveryError } from './types.js';
+import type { LogEvent } from '../vercel/event.js';
+import type { Sink, SinkContext, SinkType } from './types.js';
+
+const gzipAsync = promisify(gzip);
+const DETAIL_LIMIT = 500;
+
+export const lokiAuthSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('none') }),
+  z.object({
+    kind: z.literal('basic'),
+    username: z.string().min(1),
+    password: z.string().min(1),
+  }),
+  z.object({ kind: z.literal('bearer'), token: z.string().min(1) }),
+]);
+
+export type LokiAuth = z.infer<typeof lokiAuthSchema>;
+
+export const lokiSinkConfigSchema = z.object({
+  type: z.literal('loki'),
+  url: z.url(),
+  auth: lokiAuthSchema,
+  tenantId: z.string().min(1).nullable(),
+  labels: z.object({
+    static: z.record(z.string(), z.string()),
+    fromFields: z.array(z.string()),
+  }),
+  timeoutMs: z.number().int().min(100).max(120_000),
+});
+
+export type LokiSinkConfig = z.infer<typeof lokiSinkConfigSchema>;
+
+export type LokiClassification = 'ok' | 'permanent' | 'retryable' | 'auth';
+
+export function classifyLokiStatus(status: number): LokiClassification {
+  if (status >= 200 && status < 300) return 'ok';
+  if (status === 401 || status === 403 || status === 404) return 'auth';
+  // 400 covers malformed streams and entries outside reject_old_samples_max_age;
+  // 413/422 mean this exact payload will never be accepted. Retrying any of
+  // them forever would pin the head of the queue.
+  if (status === 400 || status === 413 || status === 422) return 'permanent';
+  return 'retryable';
+}
+
+class LokiSink implements Sink {
+  readonly type = 'loki';
+  private readonly pushUrl: string;
+
+  constructor(
+    readonly name: string,
+    private readonly config: LokiSinkConfig,
+    private readonly ctx: SinkContext,
+  ) {
+    this.pushUrl = normalizePushUrl(config.url);
+  }
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'content-encoding': 'gzip',
+    };
+    if (this.config.tenantId !== null) {
+      headers['X-Scope-OrgID'] = this.config.tenantId;
+    }
+    const auth = this.config.auth;
+    if (auth.kind === 'basic') {
+      const encoded = Buffer.from(`${auth.username}:${auth.password}`, 'utf8').toString('base64');
+      headers['authorization'] = `Basic ${encoded}`;
+    } else if (auth.kind === 'bearer') {
+      headers['authorization'] = `Bearer ${auth.token}`;
+    }
+    return headers;
+  }
+
+  async deliver(events: LogEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    const payload = buildPushPayload(events, this.config.labels);
+    if (payload.streams.length === 0) return;
+
+    const body = await gzipAsync(Buffer.from(JSON.stringify(payload), 'utf8'));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+
+    let response: Response;
+    try {
+      response = await fetch(this.pushUrl, {
+        method: 'POST',
+        headers: this.headers(),
+        body,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      const cause = error instanceof Error ? error : new Error(String(error));
+      throw new RetryableDeliveryError(`loki push to ${this.pushUrl} failed: ${cause.message}`, cause);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const classification = classifyLokiStatus(response.status);
+    if (classification === 'ok') {
+      this.ctx.log.debug({ sink: this.name, count: events.length }, 'loki push accepted');
+      return;
+    }
+
+    const detail = (await response.text().catch(() => '')).slice(0, DETAIL_LIMIT);
+    const summary = `loki responded ${String(response.status)}: ${detail}`;
+
+    if (classification === 'permanent') {
+      throw new PermanentDeliveryError(
+        `${summary} — batch cannot be accepted as-is; dead-lettering. If this is 413, lower the sink's maxBatchBytes.`,
+      );
+    }
+    if (classification === 'auth') {
+      throw new AuthDeliveryError(`${summary} — check the sink's credentials and URL`);
+    }
+    throw new RetryableDeliveryError(summary);
+  }
+
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+export const lokiSinkType: SinkType<LokiSinkConfig> = {
+  type: 'loki',
+  configSchema: lokiSinkConfigSchema,
+  create(name, config, ctx) {
+    return new LokiSink(name, config, ctx);
+  },
+  warnings(config) {
+    return labelWarnings(config.labels);
+  },
+};
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/loki.test.ts`
+Expected: PASS.
+
+- [ ] **Step 6: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add Loki sink transport
+
+Gzipped JSON push with basic/bearer auth and tenant header. Classifies
+400/413/422 as permanent so a poison batch is dead-lettered instead of
+wedging the queue, while 401/403/404 stay retryable but escalate health
+so a wrong password never destroys logs."
+```
+
+---
+
+### Task 10: Sink registry
+
+**Files:**
+- Create: `src/sinks/registry.ts`
+- Test: `test/sinks/registry.test.ts`
+
+**Interfaces:**
+- Consumes: `fileSinkType`, `fileSinkConfigSchema` from `src/sinks/file.ts`; `lokiSinkType`, `lokiSinkConfigSchema` from `src/sinks/loki.ts`.
+- Produces: `type AnySinkConfig = FileSinkConfig | LokiSinkConfig`, `sinkConfigSchema: z.ZodType<AnySinkConfig>`, `createSink(name, config, ctx): Sink`, `warningsFor(config): string[]`.
+
+This module must **not** import from `src/config/`. See the dependency note in
+Interface Contracts.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/sinks/registry.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { createSink, sinkConfigSchema, warningsFor } from '../../src/sinks/registry.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+const fileConfig = {
+  type: 'file' as const,
+  directory: '/tmp/vld-registry',
+  filePrefix: 'events',
+  retentionDays: 7,
+  freeSpaceFloorBytes: 0,
+};
+
+const lokiConfig = {
+  type: 'loki' as const,
+  url: 'http://loki:3100',
+  auth: { kind: 'none' as const },
+  tenantId: null,
+  labels: { static: { job: 'vercel' }, fromFields: ['requestId'] },
+  timeoutMs: 5000,
+};
+
+describe('sinkConfigSchema', () => {
+  it('accepts a file config', () => {
+    expect(sinkConfigSchema.safeParse(fileConfig).success).toBe(true);
+  });
+
+  it('accepts a loki config', () => {
+    expect(sinkConfigSchema.safeParse(lokiConfig).success).toBe(true);
+  });
+
+  it('rejects an unknown sink type', () => {
+    expect(sinkConfigSchema.safeParse({ type: 'syslog', host: 'x' }).success).toBe(false);
+  });
+
+  it('rejects a loki config with a malformed url', () => {
+    expect(sinkConfigSchema.safeParse({ ...lokiConfig, url: 'not a url' }).success).toBe(false);
+  });
+});
+
+describe('createSink', () => {
+  it('builds a file sink', async () => {
+    const sink = createSink('local', fileConfig, { log: silentLog });
+    expect(sink.type).toBe('file');
+    expect(sink.name).toBe('local');
+    await sink.close();
+  });
+
+  it('builds a loki sink', async () => {
+    const sink = createSink('remote', lokiConfig, { log: silentLog });
+    expect(sink.type).toBe('loki');
+    await sink.close();
+  });
+});
+
+describe('warningsFor', () => {
+  it('surfaces loki label warnings', () => {
+    expect(warningsFor(lokiConfig)[0]).toContain('requestId');
+  });
+
+  it('returns nothing for a file sink', () => {
+    expect(warningsFor(fileConfig)).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/sinks/registry.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/sinks/registry.ts`**
+
+```ts
+import { z } from 'zod';
+import { fileSinkConfigSchema, fileSinkType } from './file.js';
+import { lokiSinkConfigSchema, lokiSinkType } from './loki.js';
+import type { FileSinkConfig } from './file.js';
+import type { LokiSinkConfig } from './loki.js';
+import type { Sink, SinkContext } from './types.js';
+
+export type AnySinkConfig = FileSinkConfig | LokiSinkConfig;
+
+export const sinkConfigSchema: z.ZodType<AnySinkConfig> = z.discriminatedUnion('type', [
+  fileSinkConfigSchema,
+  lokiSinkConfigSchema,
+]);
+
+export function createSink(name: string, config: AnySinkConfig, ctx: SinkContext): Sink {
+  switch (config.type) {
+    case 'file':
+      return fileSinkType.create(name, config, ctx);
+    case 'loki':
+      return lokiSinkType.create(name, config, ctx);
+  }
+}
+
+export function warningsFor(config: AnySinkConfig): string[] {
+  switch (config.type) {
+    case 'file':
+      return fileSinkType.warnings(config);
+    case 'loki':
+      return lokiSinkType.warnings(config);
+  }
+}
+```
+
+The `switch` on the discriminant with no `default` is deliberate: adding a
+third sink type makes TypeScript report both functions as non-exhaustive, which
+is exactly the reminder a future implementer needs.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/sinks/registry.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add sink registry
+
+Owns the sink-config discriminated union so config/schema depends on the
+registry and not the reverse, avoiding an import cycle."
+```
+
+---
+
+### Task 11: Config schema
+
+**Files:**
+- Create: `src/config/schema.ts`
+- Test: `test/config/schema.test.ts`
+
+**Interfaces:**
+- Consumes: `sinkConfigSchema`, `AnySinkConfig` from `src/sinks/registry.ts`; `EventLevel` from `src/vercel/event.ts`.
+- Produces: `SINK_NAME_PATTERN`, `sinkFilterSchema`, `drainEntrySchema`, `sinkEntrySchema`, `serverConfigSchema`, `appConfigSchema`, the inferred types `SinkFilter`, `DrainEntry`, `SinkEntry`, `ServerConfig`, `AppConfig`, plus `defaultAppConfig(): AppConfig`, `newDrainId(): string`, `newDrainSecret(): string`, and the default constants `DEFAULT_MAX_SPOOL_BYTES`, `DEFAULT_MAX_BATCH_EVENTS`, `DEFAULT_MAX_BATCH_BYTES`, `DEFAULT_MAX_BODY_BYTES`, `DEFAULT_MAX_DECOMPRESSED_BYTES`, `DEFAULT_SPOOL_FREE_FLOOR_BYTES`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/config/schema.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import {
+  appConfigSchema,
+  defaultAppConfig,
+  newDrainId,
+  newDrainSecret,
+  SINK_NAME_PATTERN,
+  sinkEntrySchema,
+} from '../../src/config/schema.js';
+
+const validSink = {
+  name: 'local-file',
+  enabled: true,
+  filter: {},
+  maxSpoolBytes: 536_870_912,
+  maxBatchEvents: 1000,
+  maxBatchBytes: 4_194_304,
+  config: {
+    type: 'file',
+    directory: '/logs',
+    filePrefix: 'events',
+    retentionDays: 14,
+    freeSpaceFloorBytes: 268_435_456,
+  },
+};
+
+describe('SINK_NAME_PATTERN', () => {
+  it.each(['a', 'loki', 'loki-prod', 'sink1', 'a-b-c-1'])('accepts %s', (name) => {
+    expect(SINK_NAME_PATTERN.test(name)).toBe(true);
+  });
+
+  it.each(['', '-lead', 'Upper', 'has space', 'dot.name', '../escape', 'a/b', 'a_b'])(
+    'rejects %s',
+    (name) => {
+      expect(SINK_NAME_PATTERN.test(name)).toBe(false);
+    },
+  );
+
+  it('rejects a name longer than 64 characters', () => {
+    expect(SINK_NAME_PATTERN.test('a'.repeat(65))).toBe(false);
+    expect(SINK_NAME_PATTERN.test('a'.repeat(64))).toBe(true);
+  });
+});
+
+describe('sinkEntrySchema', () => {
+  it('accepts a valid entry', () => {
+    expect(sinkEntrySchema.safeParse(validSink).success).toBe(true);
+  });
+
+  it('rejects a traversal name', () => {
+    expect(sinkEntrySchema.safeParse({ ...validSink, name: '../etc' }).success).toBe(false);
+  });
+
+  it('accepts a filter with all predicates', () => {
+    const result = sinkEntrySchema.safeParse({
+      ...validSink,
+      filter: {
+        minLevel: 'error',
+        sources: ['lambda', 'edge'],
+        environments: ['production'],
+        projectIds: ['p1'],
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an unknown minLevel', () => {
+    expect(
+      sinkEntrySchema.safeParse({ ...validSink, filter: { minLevel: 'trace' } }).success,
+    ).toBe(false);
+  });
+});
+
+describe('appConfigSchema', () => {
+  it('accepts the default config', () => {
+    expect(appConfigSchema.safeParse(defaultAppConfig()).success).toBe(true);
+  });
+
+  it('rejects a wrong version', () => {
+    expect(appConfigSchema.safeParse({ ...defaultAppConfig(), version: 2 }).success).toBe(false);
+  });
+
+  it('rejects duplicate sink names, since the name is a directory', () => {
+    const config = { ...defaultAppConfig(), sinks: [validSink, { ...validSink }] };
+    expect(appConfigSchema.safeParse(config).success).toBe(false);
+  });
+
+  it('rejects duplicate drain ids', () => {
+    const drain = { id: 'd1', name: 'a', secret: 'x'.repeat(24), enabled: true, createdAt: 1 };
+    const config = { ...defaultAppConfig(), drains: [drain, { ...drain, name: 'b' }] };
+    expect(appConfigSchema.safeParse(config).success).toBe(false);
+  });
+
+  it('rejects a drain secret that is too short to be meaningful', () => {
+    const drain = { id: 'd1', name: 'a', secret: 'short', enabled: true, createdAt: 1 };
+    expect(appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe('defaultAppConfig', () => {
+  it('starts with no drains and no sinks', () => {
+    const config = defaultAppConfig();
+    expect(config.drains).toEqual([]);
+    expect(config.sinks).toEqual([]);
+    expect(config.version).toBe(1);
+  });
+});
+
+describe('id and secret generation', () => {
+  it('generates url-safe drain ids that are unique', () => {
+    const ids = new Set(Array.from({ length: 100 }, () => newDrainId()));
+    expect(ids.size).toBe(100);
+    for (const id of ids) expect(id).toMatch(/^[A-Za-z0-9_-]{16,}$/);
+  });
+
+  it('generates secrets long enough to pass the schema', () => {
+    const drain = {
+      id: newDrainId(),
+      name: 'a',
+      secret: newDrainSecret(),
+      enabled: true,
+      createdAt: 1,
+    };
+    expect(appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] }).success).toBe(
+      true,
+    );
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/config/schema.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/config/schema.ts`**
+
+```ts
+import { randomBytes, randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { sinkConfigSchema } from '../sinks/registry.js';
+
+export const SINK_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+export const DEFAULT_MAX_SPOOL_BYTES = 536_870_912; // 512 MiB
+export const DEFAULT_MAX_BATCH_EVENTS = 1000;
+export const DEFAULT_MAX_BATCH_BYTES = 4_194_304; // 4 MiB
+export const DEFAULT_MAX_BODY_BYTES = 16_777_216; // 16 MiB
+export const DEFAULT_MAX_DECOMPRESSED_BYTES = 134_217_728; // 128 MiB
+export const DEFAULT_SPOOL_FREE_FLOOR_BYTES = 268_435_456; // 256 MiB
+
+export const sinkFilterSchema = z.object({
+  minLevel: z.enum(['info', 'warning', 'error']).optional(),
+  sources: z.array(z.string().min(1)).optional(),
+  environments: z.array(z.string().min(1)).optional(),
+  projectIds: z.array(z.string().min(1)).optional(),
+});
+
+export type SinkFilter = z.infer<typeof sinkFilterSchema>;
+
+export const drainEntrySchema = z.object({
+  id: z.string().min(8),
+  name: z.string().min(1).max(128),
+  secret: z.string().min(16),
+  enabled: z.boolean(),
+  createdAt: z.number().int().nonnegative(),
+});
+
+export type DrainEntry = z.infer<typeof drainEntrySchema>;
+
+export const sinkEntrySchema = z.object({
+  name: z.string().regex(SINK_NAME_PATTERN, 'sink name must match ^[a-z0-9][a-z0-9-]{0,63}$'),
+  enabled: z.boolean(),
+  filter: sinkFilterSchema,
+  maxSpoolBytes: z.number().int().min(1_048_576),
+  maxBatchEvents: z.number().int().min(1).max(100_000),
+  maxBatchBytes: z.number().int().min(1024),
+  config: sinkConfigSchema,
+});
+
+export type SinkEntry = z.infer<typeof sinkEntrySchema>;
+
+export const serverConfigSchema = z.object({
+  maxBodyBytes: z.number().int().min(1024),
+  maxDecompressedBytes: z.number().int().min(1024),
+  spoolFreeSpaceFloorBytes: z.number().int().min(0),
+});
+
+export type ServerConfig = z.infer<typeof serverConfigSchema>;
+
+function uniqueBy<T>(items: T[], key: (item: T) => string): boolean {
+  return new Set(items.map(key)).size === items.length;
+}
+
+export const appConfigSchema = z
+  .object({
+    version: z.literal(1),
+    drains: z.array(drainEntrySchema),
+    sinks: z.array(sinkEntrySchema),
+    server: serverConfigSchema,
+  })
+  .refine((config) => uniqueBy(config.sinks, (sink) => sink.name), {
+    message: 'sink names must be unique, because a sink name is also its spool directory',
+    path: ['sinks'],
+  })
+  .refine((config) => uniqueBy(config.drains, (drain) => drain.id), {
+    message: 'drain ids must be unique',
+    path: ['drains'],
+  });
+
+export type AppConfig = z.infer<typeof appConfigSchema>;
+
+export function newDrainId(): string {
+  return randomUUID().replace(/-/g, '');
+}
+
+export function newDrainSecret(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+export function defaultAppConfig(): AppConfig {
+  return {
+    version: 1,
+    drains: [],
+    sinks: [],
+    server: {
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      maxDecompressedBytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+      spoolFreeSpaceFloorBytes: DEFAULT_SPOOL_FREE_FLOOR_BYTES,
+    },
+  };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/config/schema.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add config schema
+
+Sink names are validated against the directory-safe pattern and required
+to be unique, since a sink name is also its spool directory path."
+```
+
+---
+
+### Task 12: Filter compilation
+
+**Files:**
+- Create: `src/pipeline/filter.ts`
+- Test: `test/pipeline/filter.test.ts`
+
+**Interfaces:**
+- Consumes: `SinkFilter` from `src/config/schema.ts`; `LogEvent`, `eventLevel`, `levelRank` from `src/vercel/event.ts`.
+- Produces: `type EventPredicate = (event: LogEvent) => boolean`, `compileFilter(filter: SinkFilter): EventPredicate`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pipeline/filter.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { compileFilter } from '../../src/pipeline/filter.js';
+
+function event(overrides: Record<string, string | number> = {}) {
+  return {
+    id: 'e1',
+    timestamp: 1,
+    source: 'lambda',
+    projectId: 'p1',
+    environment: 'production',
+    level: 'info',
+    ...overrides,
+  };
+}
+
+describe('compileFilter', () => {
+  it('matches everything when the filter is empty', () => {
+    const predicate = compileFilter({});
+    expect(predicate(event())).toBe(true);
+    expect(predicate(event({ level: 'error', source: 'build' }))).toBe(true);
+  });
+
+  it('applies minLevel inclusively', () => {
+    const predicate = compileFilter({ minLevel: 'warning' });
+    expect(predicate(event({ level: 'info' }))).toBe(false);
+    expect(predicate(event({ level: 'warning' }))).toBe(true);
+    expect(predicate(event({ level: 'error' }))).toBe(true);
+  });
+
+  it('treats an event with no level as info for minLevel purposes', () => {
+    const { level: _omit, ...withoutLevel } = event();
+    expect(compileFilter({ minLevel: 'warning' })(withoutLevel)).toBe(false);
+    expect(compileFilter({ minLevel: 'info' })(withoutLevel)).toBe(true);
+  });
+
+  it('filters by source', () => {
+    const predicate = compileFilter({ sources: ['lambda', 'edge'] });
+    expect(predicate(event({ source: 'lambda' }))).toBe(true);
+    expect(predicate(event({ source: 'build' }))).toBe(false);
+  });
+
+  it('filters by environment', () => {
+    const predicate = compileFilter({ environments: ['production'] });
+    expect(predicate(event({ environment: 'production' }))).toBe(true);
+    expect(predicate(event({ environment: 'preview' }))).toBe(false);
+  });
+
+  it('excludes an event with no environment when environments is set', () => {
+    const { environment: _omit, ...withoutEnvironment } = event();
+    expect(compileFilter({ environments: ['production'] })(withoutEnvironment)).toBe(false);
+  });
+
+  it('filters by projectId', () => {
+    const predicate = compileFilter({ projectIds: ['p1'] });
+    expect(predicate(event({ projectId: 'p1' }))).toBe(true);
+    expect(predicate(event({ projectId: 'p2' }))).toBe(false);
+  });
+
+  it('requires all predicates to pass', () => {
+    const predicate = compileFilter({
+      minLevel: 'error',
+      sources: ['lambda'],
+      environments: ['production'],
+    });
+    expect(predicate(event({ level: 'error', source: 'lambda' }))).toBe(true);
+    expect(predicate(event({ level: 'error', source: 'build' }))).toBe(false);
+    expect(predicate(event({ level: 'info', source: 'lambda' }))).toBe(false);
+  });
+
+  it('treats an empty array as matching nothing, not everything', () => {
+    // An empty allowlist is an explicit "no sources permitted"; absence is the
+    // way to express "any source".
+    expect(compileFilter({ sources: [] })(event())).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/pipeline/filter.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/pipeline/filter.ts`**
+
+```ts
+import { eventLevel, levelRank } from '../vercel/event.js';
+import type { SinkFilter } from '../config/schema.js';
+import type { LogEvent } from '../vercel/event.js';
+
+export type EventPredicate = (event: LogEvent) => boolean;
+
+function stringField(event: LogEvent, field: string): string | null {
+  const value = event[field];
+  return typeof value === 'string' ? value : null;
+}
+
+export function compileFilter(filter: SinkFilter): EventPredicate {
+  const checks: EventPredicate[] = [];
+
+  if (filter.minLevel !== undefined) {
+    const threshold = levelRank(filter.minLevel);
+    checks.push((event) => levelRank(eventLevel(event)) >= threshold);
+  }
+
+  if (filter.sources !== undefined) {
+    const allowed = new Set(filter.sources);
+    checks.push((event) => allowed.has(event.source));
+  }
+
+  if (filter.environments !== undefined) {
+    const allowed = new Set(filter.environments);
+    checks.push((event) => {
+      const value = stringField(event, 'environment');
+      return value !== null && allowed.has(value);
+    });
+  }
+
+  if (filter.projectIds !== undefined) {
+    const allowed = new Set(filter.projectIds);
+    checks.push((event) => allowed.has(event.projectId));
+  }
+
+  if (checks.length === 0) return () => true;
+  return (event) => checks.every((check) => check(event));
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/pipeline/filter.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: compile sink filters into predicates
+
+An absent predicate matches everything; an empty array matches nothing,
+so an explicit empty allowlist is not silently ignored."
+```
+
+---
+
+### Task 13: Config store
+
+**Files:**
+- Create: `src/config/store.ts`
+- Test: `test/config/store.test.ts`
+
+**Interfaces:**
+- Consumes: `appConfigSchema`, `defaultAppConfig`, `AppConfig` from `src/config/schema.ts`.
+- Produces: `type LoadedConfig = { config: AppConfig; etag: string }`, `class ConfigInvalidError`, `class EtagMismatchError`, `etagOf(config: AppConfig): string`, `class ConfigStore` with `load()` and `save(config, expectedEtag)`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/config/store.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import {
+  ConfigInvalidError,
+  ConfigStore,
+  EtagMismatchError,
+  etagOf,
+} from '../../src/config/store.js';
+
+describe('ConfigStore', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-config-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('writes a default config when none exists', async () => {
+    const store = new ConfigStore(dir);
+    const loaded = await store.load();
+    expect(loaded.config).toEqual(defaultAppConfig());
+    expect(await readdir(dir)).toContain('config.json');
+  });
+
+  it('round-trips a saved config', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+    const updated = { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 4096 } };
+
+    const saved = await store.save(updated, initial.etag);
+    const reloaded = await new ConfigStore(dir).load();
+
+    expect(reloaded.config.server.maxBodyBytes).toBe(4096);
+    expect(reloaded.etag).toBe(saved.etag);
+  });
+
+  it('leaves no .tmp file behind after a save', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+    await store.save(initial.config, initial.etag);
+    expect(await readdir(dir)).not.toContain('config.json.tmp');
+  });
+
+  it('retains the previous version as .bak', async () => {
+    const store = new ConfigStore(dir);
+    const first = await store.load();
+    const second = await store.save(
+      { ...first.config, server: { ...first.config.server, maxBodyBytes: 8192 } },
+      first.etag,
+    );
+    await store.save(
+      { ...second.config, server: { ...second.config.server, maxBodyBytes: 9999 } },
+      second.etag,
+    );
+
+    const backup = JSON.parse(await readFile(join(dir, 'config.json.bak'), 'utf8'));
+    expect(backup.server.maxBodyBytes).toBe(8192);
+  });
+
+  it('rejects a save whose etag is stale', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+    await store.save(
+      { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 4096 } },
+      initial.etag,
+    );
+
+    await expect(store.save(initial.config, initial.etag)).rejects.toBeInstanceOf(
+      EtagMismatchError,
+    );
+  });
+
+  it('allows a save with a null etag, for boot-time writes', async () => {
+    const store = new ConfigStore(dir);
+    await store.load();
+    await expect(store.save(defaultAppConfig(), null)).resolves.toBeDefined();
+  });
+
+  it('refuses to start on malformed JSON rather than resetting', async () => {
+    await writeFile(join(dir, 'config.json'), '{ not json');
+    await expect(new ConfigStore(dir).load()).rejects.toBeInstanceOf(ConfigInvalidError);
+  });
+
+  it('refuses to start on a schema-invalid config and names the failing path', async () => {
+    await writeFile(join(dir, 'config.json'), JSON.stringify({ version: 1, drains: 'nope' }));
+    const rejection = new ConfigStore(dir).load();
+    await expect(rejection).rejects.toBeInstanceOf(ConfigInvalidError);
+    await expect(rejection).rejects.toThrow(/drains/);
+  });
+
+  it('mentions a usable backup in the error when one parses cleanly', async () => {
+    await writeFile(join(dir, 'config.json.bak'), JSON.stringify(defaultAppConfig()));
+    await writeFile(join(dir, 'config.json'), '{ not json');
+    await expect(new ConfigStore(dir).load()).rejects.toThrow(/config\.json\.bak/);
+  });
+
+  it('produces an etag independent of key order', () => {
+    const a = defaultAppConfig();
+    const reordered = {
+      server: a.server,
+      sinks: a.sinks,
+      drains: a.drains,
+      version: a.version,
+    } as typeof a;
+    expect(etagOf(reordered)).toBe(etagOf(a));
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/config/store.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/config/store.ts`**
+
+The etag is computed over a **canonical** serialization with sorted keys.
+Without that, a save/load round trip could change key order and produce a
+spurious `409` on the next edit.
+
+```ts
+import { copyFile, mkdir, open, readFile, rename } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+import { z } from 'zod';
+import { appConfigSchema, defaultAppConfig } from './schema.js';
+import type { AppConfig } from './schema.js';
+import type { JsonValue } from '../../types/json.js';
+
+export type LoadedConfig = { config: AppConfig; etag: string };
+
+export class ConfigInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigInvalidError';
+  }
+}
+
+export class EtagMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EtagMismatchError';
+  }
+}
+
+function isErrno(error: Error, code: string): boolean {
+  const candidate: { code?: string } = error;
+  return candidate.code === code;
+}
+
+function canonicalize(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === 'object') {
+    const sorted: { [key: string]: JsonValue } = {};
+    for (const key of Object.keys(value).sort()) {
+      const entry = value[key];
+      if (entry !== undefined) sorted[key] = canonicalize(entry);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+export function etagOf(config: AppConfig): string {
+  const canonical = canonicalize(JSON.parse(JSON.stringify(config)) as JsonValue);
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex').slice(0, 32);
+}
+
+export class ConfigStore {
+  private readonly path: string;
+  private readonly backupPath: string;
+  private readonly tmpPath: string;
+
+  constructor(private readonly dir: string) {
+    this.path = join(dir, 'config.json');
+    this.backupPath = join(dir, 'config.json.bak');
+    this.tmpPath = join(dir, 'config.json.tmp');
+  }
+
+  async load(): Promise<LoadedConfig> {
+    await mkdir(this.dir, { recursive: true });
+
+    let text: string;
+    try {
+      text = await readFile(this.path, 'utf8');
+    } catch (error) {
+      if (error instanceof Error && isErrno(error, 'ENOENT')) {
+        const config = defaultAppConfig();
+        await this.writeAtomic(config);
+        return { config, etag: etagOf(config) };
+      }
+      throw error;
+    }
+
+    let raw: JsonValue;
+    try {
+      raw = JSON.parse(text) as JsonValue;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ConfigInvalidError(
+        `${this.path} is not valid JSON: ${detail}${await this.backupHint()}`,
+      );
+    }
+
+    const result = appConfigSchema.safeParse(raw);
+    if (!result.success) {
+      throw new ConfigInvalidError(
+        `${this.path} does not match the config schema:\n${z.prettifyError(result.error)}${await this.backupHint()}`,
+      );
+    }
+    return { config: result.data, etag: etagOf(result.data) };
+  }
+
+  async save(config: AppConfig, expectedEtag: string | null): Promise<LoadedConfig> {
+    const validated = appConfigSchema.parse(config);
+    if (expectedEtag !== null) {
+      const current = await this.load();
+      if (current.etag !== expectedEtag) {
+        throw new EtagMismatchError(
+          'the configuration changed since it was read; reload and reapply your edit',
+        );
+      }
+    }
+    await this.writeAtomic(validated);
+    return { config: validated, etag: etagOf(validated) };
+  }
+
+  private async writeAtomic(config: AppConfig): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+
+    try {
+      await copyFile(this.path, this.backupPath);
+    } catch (error) {
+      if (!(error instanceof Error && isErrno(error, 'ENOENT'))) throw error;
+    }
+
+    const handle = await open(this.tmpPath, 'w');
+    try {
+      await handle.writeFile(`${JSON.stringify(config, null, 2)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(this.tmpPath, this.path);
+
+    const dirHandle = await open(this.dir, 'r');
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
+  }
+
+  private async backupHint(): Promise<string> {
+    try {
+      const text = await readFile(this.backupPath, 'utf8');
+      const parsed = appConfigSchema.safeParse(JSON.parse(text) as JsonValue);
+      if (parsed.success) {
+        return `\n\nThe backup at ${this.backupPath} parses cleanly. To recover, copy it over ${this.path} and restart.`;
+      }
+    } catch {
+      // No usable backup; the primary error stands on its own.
+    }
+    return '';
+  }
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/config/store.test.ts`
+Expected: PASS, 10 tests.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add atomic config store
+
+tmp -> fsync -> rename -> fsync(dir), retaining the prior version as
+.bak. Refuses to start on an invalid config instead of resetting it, and
+points at the backup when the backup is usable. Etags are computed over
+a key-sorted canonical form so a round trip cannot cause a false 409."
+```
+
+---
+
+### Task 14: Secret redaction
+
+**Files:**
+- Create: `src/config/redact.ts`
+- Test: `test/config/redact.test.ts`
+
+**Interfaces:**
+- Consumes: `AppConfig`, `DrainEntry`, `SinkEntry`, `ServerConfig`, `appConfigSchema` from `src/config/schema.ts`; `JsonValue` from `types/json.ts`.
+- Produces: `type RedactedDrain`, `type RedactedConfig`, `redactConfig(config: AppConfig): RedactedConfig`, `restoreSecrets(incoming: JsonValue, current: AppConfig): AppConfig`, `class SecretRestoreError`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/config/redact.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import { redactConfig, restoreSecrets, SecretRestoreError } from '../../src/config/redact.js';
+import type { AppConfig } from '../../src/config/schema.js';
+
+function configWithSecrets(): AppConfig {
+  return {
+    ...defaultAppConfig(),
+    drains: [
+      { id: 'd1', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 },
+    ],
+    sinks: [
+      {
+        name: 'loki',
+        enabled: true,
+        filter: {},
+        maxSpoolBytes: 536_870_912,
+        maxBatchEvents: 1000,
+        maxBatchBytes: 4_194_304,
+        config: {
+          type: 'loki',
+          url: 'http://loki:3100',
+          auth: { kind: 'basic', username: 'user', password: 'pw' },
+          tenantId: null,
+          labels: { static: { job: 'vercel' }, fromFields: ['level'] },
+          timeoutMs: 5000,
+        },
+      },
+    ],
+  };
+}
+
+describe('redactConfig', () => {
+  it('nulls drain secrets and flags their presence', () => {
+    const redacted = redactConfig(configWithSecrets());
+    expect(redacted.drains[0]?.secret).toBeNull();
+    expect(redacted.drains[0]?.hasSecret).toBe(true);
+    expect(JSON.stringify(redacted)).not.toContain('x'.repeat(32));
+  });
+
+  it('nulls loki passwords and flags their presence', () => {
+    const redacted = redactConfig(configWithSecrets());
+    const sinkConfig = redacted.sinks[0]?.config;
+    expect(JSON.stringify(sinkConfig)).not.toContain('pw');
+    expect(JSON.stringify(sinkConfig)).toContain('user');
+  });
+
+  it('preserves everything non-secret', () => {
+    const redacted = redactConfig(configWithSecrets());
+    expect(redacted.drains[0]?.name).toBe('prod');
+    expect(redacted.sinks[0]?.name).toBe('loki');
+  });
+});
+
+describe('restoreSecrets', () => {
+  it('keeps the existing drain secret when the incoming one is null', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    const restored = restoreSecrets(incoming, current);
+    expect(restored.drains[0]?.secret).toBe('x'.repeat(32));
+  });
+
+  it('keeps the existing loki password when the incoming one is null', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    const restored = restoreSecrets(incoming, current);
+    const auth = restored.sinks[0]?.config;
+    expect(auth?.type === 'loki' && auth.auth.kind === 'basic' && auth.auth.password).toBe('pw');
+  });
+
+  it('replaces a secret when a new string is supplied', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    incoming.drains[0].secret = 'y'.repeat(32);
+    const restored = restoreSecrets(incoming, current);
+    expect(restored.drains[0]?.secret).toBe('y'.repeat(32));
+  });
+
+  it('fails when a brand-new drain arrives with no secret', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    incoming.drains.push({
+      id: 'd2',
+      name: 'new',
+      secret: null,
+      hasSecret: false,
+      enabled: true,
+      createdAt: 2,
+    });
+    expect(() => restoreSecrets(incoming, current)).toThrow(SecretRestoreError);
+  });
+
+  it('fails when a brand-new loki sink arrives with basic auth and no password', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    incoming.sinks[0].name = 'loki-two';
+    expect(() => restoreSecrets(incoming, current)).toThrow(SecretRestoreError);
+  });
+
+  it('produces a config that passes the full schema', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    expect(restoreSecrets(incoming, current)).toEqual(current);
+  });
+});
+```
+
+Matching is by identity — `drains` by `id`, `sinks` by `name` — which is why
+renaming a sink is treated as a new sink and requires its secret again.
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/config/redact.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/config/redact.ts`**
+
+```ts
+import { z } from 'zod';
+import { appConfigSchema } from './schema.js';
+import type { AppConfig, DrainEntry, ServerConfig, SinkEntry } from './schema.js';
+import type { JsonValue } from '../../types/json.js';
+
+export class SecretRestoreError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SecretRestoreError';
+  }
+}
+
+export type RedactedDrain = Omit<DrainEntry, 'secret'> & { secret: null; hasSecret: boolean };
+
+export type RedactedConfig = {
+  version: 1;
+  drains: RedactedDrain[];
+  sinks: SinkEntry[];
+  server: ServerConfig;
+};
+
+function redactSinkEntry(entry: SinkEntry): SinkEntry {
+  if (entry.config.type !== 'loki') return entry;
+  const auth = entry.config.auth;
+  if (auth.kind === 'basic') {
+    return {
+      ...entry,
+      config: { ...entry.config, auth: { ...auth, password: '' } },
+    };
+  }
+  if (auth.kind === 'bearer') {
+    return { ...entry, config: { ...entry.config, auth: { ...auth, token: '' } } };
+  }
+  return entry;
+}
+
+export function redactConfig(config: AppConfig): RedactedConfig {
+  return {
+    version: 1,
+    drains: config.drains.map(({ secret, ...rest }) => ({
+      ...rest,
+      secret: null,
+      hasSecret: secret.length > 0,
+    })),
+    sinks: config.sinks.map(redactSinkEntry),
+    server: config.server,
+  };
+}
+
+// The incoming payload mirrors RedactedConfig but with secrets optionally
+// replaced by real strings, so it is validated loosely here and strictly by
+// appConfigSchema once secrets have been restored.
+const incomingSchema = z.object({
+  version: z.literal(1),
+  drains: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      secret: z.string().nullish(),
+      enabled: z.boolean(),
+      createdAt: z.number(),
+    }),
+  ),
+  sinks: z.array(z.record(z.string(), z.custom<JsonValue>(() => true))),
+  server: z.record(z.string(), z.custom<JsonValue>(() => true)),
+});
+
+export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConfig {
+  const parsed = incomingSchema.safeParse(incoming);
+  if (!parsed.success) {
+    throw new SecretRestoreError(`malformed configuration payload:\n${z.prettifyError(parsed.error)}`);
+  }
+
+  const drainsById = new Map(current.drains.map((drain) => [drain.id, drain]));
+  const sinksByName = new Map(current.sinks.map((sink) => [sink.name, sink]));
+
+  const drains = parsed.data.drains.map((drain) => {
+    if (typeof drain.secret === 'string' && drain.secret.length > 0) {
+      return { ...drain, secret: drain.secret };
+    }
+    const existing = drainsById.get(drain.id);
+    if (existing === undefined) {
+      throw new SecretRestoreError(
+        `drain "${drain.name}" is new and must be created with a secret`,
+      );
+    }
+    return { ...drain, secret: existing.secret };
+  });
+
+  const sinks = parsed.data.sinks.map((raw) => {
+    const restored = restoreSinkSecret(raw, sinksByName);
+    return restored;
+  });
+
+  const candidate = { version: 1 as const, drains, sinks, server: parsed.data.server };
+  const validated = appConfigSchema.safeParse(candidate);
+  if (!validated.success) {
+    throw new SecretRestoreError(
+      `configuration is invalid:\n${z.prettifyError(validated.error)}`,
+    );
+  }
+  return validated.data;
+}
+
+function restoreSinkSecret(
+  raw: Record<string, JsonValue>,
+  existingByName: Map<string, SinkEntry>,
+): JsonValue {
+  const config = raw['config'];
+  if (config === null || typeof config !== 'object' || Array.isArray(config)) return raw;
+  if (config['type'] !== 'loki') return raw;
+
+  const auth = config['auth'];
+  if (auth === null || typeof auth !== 'object' || Array.isArray(auth)) return raw;
+
+  const name = typeof raw['name'] === 'string' ? raw['name'] : '';
+  const existing = existingByName.get(name);
+  const existingAuth =
+    existing !== undefined && existing.config.type === 'loki' ? existing.config.auth : null;
+
+  const field = auth['kind'] === 'basic' ? 'password' : auth['kind'] === 'bearer' ? 'token' : null;
+  if (field === null) return raw;
+
+  const supplied = auth[field];
+  if (typeof supplied === 'string' && supplied.length > 0) return raw;
+
+  if (existingAuth === null || existingAuth.kind !== auth['kind']) {
+    throw new SecretRestoreError(
+      `sink "${name}" uses ${String(auth['kind'])} auth and must be saved with its ${field}`,
+    );
+  }
+  const carried = existingAuth.kind === 'basic' ? existingAuth.password : existingAuth.token;
+  return { ...raw, config: { ...config, auth: { ...auth, [field]: carried } } };
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/config/redact.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: make config secrets write-only
+
+Reads return null with a hasSecret flag; writes carry forward the stored
+value unless a replacement is supplied, matched by drain id and sink
+name. A new entry must supply its own secret."
+```
+
+---
+
+### Task 15: Metrics
+
+**Files:**
+- Create: `src/status/metrics.ts`, `types/api.ts`
+- Test: `test/status/metrics.test.ts`
+
+**Interfaces:**
+- Consumes: `LogEvent` from `src/vercel/event.ts`; `RejectedEntry` from `src/vercel/decode.ts`.
+- Produces: in `types/api.ts` the shared shapes `DrainOutcome`, `SinkHealthState`, `SinkHealth`, `DrainStatus`, `SinkStatus`, `VolumeStatus`, `OrphanedSpool`, `StatusSnapshot`; in `src/status/metrics.ts` the `Metrics` class and `initialSinkHealth()`.
+
+`types/api.ts` contains **only** type declarations with no imports, so both the
+server and the SPA can consume it without resolution friction.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/status/metrics.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { Metrics } from '../../src/status/metrics.js';
+
+function event(id: string, timestamp = 1000) {
+  return { id, timestamp, source: 'lambda', projectId: 'p1' };
+}
+
+describe('Metrics', () => {
+  it('counts drain request outcomes separately', () => {
+    const metrics = new Metrics();
+    metrics.recordDrainRequest('d1', 'ok');
+    metrics.recordDrainRequest('d1', 'ok');
+    metrics.recordDrainRequest('d1', 'badSignature');
+
+    const drain = metrics.snapshot().drains.find((entry) => entry.id === 'd1');
+    expect(drain?.requests).toMatchObject({ ok: 2, badSignature: 1 });
+  });
+
+  it('tracks events received and the latest event timestamp', () => {
+    const metrics = new Metrics();
+    metrics.recordEventsReceived('d1', 3, 5000);
+    metrics.recordEventsReceived('d1', 2, 4000);
+
+    const drain = metrics.snapshot().drains.find((entry) => entry.id === 'd1');
+    expect(drain?.eventsReceived).toBe(5);
+    // The latest timestamp must not go backwards on an out-of-order batch.
+    expect(drain?.lastEventAt).toBe(5000);
+  });
+
+  it('accumulates sink counters', () => {
+    const metrics = new Metrics();
+    metrics.recordDelivered('loki', 10);
+    metrics.recordDropped('loki', 3);
+    metrics.recordDeadLettered('loki', 1);
+
+    expect(metrics.snapshot().sinkCounters['loki']).toEqual({
+      delivered: 10,
+      dropped: 3,
+      deadLettered: 1,
+    });
+  });
+
+  it('returns a default health for an unknown sink', () => {
+    const metrics = new Metrics();
+    expect(metrics.getSinkHealth('never-seen').state).toBe('ok');
+    expect(metrics.getSinkHealth('never-seen').consecutiveFailures).toBe(0);
+  });
+
+  it('stores and returns sink health', () => {
+    const metrics = new Metrics();
+    metrics.setSinkHealth('loki', {
+      state: 'failed',
+      consecutiveFailures: 7,
+      lastError: 'boom',
+      lastErrorAt: 100,
+      lastSuccessAt: null,
+      nextRetryAt: 200,
+    });
+    expect(metrics.getSinkHealth('loki').state).toBe('failed');
+  });
+
+  it('bounds the recent-events ring buffer and keeps the newest', () => {
+    const metrics = new Metrics();
+    for (let index = 0; index < 250; index += 1) {
+      metrics.pushRecentEvents([event(`e${String(index)}`)]);
+    }
+    const recent = metrics.snapshot().recent.events;
+    expect(recent).toHaveLength(200);
+    expect(recent[recent.length - 1]?.id).toBe('e249');
+  });
+
+  it('bounds the rejects and errors ring buffers', () => {
+    const metrics = new Metrics();
+    for (let index = 0; index < 120; index += 1) {
+      metrics.recordRejected('d1', [{ index, reason: 'bad', snippet: 'x' }]);
+      metrics.recordError('loki', `failure ${String(index)}`);
+    }
+    expect(metrics.snapshot().recent.rejects.length).toBeLessThanOrEqual(100);
+    expect(metrics.snapshot().recent.errors.length).toBeLessThanOrEqual(100);
+  });
+
+  it('forgets a removed sink', () => {
+    const metrics = new Metrics();
+    metrics.recordDelivered('gone', 5);
+    metrics.forgetSink('gone');
+    expect(metrics.snapshot().sinkCounters['gone']).toBeUndefined();
+  });
+
+  it('reports uptime as a non-negative number', () => {
+    expect(new Metrics().snapshot().uptimeSec).toBeGreaterThanOrEqual(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/status/metrics.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Create `types/api.ts`**
+
+```ts
+export type DrainOutcome = 'ok' | 'badSignature' | 'notFound' | 'disabled' | 'malformedBody';
+
+export type SinkHealthState = 'ok' | 'retrying' | 'failed';
+
+export type SinkHealth = {
+  state: SinkHealthState;
+  consecutiveFailures: number;
+  lastError: string | null;
+  lastErrorAt: number | null;
+  lastSuccessAt: number | null;
+  nextRetryAt: number | null;
+};
+
+export type DrainRequestCounters = {
+  ok: number;
+  badSignature: number;
+  notFound: number;
+  disabled: number;
+  malformedBody: number;
+};
+
+export type DrainStatus = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  eventsReceived: number;
+  lastEventAt: number | null;
+  requests: DrainRequestCounters;
+};
+
+export type SinkCounters = { delivered: number; dropped: number; deadLettered: number };
+
+export type SinkStatus = {
+  name: string;
+  type: string;
+  enabled: boolean;
+  health: SinkHealth;
+  queue: { files: number; bytes: number; oldestAgeSec: number | null };
+  counters: SinkCounters;
+};
+
+export type VolumeStatus = { path: string; freeBytes: number; totalBytes: number };
+
+export type OrphanedSpool = { name: string; files: number; bytes: number };
+
+export type RejectRecord = { drainId: string; index: number; reason: string; snippet: string };
+
+export type ErrorRecord = { scope: string; message: string; at: number };
+
+export type StatusSnapshot = {
+  service: { state: 'ok' | 'degraded'; uptimeSec: number; version: string; startedAt: number };
+  volumes: { config: VolumeStatus; spool: VolumeStatus };
+  drains: DrainStatus[];
+  sinks: SinkStatus[];
+  orphanedSpools: OrphanedSpool[];
+  recent: { events: unknown[]; rejects: RejectRecord[]; errors: ErrorRecord[] };
+};
+```
+
+`recent.events` is the single permitted `unknown[]` in the codebase: it is
+opaque JSON passed straight to the browser for display and never inspected by
+type-dependent logic. Add the ESLint disable comment on that line only:
+
+```ts
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opaque display payload
+```
+
+If ESLint objects to `unknown[]` here under a future rule, change it to
+`JsonValue[]` by importing from `./json.js` — but that adds an import to this
+otherwise import-free file, so prefer the narrow disable.
+
+- [ ] **Step 4: Implement `src/status/metrics.ts`**
+
+```ts
+import type { LogEvent } from '../vercel/event.js';
+import type { RejectedEntry } from '../vercel/decode.js';
+import type {
+  DrainOutcome,
+  DrainRequestCounters,
+  ErrorRecord,
+  RejectRecord,
+  SinkCounters,
+  SinkHealth,
+} from '../../types/api.js';
+
+const RECENT_EVENT_LIMIT = 200;
+const RECENT_RECORD_LIMIT = 100;
+
+export type MetricsSnapshot = {
+  uptimeSec: number;
+  startedAt: number;
+  drains: {
+    id: string;
+    eventsReceived: number;
+    lastEventAt: number | null;
+    requests: DrainRequestCounters;
+  }[];
+  sinkCounters: Record<string, SinkCounters>;
+  sinkHealth: Record<string, SinkHealth>;
+  recent: { events: LogEvent[]; rejects: RejectRecord[]; errors: ErrorRecord[] };
+};
+
+export function initialSinkHealth(): SinkHealth {
+  return {
+    state: 'ok',
+    consecutiveFailures: 0,
+    lastError: null,
+    lastErrorAt: null,
+    lastSuccessAt: null,
+    nextRetryAt: null,
+  };
+}
+
+function emptyRequestCounters(): DrainRequestCounters {
+  return { ok: 0, badSignature: 0, notFound: 0, disabled: 0, malformedBody: 0 };
+}
+
+function pushBounded<T>(buffer: T[], items: T[], limit: number): void {
+  buffer.push(...items);
+  if (buffer.length > limit) buffer.splice(0, buffer.length - limit);
+}
+
+type DrainCounters = {
+  eventsReceived: number;
+  lastEventAt: number | null;
+  requests: DrainRequestCounters;
+};
+
+export class Metrics {
+  private readonly startedAt = Date.now();
+  private readonly drains = new Map<string, DrainCounters>();
+  private readonly sinkCounters = new Map<string, SinkCounters>();
+  private readonly sinkHealth = new Map<string, SinkHealth>();
+  private readonly recentEvents: LogEvent[] = [];
+  private readonly recentRejects: RejectRecord[] = [];
+  private readonly recentErrors: ErrorRecord[] = [];
+
+  private drainCounters(drainId: string): DrainCounters {
+    const existing = this.drains.get(drainId);
+    if (existing !== undefined) return existing;
+    const created: DrainCounters = {
+      eventsReceived: 0,
+      lastEventAt: null,
+      requests: emptyRequestCounters(),
+    };
+    this.drains.set(drainId, created);
+    return created;
+  }
+
+  private counters(sinkName: string): SinkCounters {
+    const existing = this.sinkCounters.get(sinkName);
+    if (existing !== undefined) return existing;
+    const created: SinkCounters = { delivered: 0, dropped: 0, deadLettered: 0 };
+    this.sinkCounters.set(sinkName, created);
+    return created;
+  }
+
+  recordDrainRequest(drainId: string, outcome: DrainOutcome): void {
+    this.drainCounters(drainId).requests[outcome] += 1;
+  }
+
+  recordEventsReceived(drainId: string, count: number, latestTimestampMs: number): void {
+    const counters = this.drainCounters(drainId);
+    counters.eventsReceived += count;
+    if (counters.lastEventAt === null || latestTimestampMs > counters.lastEventAt) {
+      counters.lastEventAt = latestTimestampMs;
+    }
+  }
+
+  recordRejected(drainId: string, entries: RejectedEntry[]): void {
+    pushBounded(
+      this.recentRejects,
+      entries.map((entry) => ({ drainId, ...entry })),
+      RECENT_RECORD_LIMIT,
+    );
+  }
+
+  recordDelivered(sinkName: string, count: number): void {
+    this.counters(sinkName).delivered += count;
+  }
+
+  recordDropped(sinkName: string, count: number): void {
+    this.counters(sinkName).dropped += count;
+  }
+
+  recordDeadLettered(sinkName: string, count: number): void {
+    this.counters(sinkName).deadLettered += count;
+  }
+
+  setSinkHealth(sinkName: string, health: SinkHealth): void {
+    this.sinkHealth.set(sinkName, health);
+  }
+
+  getSinkHealth(sinkName: string): SinkHealth {
+    return this.sinkHealth.get(sinkName) ?? initialSinkHealth();
+  }
+
+  pushRecentEvents(events: LogEvent[]): void {
+    pushBounded(this.recentEvents, events, RECENT_EVENT_LIMIT);
+  }
+
+  recordError(scope: string, message: string): void {
+    pushBounded(this.recentErrors, [{ scope, message, at: Date.now() }], RECENT_RECORD_LIMIT);
+  }
+
+  forgetSink(sinkName: string): void {
+    this.sinkCounters.delete(sinkName);
+    this.sinkHealth.delete(sinkName);
+  }
+
+  snapshot(): MetricsSnapshot {
+    return {
+      uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
+      startedAt: this.startedAt,
+      drains: [...this.drains.entries()].map(([id, counters]) => ({ id, ...counters })),
+      sinkCounters: Object.fromEntries(this.sinkCounters),
+      sinkHealth: Object.fromEntries(this.sinkHealth),
+      recent: {
+        events: [...this.recentEvents],
+        rejects: [...this.recentRejects],
+        errors: [...this.recentErrors],
+      },
+    };
+  }
+}
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run test/status/metrics.test.ts`
+Expected: PASS.
+
+- [ ] **Step 6: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add in-memory metrics and shared status types
+
+Counters and bounded ring buffers, reset on restart by design. Status
+shapes live in types/api.ts with no imports so both the server and the
+SPA can consume them."
+```
+
+---
+
+### Task 16: Durable spool queue
+
+The core durability primitive. Take your time here; the end-to-end test in
+Task 24 exists to prove this module's contract.
+
+**Files:**
+- Create: `src/pipeline/spool.ts`
+- Test: `test/pipeline/spool.test.ts`
+
+**Interfaces:**
+- Consumes: `LogEvent`, `logEventSchema` from `src/vercel/event.ts`; `FreeSpaceProbe`, `statfsFreeSpace` re-exported from `src/sinks/file.ts`.
+- Produces: `type SpoolOptions`, `type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number }`, `type EnqueueResult = { writtenBytes: number; droppedEvents: number }`, `class SpoolQueue` with `static open`, `enqueue`, `nextBatch`, `ack`, `deadLetter`, `bytes`, `fileCount`, `oldestMtimeMs`, `discardAll`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pipeline/spool.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SpoolQueue } from '../../src/pipeline/spool.js';
+
+const BIG = 1_048_576;
+
+function event(id: string, timestamp = 1000) {
+  return { id, timestamp, source: 'lambda', projectId: 'p1' };
+}
+
+function options(overrides: Partial<{ maxSpoolBytes: number; freeSpaceFloorBytes: number }> = {}) {
+  return { maxSpoolBytes: BIG, freeSpaceFloorBytes: 0, ...overrides };
+}
+
+describe('SpoolQueue', () => {
+  let dir = '';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-spool-'));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('round-trips a batch through enqueue and nextBatch', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a'), event('b')]);
+
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['a', 'b']);
+    expect(batch?.files).toHaveLength(1);
+  });
+
+  it('returns null when empty', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    expect(await queue.nextBatch(1000, BIG)).toBeNull();
+  });
+
+  it('ack removes exactly the coalesced files', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a')]);
+    await queue.enqueue([event('b')]);
+    await queue.enqueue([event('c')]);
+
+    const batch = await queue.nextBatch(2, BIG);
+    expect(batch?.files).toHaveLength(2);
+    await queue.ack(batch!);
+
+    expect(queue.fileCount()).toBe(1);
+    const remaining = await queue.nextBatch(1000, BIG);
+    expect(remaining?.events.map((e) => e['id'])).toEqual(['c']);
+  });
+
+  it('delivers in FIFO order across a padding boundary', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    for (let index = 0; index < 12; index += 1) {
+      await queue.enqueue([event(`e${String(index)}`)]);
+    }
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(
+      Array.from({ length: 12 }, (_unused, index) => `e${String(index)}`),
+    );
+  });
+
+  it('coalesces up to maxEvents but always returns at least one file', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a'), event('b'), event('c')]);
+
+    // A single file already exceeds the limit; it must still be returned,
+    // otherwise the queue would deadlock on its own head.
+    const batch = await queue.nextBatch(1, BIG);
+    expect(batch?.files).toHaveLength(1);
+    expect(batch?.events).toHaveLength(3);
+  });
+
+  it('recovers sequence and byte accounting after reopening', async () => {
+    const first = await SpoolQueue.open(dir, options());
+    await first.enqueue([event('a')]);
+    await first.enqueue([event('b')]);
+    const bytesBefore = first.bytes();
+
+    const second = await SpoolQueue.open(dir, options());
+    expect(second.fileCount()).toBe(2);
+    expect(second.bytes()).toBe(bytesBefore);
+
+    await second.enqueue([event('c')]);
+    const batch = await second.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['a', 'b', 'c']);
+  });
+
+  it('deletes stray .tmp files on open and ignores unrelated files', async () => {
+    await writeFile(join(dir, '000000000005.jsonl.tmp'), 'garbage');
+    await writeFile(join(dir, 'README.txt'), 'not a batch');
+
+    const queue = await SpoolQueue.open(dir, options());
+
+    expect(queue.fileCount()).toBe(0);
+    const entries = await readdir(dir);
+    expect(entries).not.toContain('000000000005.jsonl.tmp');
+    expect(entries).toContain('README.txt');
+  });
+
+  it('drops the oldest batches when the byte budget is exceeded', async () => {
+    const queue = await SpoolQueue.open(dir, options({ maxSpoolBytes: 400 }));
+    // Each event line is roughly 70 bytes.
+    const first = await queue.enqueue([event('a1'), event('a2'), event('a3')]);
+    expect(first.droppedEvents).toBe(0);
+
+    let dropped = 0;
+    for (let index = 0; index < 8; index += 1) {
+      const result = await queue.enqueue([event(`b${String(index)}`)]);
+      dropped += result.droppedEvents;
+    }
+
+    expect(dropped).toBeGreaterThan(0);
+    expect(queue.bytes()).toBeLessThanOrEqual(400);
+    // Newest data survives; the oldest was sacrificed.
+    const batch = await queue.nextBatch(1000, BIG);
+    const ids = batch?.events.map((e) => e['id']) ?? [];
+    expect(ids).toContain('b7');
+    expect(ids).not.toContain('a1');
+  });
+
+  it('drops the whole batch when free space is below the floor', async () => {
+    const queue = await SpoolQueue.open(dir, {
+      maxSpoolBytes: BIG,
+      freeSpaceFloorBytes: 1_000_000,
+      freeSpace: () => Promise.resolve(500),
+    });
+
+    const result = await queue.enqueue([event('a'), event('b')]);
+
+    expect(result.droppedEvents).toBe(2);
+    expect(result.writtenBytes).toBe(0);
+    expect(queue.fileCount()).toBe(0);
+  });
+
+  it('writes normally when free space is above the floor', async () => {
+    const queue = await SpoolQueue.open(dir, {
+      maxSpoolBytes: BIG,
+      freeSpaceFloorBytes: 1000,
+      freeSpace: () => Promise.resolve(50_000_000),
+    });
+    const result = await queue.enqueue([event('a')]);
+    expect(result.droppedEvents).toBe(0);
+    expect(queue.fileCount()).toBe(1);
+  });
+
+  it('moves a batch to the dead directory', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a')]);
+    const batch = await queue.nextBatch(1000, BIG);
+
+    await queue.deadLetter(batch!);
+
+    expect(queue.fileCount()).toBe(0);
+    expect(queue.bytes()).toBe(0);
+    const dead = await readdir(join(dir, 'dead'));
+    expect(dead).toHaveLength(1);
+    expect(await readFile(join(dir, 'dead', dead[0] ?? ''), 'utf8')).toContain('"a"');
+  });
+
+  it('skips unparseable lines rather than looping forever', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a')]);
+    const [name] = await readdir(dir).then((entries) => entries.filter((e) => e.endsWith('.jsonl')));
+    await writeFile(join(dir, name ?? ''), 'this is not json\n');
+
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.events).toEqual([]);
+    expect(batch?.files).toHaveLength(1);
+    // Acking a zero-event batch is what lets the queue self-heal past corruption.
+    await queue.ack(batch!);
+    expect(queue.fileCount()).toBe(0);
+  });
+
+  it('reports the age of the head of the queue', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    expect(await queue.oldestMtimeMs()).toBeNull();
+    await queue.enqueue([event('a')]);
+    const mtime = await queue.oldestMtimeMs();
+    expect(mtime).not.toBeNull();
+    expect(Date.now() - (mtime ?? 0)).toBeLessThan(10_000);
+  });
+
+  it('discards everything including dead letters', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('a')]);
+    const batch = await queue.nextBatch(1000, BIG);
+    await queue.deadLetter(batch!);
+    await queue.enqueue([event('b')]);
+
+    await queue.discardAll();
+
+    expect(queue.fileCount()).toBe(0);
+    expect(queue.bytes()).toBe(0);
+    expect(await readdir(join(dir, 'dead'))).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/pipeline/spool.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/pipeline/spool.ts`**
+
+```ts
+import { mkdir, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { logEventSchema } from '../vercel/event.js';
+import { statfsFreeSpace } from '../sinks/file.js';
+import type { LogEvent } from '../vercel/event.js';
+import type { FreeSpaceProbe } from '../sinks/types.js';
+
+const BATCH_NAME = /^\d{12}\.jsonl$/;
+const SEQ_WIDTH = 12;
+const DEAD_DIR = 'dead';
+
+export type SpoolOptions = {
+  maxSpoolBytes: number;
+  freeSpaceFloorBytes: number;
+  freeSpace?: FreeSpaceProbe;
+};
+
+export type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number };
+export type EnqueueResult = { writtenBytes: number; droppedEvents: number };
+
+type Entry = { name: string; bytes: number };
+
+function serialize(events: LogEvent[]): Buffer {
+  return Buffer.from(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8');
+}
+
+function parseLines(text: string): LogEvent[] {
+  const events: LogEvent[] = [];
+  for (const line of text.split('\n')) {
+    if (line.trim().length === 0) continue;
+    try {
+      const parsed = logEventSchema.safeParse(JSON.parse(line));
+      if (parsed.success) events.push(parsed.data);
+    } catch {
+      // A corrupt line is skipped. The batch may end up empty, which the
+      // worker acks — that is how the queue heals past corruption instead of
+      // retrying a broken head forever.
+    }
+  }
+  return events;
+}
+
+function countLines(text: string): number {
+  return text.split('\n').filter((line) => line.trim().length > 0).length;
+}
+
+export class SpoolQueue {
+  private entries: Entry[] = [];
+  private totalBytes = 0;
+  private seq = 0;
+  private readonly freeSpace: FreeSpaceProbe;
+
+  private constructor(
+    private readonly dir: string,
+    private readonly options: SpoolOptions,
+  ) {
+    this.freeSpace = options.freeSpace ?? statfsFreeSpace;
+  }
+
+  static async open(dir: string, options: SpoolOptions): Promise<SpoolQueue> {
+    const queue = new SpoolQueue(dir, options);
+    await mkdir(join(dir, DEAD_DIR), { recursive: true });
+    await queue.recover();
+    return queue;
+  }
+
+  private async recover(): Promise<void> {
+    const names = await readdir(this.dir);
+    const batches: string[] = [];
+
+    for (const name of names) {
+      if (name.endsWith('.tmp')) {
+        await unlink(join(this.dir, name)).catch(() => undefined);
+        continue;
+      }
+      if (BATCH_NAME.test(name)) batches.push(name);
+    }
+    batches.sort();
+
+    const entries: Entry[] = [];
+    let total = 0;
+    let maxSeq = -1;
+    for (const name of batches) {
+      const stats = await stat(join(this.dir, name));
+      entries.push({ name, bytes: stats.size });
+      total += stats.size;
+      maxSeq = Math.max(maxSeq, Number.parseInt(name.slice(0, SEQ_WIDTH), 10));
+    }
+
+    this.entries = entries;
+    this.totalBytes = total;
+    this.seq = maxSeq + 1;
+  }
+
+  bytes(): number {
+    return this.totalBytes;
+  }
+
+  fileCount(): number {
+    return this.entries.length;
+  }
+
+  async enqueue(events: LogEvent[]): Promise<EnqueueResult> {
+    if (events.length === 0) return { writtenBytes: 0, droppedEvents: 0 };
+
+    if (this.options.freeSpaceFloorBytes > 0) {
+      const available = await this.freeSpace(this.dir);
+      if (available < this.options.freeSpaceFloorBytes) {
+        return { writtenBytes: 0, droppedEvents: events.length };
+      }
+    }
+
+    const payload = serialize(events);
+    const droppedEvents = await this.makeRoom(payload.byteLength);
+
+    const name = `${String(this.seq).padStart(SEQ_WIDTH, '0')}.jsonl`;
+    this.seq += 1;
+    const tmpPath = join(this.dir, `${name}.tmp`);
+
+    const handle = await open(tmpPath, 'w');
+    try {
+      await handle.writeFile(payload);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rename(tmpPath, join(this.dir, name));
+
+    const dirHandle = await open(this.dir, 'r');
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
+
+    this.entries.push({ name, bytes: payload.byteLength });
+    this.totalBytes += payload.byteLength;
+    return { writtenBytes: payload.byteLength, droppedEvents };
+  }
+
+  private async makeRoom(incoming: number): Promise<number> {
+    let dropped = 0;
+    while (this.entries.length > 0 && this.totalBytes + incoming > this.options.maxSpoolBytes) {
+      const oldest = this.entries.shift();
+      if (oldest === undefined) break;
+      const path = join(this.dir, oldest.name);
+      try {
+        dropped += countLines(await readFile(path, 'utf8'));
+      } catch {
+        // Already gone; still account for its bytes below.
+      }
+      this.totalBytes -= oldest.bytes;
+      await unlink(path).catch(() => undefined);
+    }
+    // If a single batch is larger than the whole budget the loop empties the
+    // queue and we still write it: refusing the newest data would be worse.
+    return dropped;
+  }
+
+  async nextBatch(maxEvents: number, maxBytes: number): Promise<SpoolBatch | null> {
+    if (this.entries.length === 0) return null;
+
+    const files: string[] = [];
+    const events: LogEvent[] = [];
+    let bytes = 0;
+
+    for (const entry of this.entries) {
+      let text: string;
+      try {
+        text = await readFile(join(this.dir, entry.name), 'utf8');
+      } catch {
+        continue;
+      }
+      const parsed = parseLines(text);
+
+      const wouldExceed = events.length + parsed.length > maxEvents || bytes + entry.bytes > maxBytes;
+      if (files.length > 0 && wouldExceed) break;
+
+      files.push(entry.name);
+      events.push(...parsed);
+      bytes += entry.bytes;
+
+      if (events.length >= maxEvents || bytes >= maxBytes) break;
+    }
+
+    if (files.length === 0) return null;
+    return { files, events, bytes };
+  }
+
+  async ack(batch: SpoolBatch): Promise<void> {
+    await this.removeAll(batch.files, (name) => unlink(join(this.dir, name)));
+  }
+
+  async deadLetter(batch: SpoolBatch): Promise<void> {
+    await this.removeAll(batch.files, (name) =>
+      rename(join(this.dir, name), join(this.dir, DEAD_DIR, name)),
+    );
+  }
+
+  private async removeAll(
+    names: string[],
+    action: (name: string) => Promise<void>,
+  ): Promise<void> {
+    const removing = new Set(names);
+    for (const name of names) {
+      await action(name).catch(() => undefined);
+    }
+    const kept: Entry[] = [];
+    for (const entry of this.entries) {
+      if (removing.has(entry.name)) {
+        this.totalBytes -= entry.bytes;
+      } else {
+        kept.push(entry);
+      }
+    }
+    this.entries = kept;
+  }
+
+  async oldestMtimeMs(): Promise<number | null> {
+    const oldest = this.entries[0];
+    if (oldest === undefined) return null;
+    try {
+      const stats = await stat(join(this.dir, oldest.name));
+      return stats.mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
+  async discardAll(): Promise<void> {
+    for (const entry of this.entries) {
+      await unlink(join(this.dir, entry.name)).catch(() => undefined);
+    }
+    this.entries = [];
+    this.totalBytes = 0;
+    await rm(join(this.dir, DEAD_DIR), { recursive: true, force: true });
+    await mkdir(join(this.dir, DEAD_DIR), { recursive: true });
+  }
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/pipeline/spool.test.ts`
+Expected: PASS, 14 tests.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add durable spool queue
+
+Batch files are written tmp -> fsync -> rename -> fsync(dir) so a crash
+never exposes a partial batch, and are unlinked only after a sink
+accepts them. Twelve-digit sequence names make lexicographic order FIFO
+order. Overflow drops oldest with a counted event total; a corrupt file
+yields an empty batch that the worker acks, so the head can never wedge."
+```
+
+---
+
+### Task 17: Dispatcher — worker loop, backoff, and health
+
+**Files:**
+- Create: `src/pipeline/dispatcher.ts`
+- Test: `test/pipeline/dispatcher-worker.test.ts`
+
+**Interfaces:**
+- Consumes: `SpoolQueue`, `SpoolBatch` from `src/pipeline/spool.ts`; `Sink`, `PermanentDeliveryError`, `AuthDeliveryError` from `src/sinks/types.ts`; `Metrics`, `initialSinkHealth` from `src/status/metrics.ts`; `Logger` from `src/log.ts`.
+- Produces: `backoffDelayMs(consecutiveFailures, baseMs, capMs, random): number`, `class SinkWorker` (internal but exported for testing) with `start()`, `stop()`, `drainOnce(): Promise<boolean>`, and `health(): SinkHealth`.
+
+Config reconciliation is Task 18. This task builds the worker in isolation so
+its retry semantics can be tested without any config machinery.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pipeline/dispatcher-worker.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { SpoolQueue } from '../../src/pipeline/spool.js';
+import { backoffDelayMs, SinkWorker } from '../../src/pipeline/dispatcher.js';
+import { Metrics } from '../../src/status/metrics.js';
+import { AuthDeliveryError, PermanentDeliveryError } from '../../src/sinks/types.js';
+import type { LogEvent } from '../../src/vercel/event.js';
+import type { Sink } from '../../src/sinks/types.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+function event(id: string) {
+  return { id, timestamp: 1000, source: 'lambda', projectId: 'p1' };
+}
+
+class FakeSink implements Sink {
+  readonly type = 'fake';
+  readonly received: LogEvent[][] = [];
+  constructor(
+    readonly name: string,
+    private readonly behavior: (attempt: number) => Error | null = () => null,
+  ) {}
+  private attempts = 0;
+  deliver(events: LogEvent[]): Promise<void> {
+    this.attempts += 1;
+    const error = this.behavior(this.attempts);
+    if (error !== null) return Promise.reject(error);
+    this.received.push(events);
+    return Promise.resolve();
+  }
+  close(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+describe('backoffDelayMs', () => {
+  it('grows exponentially from the base', () => {
+    expect(backoffDelayMs(1, 1000, 60_000, () => 0)).toBe(1000);
+    expect(backoffDelayMs(2, 1000, 60_000, () => 0)).toBe(2000);
+    expect(backoffDelayMs(3, 1000, 60_000, () => 0)).toBe(4000);
+  });
+
+  it('caps at the maximum', () => {
+    expect(backoffDelayMs(30, 1000, 60_000, () => 0)).toBe(60_000);
+  });
+
+  it('adds jitter above the base delay', () => {
+    const withJitter = backoffDelayMs(1, 1000, 60_000, () => 1);
+    expect(withJitter).toBeGreaterThan(1000);
+    expect(withJitter).toBeLessThanOrEqual(1300);
+  });
+
+  it('never returns less than the base for the first failure', () => {
+    expect(backoffDelayMs(0, 1000, 60_000, () => 0)).toBe(1000);
+  });
+});
+
+describe('SinkWorker', () => {
+  let dir = '';
+  let metrics: Metrics;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'vld-worker-'));
+    metrics = new Metrics();
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function makeWorker(sink: Sink): Promise<{ worker: SinkWorker; queue: SpoolQueue }> {
+    const queue = await SpoolQueue.open(dir, { maxSpoolBytes: 1_048_576, freeSpaceFloorBytes: 0 });
+    const worker = new SinkWorker({
+      sink,
+      queue,
+      metrics,
+      log: silentLog,
+      maxBatchEvents: 1000,
+      maxBatchBytes: 1_048_576,
+      baseBackoffMs: 10,
+      maxBackoffMs: 40,
+      random: () => 0,
+    });
+    return { worker, queue };
+  }
+
+  it('delivers a spooled batch and removes it', async () => {
+    const sink = new FakeSink('ok');
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    expect(await worker.drainOnce()).toBe(true);
+
+    expect(sink.received[0]?.map((e) => e['id'])).toEqual(['a']);
+    expect(queue.fileCount()).toBe(0);
+    expect(metrics.snapshot().sinkCounters['ok']?.delivered).toBe(1);
+    expect(worker.health().state).toBe('ok');
+  });
+
+  it('reports nothing to do on an empty queue', async () => {
+    const { worker } = await makeWorker(new FakeSink('idle'));
+    expect(await worker.drainOnce()).toBe(false);
+  });
+
+  it('keeps the batch on a retryable failure and escalates after the threshold', async () => {
+    const sink = new FakeSink('flaky', () => new Error('loki down'));
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    await worker.drainOnce();
+    expect(queue.fileCount()).toBe(1);
+    expect(worker.health().state).toBe('retrying');
+    expect(worker.health().consecutiveFailures).toBe(1);
+    expect(worker.health().lastError).toContain('loki down');
+    expect(worker.health().nextRetryAt).not.toBeNull();
+
+    for (let index = 0; index < 4; index += 1) await worker.drainOnce();
+    expect(worker.health().consecutiveFailures).toBe(5);
+    expect(worker.health().state).toBe('failed');
+    expect(queue.fileCount()).toBe(1);
+  });
+
+  it('treats an unexpected error as retryable, never discarding logs', async () => {
+    const sink = new FakeSink('buggy', () => new TypeError('undefined is not a function'));
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    await worker.drainOnce();
+
+    expect(queue.fileCount()).toBe(1);
+    expect(metrics.snapshot().sinkCounters['buggy']?.deadLettered ?? 0).toBe(0);
+  });
+
+  it('dead-letters on a permanent failure and advances', async () => {
+    const sink = new FakeSink('poison', (attempt) =>
+      attempt === 1 ? new PermanentDeliveryError('400 malformed') : null,
+    );
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('bad')]);
+    await queue.enqueue([event('good')]);
+
+    await worker.drainOnce();
+    expect(metrics.snapshot().sinkCounters['poison']?.deadLettered).toBe(1);
+
+    await worker.drainOnce();
+    expect(sink.received[0]?.map((e) => e['id'])).toEqual(['good']);
+    expect(queue.fileCount()).toBe(0);
+  });
+
+  it('escalates health immediately on an auth failure', async () => {
+    const sink = new FakeSink('auth', () => new AuthDeliveryError('401 check credentials'));
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    await worker.drainOnce();
+
+    expect(worker.health().state).toBe('failed');
+    expect(worker.health().consecutiveFailures).toBe(1);
+    expect(queue.fileCount()).toBe(1);
+  });
+
+  it('recovers health after a success', async () => {
+    const sink = new FakeSink('recover', (attempt) => (attempt <= 2 ? new Error('down') : null));
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    await worker.drainOnce();
+    await worker.drainOnce();
+    expect(worker.health().state).toBe('retrying');
+
+    await worker.drainOnce();
+    expect(worker.health().state).toBe('ok');
+    expect(worker.health().consecutiveFailures).toBe(0);
+    expect(worker.health().lastSuccessAt).not.toBeNull();
+  });
+
+  it('drains everything when started, then stops cleanly', async () => {
+    const sink = new FakeSink('runner');
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+    await queue.enqueue([event('b')]);
+
+    worker.start();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await worker.stop(1000);
+
+    expect(queue.fileCount()).toBe(0);
+    expect(sink.received.flat().map((e) => e['id']).sort()).toEqual(['a', 'b']);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/pipeline/dispatcher-worker.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement the worker in `src/pipeline/dispatcher.ts`**
+
+```ts
+import { AuthDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
+import { initialSinkHealth } from '../status/metrics.js';
+import type { Logger } from '../log.js';
+import type { Metrics } from '../status/metrics.js';
+import type { Sink } from '../sinks/types.js';
+import type { SpoolQueue } from './spool.js';
+import type { SinkHealth } from '../../types/api.js';
+
+const FAILURE_THRESHOLD = 5;
+const IDLE_POLL_MS = 500;
+const JITTER_FRACTION = 0.3;
+
+export function backoffDelayMs(
+  consecutiveFailures: number,
+  baseMs: number,
+  capMs: number,
+  random: () => number,
+): number {
+  const exponent = Math.max(0, consecutiveFailures - 1);
+  const raw = baseMs * 2 ** exponent;
+  const capped = Math.min(raw, capMs);
+  const jitter = capped * JITTER_FRACTION * random();
+  return Math.min(Math.round(capped + jitter), Math.round(capMs * (1 + JITTER_FRACTION)));
+}
+
+export type SinkWorkerOptions = {
+  sink: Sink;
+  queue: SpoolQueue;
+  metrics: Metrics;
+  log: Logger;
+  maxBatchEvents: number;
+  maxBatchBytes: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+  random?: () => number;
+};
+
+export class SinkWorker {
+  private state: SinkHealth = initialSinkHealth();
+  private running = false;
+  private loop: Promise<void> | null = null;
+  private readonly baseBackoffMs: number;
+  private readonly maxBackoffMs: number;
+  private readonly random: () => number;
+
+  constructor(private readonly options: SinkWorkerOptions) {
+    this.baseBackoffMs = options.baseBackoffMs ?? 1000;
+    this.maxBackoffMs = options.maxBackoffMs ?? 60_000;
+    this.random = options.random ?? Math.random;
+    options.metrics.setSinkHealth(options.sink.name, this.state);
+  }
+
+  health(): SinkHealth {
+    return { ...this.state };
+  }
+
+  private publish(): void {
+    this.options.metrics.setSinkHealth(this.options.sink.name, this.health());
+  }
+
+  private onSuccess(count: number): void {
+    this.state = {
+      state: 'ok',
+      consecutiveFailures: 0,
+      lastError: null,
+      lastErrorAt: null,
+      lastSuccessAt: Date.now(),
+      nextRetryAt: null,
+    };
+    this.options.metrics.recordDelivered(this.options.sink.name, count);
+    this.publish();
+  }
+
+  private onFailure(error: Error): number {
+    const consecutiveFailures = this.state.consecutiveFailures + 1;
+    const delay = backoffDelayMs(
+      consecutiveFailures,
+      this.baseBackoffMs,
+      this.maxBackoffMs,
+      this.random,
+    );
+    // An auth failure is surfaced as failed immediately: waiting five rounds
+    // to tell the operator their password is wrong wastes their time.
+    const escalate = error instanceof AuthDeliveryError;
+    this.state = {
+      state: escalate || consecutiveFailures >= FAILURE_THRESHOLD ? 'failed' : 'retrying',
+      consecutiveFailures,
+      lastError: error.message,
+      lastErrorAt: Date.now(),
+      lastSuccessAt: this.state.lastSuccessAt,
+      nextRetryAt: Date.now() + delay,
+    };
+    this.options.metrics.recordError(this.options.sink.name, error.message);
+    this.publish();
+    return delay;
+  }
+
+  /**
+   * Attempts one batch. Returns true if a batch was claimed (delivered or
+   * dead-lettered or failed), false if the queue was empty.
+   */
+  async drainOnce(): Promise<boolean> {
+    const batch = await this.options.queue.nextBatch(
+      this.options.maxBatchEvents,
+      this.options.maxBatchBytes,
+    );
+    if (batch === null) return false;
+
+    try {
+      await this.options.sink.deliver(batch.events);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      if (failure instanceof PermanentDeliveryError) {
+        await this.options.queue.deadLetter(batch);
+        this.options.metrics.recordDeadLettered(this.options.sink.name, batch.files.length);
+        this.options.log.error(
+          { sink: this.options.sink.name, files: batch.files.length, err: failure.message },
+          'batch dead-lettered',
+        );
+        return true;
+      }
+      // Anything else, including an unexpected bug, is retryable. The batch
+      // stays on disk.
+      this.onFailure(failure);
+      return true;
+    }
+
+    await this.options.queue.ack(batch);
+    this.onSuccess(batch.files.length);
+    return true;
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.loop = this.run();
+  }
+
+  private async run(): Promise<void> {
+    while (this.running) {
+      let claimed = false;
+      try {
+        claimed = await this.drainOnce();
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        this.options.log.error(
+          { sink: this.options.sink.name, err: failure.message },
+          'worker iteration failed',
+        );
+        this.onFailure(failure);
+      }
+
+      const waitMs = !claimed
+        ? IDLE_POLL_MS
+        : this.state.consecutiveFailures > 0
+          ? Math.max(0, (this.state.nextRetryAt ?? 0) - Date.now())
+          : 0;
+      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+
+  async stop(deadlineMs: number): Promise<void> {
+    this.running = false;
+    const pending = this.loop;
+    this.loop = null;
+    if (pending === null) return;
+    await Promise.race([
+      pending,
+      new Promise((resolve) => setTimeout(resolve, deadlineMs)),
+    ]);
+    await this.options.sink.close();
+  }
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/pipeline/dispatcher-worker.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add sink worker with backoff and health
+
+Only PermanentDeliveryError dead-letters; every other error, including
+an unexpected bug, keeps the batch on disk. AuthDeliveryError surfaces
+as failed on the first attempt while remaining retryable."
+```
+
+---
+
+### Task 18: Dispatcher — reconciliation, orphans, and sink test
+
+**Files:**
+- Modify: `src/pipeline/dispatcher.ts`
+- Test: `test/pipeline/dispatcher-reconcile.test.ts`
+
+**Interfaces:**
+- Consumes: `SinkWorker` from Task 17; `createSink`, `warningsFor` from `src/sinks/registry.ts`; `compileFilter` from `src/pipeline/filter.ts`; `AppConfig`, `SinkEntry` from `src/config/schema.ts`; `resolveLogsDirectory` from `src/sinks/file.ts`.
+- Produces: `type DispatcherOptions`, `type TestSinkResult`, `class Dispatcher` with `applyConfig`, `enqueue`, `start`, `stop`, `listOrphanedSpools`, `discardOrphan`, `testSink`, `snapshotSinks`, `isDegraded`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/pipeline/dispatcher-reconcile.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import { Metrics } from '../../src/status/metrics.js';
+import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+function event(id: string, overrides: Record<string, string> = {}) {
+  return { id, timestamp: 1000, source: 'lambda', projectId: 'p1', level: 'info', ...overrides };
+}
+
+describe('Dispatcher', () => {
+  let spoolRoot = '';
+  let logsRoot = '';
+  let metrics: Metrics;
+  let dispatcher: Dispatcher;
+
+  beforeEach(async () => {
+    spoolRoot = await mkdtemp(join(tmpdir(), 'vld-spoolroot-'));
+    logsRoot = await mkdtemp(join(tmpdir(), 'vld-logsroot-'));
+    metrics = new Metrics();
+    dispatcher = new Dispatcher({ spoolRoot, logsRoot, metrics, log: silentLog });
+  });
+
+  afterEach(async () => {
+    await dispatcher.stop(500);
+    await rm(spoolRoot, { recursive: true, force: true });
+    await rm(logsRoot, { recursive: true, force: true });
+  });
+
+  function fileSink(name: string, overrides: Partial<SinkEntry> = {}): SinkEntry {
+    return {
+      name,
+      enabled: true,
+      filter: {},
+      maxSpoolBytes: 1_048_576,
+      maxBatchEvents: 1000,
+      maxBatchBytes: 1_048_576,
+      config: {
+        type: 'file',
+        directory: join(logsRoot, name),
+        filePrefix: 'events',
+        retentionDays: 0,
+        freeSpaceFloorBytes: 0,
+      },
+      ...overrides,
+    };
+  }
+
+  function configWith(sinks: SinkEntry[]): AppConfig {
+    return { ...defaultAppConfig(), sinks };
+  }
+
+  it('creates a spool directory per enabled sink', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('one'), fileSink('two')]));
+    expect((await readdir(spoolRoot)).sort()).toEqual(['one', 'two']);
+  });
+
+  it('routes events only to sinks whose filter matches', async () => {
+    await dispatcher.applyConfig(
+      configWith([
+        fileSink('errors-only', { filter: { minLevel: 'error' } }),
+        fileSink('everything'),
+      ]),
+    );
+
+    await dispatcher.enqueue([event('a', { level: 'info' })]);
+
+    const statuses = await dispatcher.snapshotSinks();
+    const errorsOnly = statuses.find((s) => s.name === 'errors-only');
+    const everything = statuses.find((s) => s.name === 'everything');
+    expect(errorsOnly?.queue.files).toBe(0);
+    expect(everything?.queue.files).toBe(1);
+  });
+
+  it('does not enqueue to a disabled sink', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('off', { enabled: false })]));
+    await dispatcher.enqueue([event('a')]);
+    const statuses = await dispatcher.snapshotSinks();
+    expect(statuses.find((s) => s.name === 'off')?.queue.files).toBe(0);
+  });
+
+  it('preserves the spool when a sink is removed, and reports it as orphaned', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('temporary')]));
+    await dispatcher.enqueue([event('a')]);
+
+    await dispatcher.applyConfig(configWith([]));
+
+    expect(await readdir(spoolRoot)).toContain('temporary');
+    const orphans = await dispatcher.listOrphanedSpools();
+    expect(orphans.map((o) => o.name)).toEqual(['temporary']);
+    expect(orphans[0]?.files).toBe(1);
+    expect(orphans[0]?.bytes).toBeGreaterThan(0);
+  });
+
+  it('resumes the same spool when a sink setting changes', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: false })]));
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: true })]));
+    await dispatcher.enqueue([event('a')]);
+
+    // Same name means same queue identity, so nothing is orphaned.
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+  });
+
+  it('discards an orphaned spool on request', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('gone')]));
+    await dispatcher.enqueue([event('a')]);
+    await dispatcher.applyConfig(configWith([]));
+
+    await dispatcher.discardOrphan('gone');
+
+    expect(await readdir(spoolRoot)).not.toContain('gone');
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+  });
+
+  it('refuses to discard a name that is not an orphan', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('active')]));
+    await expect(dispatcher.discardOrphan('active')).rejects.toThrow(/active/);
+  });
+
+  it('refuses a traversal name in discardOrphan', async () => {
+    await expect(dispatcher.discardOrphan('../..')).rejects.toThrow();
+  });
+
+  it('rejects a file sink whose directory escapes the logs root', async () => {
+    const escaping = fileSink('escape', {
+      config: {
+        type: 'file',
+        directory: '/etc',
+        filePrefix: 'events',
+        retentionDays: 0,
+        freeSpaceFloorBytes: 0,
+      },
+    });
+    await expect(dispatcher.applyConfig(configWith([escaping]))).rejects.toThrow(/outside/i);
+  });
+
+  it('runs a sink test and reports success', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('probe')]));
+    const result = await dispatcher.testSink('probe');
+    expect(result.ok).toBe(true);
+    expect(await readdir(join(logsRoot, 'probe'))).toHaveLength(1);
+  });
+
+  it('reports a sink test failure without throwing', async () => {
+    await dispatcher.applyConfig(
+      configWith([
+        {
+          name: 'bad-loki',
+          enabled: true,
+          filter: {},
+          maxSpoolBytes: 1_048_576,
+          maxBatchEvents: 1000,
+          maxBatchBytes: 1_048_576,
+          config: {
+            type: 'loki',
+            url: 'http://127.0.0.1:1',
+            auth: { kind: 'none' },
+            tenantId: null,
+            labels: { static: {}, fromFields: [] },
+            timeoutMs: 200,
+          },
+        },
+      ]),
+    );
+
+    const result = await dispatcher.testSink('bad-loki');
+    expect(result.ok).toBe(false);
+    expect(result.detail.length).toBeGreaterThan(0);
+  });
+
+  it('reports an unknown sink test as a failure', async () => {
+    const result = await dispatcher.testSink('nope');
+    expect(result.ok).toBe(false);
+  });
+
+  it('reports degraded when a sink health is failed', async () => {
+    await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
+    expect(dispatcher.isDegraded()).toBe(false);
+    metrics.setSinkHealth('ok-sink', {
+      state: 'failed',
+      consecutiveFailures: 9,
+      lastError: 'x',
+      lastErrorAt: 1,
+      lastSuccessAt: null,
+      nextRetryAt: 2,
+    });
+    expect(dispatcher.isDegraded()).toBe(true);
+  });
+
+  it('ignores a non-directory entry in the spool root when listing orphans', async () => {
+    await writeFile(join(spoolRoot, 'stray-file'), 'x');
+    await mkdir(join(spoolRoot, 'orphan-dir'), { recursive: true });
+    const orphans = await dispatcher.listOrphanedSpools();
+    expect(orphans.map((o) => o.name)).toEqual(['orphan-dir']);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/pipeline/dispatcher-reconcile.test.ts`
+Expected: FAIL — `Dispatcher` is not exported.
+
+- [ ] **Step 3: Implement the Dispatcher in `src/pipeline/dispatcher.ts`**
+
+Append to the file created in Task 17:
+
+```ts
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { compileFilter } from './filter.js';
+import { SpoolQueue } from './spool.js';
+import { createSink } from '../sinks/registry.js';
+import { resolveLogsDirectory } from '../sinks/file.js';
+import { SINK_NAME_PATTERN } from '../config/schema.js';
+import type { AppConfig, SinkEntry } from '../config/schema.js';
+import type { EventPredicate } from './filter.js';
+import type { LogEvent } from '../vercel/event.js';
+import type { FreeSpaceProbe } from '../sinks/types.js';
+import type { OrphanedSpool, SinkStatus } from '../../types/api.js';
+
+export type TestSinkResult = { ok: boolean; detail: string };
+
+export type DispatcherOptions = {
+  spoolRoot: string;
+  logsRoot: string;
+  metrics: Metrics;
+  log: Logger;
+  freeSpace?: FreeSpaceProbe;
+};
+
+type ActiveSink = {
+  entry: SinkEntry;
+  predicate: EventPredicate;
+  queue: SpoolQueue;
+  worker: SinkWorker;
+};
+
+export class Dispatcher {
+  private active = new Map<string, ActiveSink>();
+  private config: AppConfig | null = null;
+  private started = false;
+
+  constructor(private readonly options: DispatcherOptions) {}
+
+  private spoolDirFor(name: string): string {
+    if (!SINK_NAME_PATTERN.test(name)) {
+      throw new Error(`invalid sink name "${name}"`);
+    }
+    return join(this.options.spoolRoot, name);
+  }
+
+  /**
+   * Normalizes a sink entry, resolving and containing a file sink's directory.
+   * Throws before anything is created so an invalid config cannot half-apply.
+   */
+  private normalize(entry: SinkEntry): SinkEntry {
+    if (entry.config.type !== 'file') return entry;
+    const directory = resolveLogsDirectory(entry.config.directory, this.options.logsRoot);
+    return { ...entry, config: { ...entry.config, directory } };
+  }
+
+  async applyConfig(config: AppConfig): Promise<void> {
+    const normalized = config.sinks.map((entry) => this.normalize(entry));
+    const desired = new Map(normalized.map((entry) => [entry.name, entry]));
+
+    for (const [name, current] of [...this.active]) {
+      const next = desired.get(name);
+      const unchanged =
+        next !== undefined && JSON.stringify(next) === JSON.stringify(current.entry);
+      if (unchanged) continue;
+      await current.worker.stop(5000);
+      this.active.delete(name);
+      if (next === undefined) {
+        // Deliberately leaves the spool directory on disk.
+        this.options.metrics.forgetSink(name);
+      }
+    }
+
+    for (const entry of normalized) {
+      if (this.active.has(entry.name)) continue;
+      if (!entry.enabled) continue;
+      await this.startSink(entry);
+    }
+
+    this.config = { ...config, sinks: normalized };
+  }
+
+  private async startSink(entry: SinkEntry): Promise<void> {
+    const dir = this.spoolDirFor(entry.name);
+    await mkdir(dir, { recursive: true });
+
+    const queue = await SpoolQueue.open(dir, {
+      maxSpoolBytes: entry.maxSpoolBytes,
+      freeSpaceFloorBytes: this.config?.server.spoolFreeSpaceFloorBytes ?? 0,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+
+    const sink = createSink(entry.name, entry.config, {
+      log: this.options.log,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+
+    const worker = new SinkWorker({
+      sink,
+      queue,
+      metrics: this.options.metrics,
+      log: this.options.log,
+      maxBatchEvents: entry.maxBatchEvents,
+      maxBatchBytes: entry.maxBatchBytes,
+    });
+
+    this.active.set(entry.name, {
+      entry,
+      predicate: compileFilter(entry.filter),
+      queue,
+      worker,
+    });
+    if (this.started) worker.start();
+  }
+
+  async enqueue(events: LogEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    for (const active of this.active.values()) {
+      if (!active.entry.enabled) continue;
+      const matching = events.filter((event) => active.predicate(event));
+      if (matching.length === 0) continue;
+      const result = await active.queue.enqueue(matching);
+      if (result.droppedEvents > 0) {
+        this.options.metrics.recordDropped(active.entry.name, result.droppedEvents);
+        this.options.log.warn(
+          { sink: active.entry.name, dropped: result.droppedEvents },
+          'spool overflow dropped oldest batches',
+        );
+      }
+    }
+  }
+
+  start(): void {
+    this.started = true;
+    for (const active of this.active.values()) active.worker.start();
+  }
+
+  async stop(deadlineMs: number): Promise<void> {
+    this.started = false;
+    await Promise.all([...this.active.values()].map((active) => active.worker.stop(deadlineMs)));
+    this.active.clear();
+  }
+
+  async listOrphanedSpools(): Promise<OrphanedSpool[]> {
+    let names: string[];
+    try {
+      names = await readdir(this.options.spoolRoot);
+    } catch {
+      return [];
+    }
+
+    const configured = new Set((this.config?.sinks ?? []).map((entry) => entry.name));
+    const orphans: OrphanedSpool[] = [];
+
+    for (const name of names) {
+      if (configured.has(name)) continue;
+      const dir = join(this.options.spoolRoot, name);
+      const stats = await stat(dir).catch(() => null);
+      if (stats === null || !stats.isDirectory()) continue;
+
+      let files = 0;
+      let bytes = 0;
+      for (const entry of await readdir(dir).catch(() => [])) {
+        if (!entry.endsWith('.jsonl')) continue;
+        const fileStats = await stat(join(dir, entry)).catch(() => null);
+        if (fileStats === null) continue;
+        files += 1;
+        bytes += fileStats.size;
+      }
+      orphans.push({ name, files, bytes });
+    }
+    return orphans;
+  }
+
+  async discardOrphan(name: string): Promise<void> {
+    const orphans = await this.listOrphanedSpools();
+    if (!orphans.some((orphan) => orphan.name === name)) {
+      throw new Error(`"${name}" is not an orphaned spool directory`);
+    }
+    await rm(this.spoolDirFor(name), { recursive: true, force: true });
+  }
+
+  async testSink(name: string): Promise<TestSinkResult> {
+    const active = this.active.get(name);
+    if (active === undefined) {
+      return { ok: false, detail: `sink "${name}" is not running; enable and save it first` };
+    }
+    const probe: LogEvent = {
+      id: `test-${String(Date.now())}`,
+      timestamp: Date.now(),
+      source: 'external',
+      projectId: 'vercel-log-drain',
+      level: 'info',
+      message: `test event from vercel-log-drain for sink ${name}`,
+    };
+    const sink = createSink(active.entry.name, active.entry.config, {
+      log: this.options.log,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+    try {
+      await sink.deliver([probe]);
+      return { ok: true, detail: 'test event accepted' };
+    } catch (error) {
+      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    } finally {
+      await sink.close();
+    }
+  }
+
+  async snapshotSinks(): Promise<SinkStatus[]> {
+    const counters = this.options.metrics.snapshot().sinkCounters;
+    const statuses: SinkStatus[] = [];
+
+    for (const entry of this.config?.sinks ?? []) {
+      const active = this.active.get(entry.name);
+      const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+      statuses.push({
+        name: entry.name,
+        type: entry.config.type,
+        enabled: entry.enabled,
+        health: this.options.metrics.getSinkHealth(entry.name),
+        queue: {
+          files: active?.queue.fileCount() ?? 0,
+          bytes: active?.queue.bytes() ?? 0,
+          oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+        },
+        counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+      });
+    }
+    return statuses;
+  }
+
+  isDegraded(): boolean {
+    for (const entry of this.config?.sinks ?? []) {
+      if (!entry.enabled) continue;
+      if (this.options.metrics.getSinkHealth(entry.name).state === 'failed') return true;
+    }
+    return false;
+  }
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/pipeline/dispatcher-reconcile.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add dispatcher config reconciliation
+
+Removing or disabling a sink stops its worker but preserves its spool,
+surfaced as an orphan with an explicit discard action. A settings change
+reuses the same spool because the sink name is the queue identity. File
+sink directories are contained under the logs root before anything is
+created, so an invalid config cannot half-apply."
+```
+
+---
+
+### Task 19: Proxy authentication middleware
+
+**Files:**
+- Create: `src/server/types.ts`, `src/server/middleware/proxy-auth.ts`
+- Test: `test/server/proxy-auth.test.ts`
+
+**Interfaces:**
+- Consumes: nothing beyond Hono.
+- Produces: in `src/server/types.ts` the type `AppEnv`; in the middleware `type AuthConfig`, `type PeerResolver`, `nodePeerResolver`, `parseAuthConfig(env)`, `proxyAuth(config, resolvePeer)`.
+
+**Verified behavior you must not design around differently:**
+`@hono/node-server` populates `c.env.incoming` only for requests over a real
+socket. Under Hono's in-process `app.request()` it is `undefined`. That is why
+the peer resolver is injected, and why an unresolved peer must be denied.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/server/proxy-auth.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { Hono } from 'hono';
+import { parseAuthConfig, proxyAuth } from '../../src/server/middleware/proxy-auth.js';
+import type { AuthConfig } from '../../src/server/middleware/proxy-auth.js';
+import type { AppEnv } from '../../src/server/types.js';
+
+function appWith(config: AuthConfig, peer: string | undefined) {
+  const app = new Hono<AppEnv>();
+  app.use('/admin/*', proxyAuth(config, () => peer));
+  app.get('/admin/thing', (c) => c.json({ user: c.get('user') }));
+  app.get('/open', (c) => c.text('public'));
+  return app;
+}
+
+const proxyMode: AuthConfig = {
+  mode: 'proxy',
+  trustedProxies: ['10.0.0.0/8', '127.0.0.1/32'],
+  userHeader: 'x-forwarded-user',
+  allowedUsers: null,
+};
+
+describe('parseAuthConfig', () => {
+  it('returns unset when AUTH_MODE is missing', () => {
+    expect(parseAuthConfig({}).mode).toBe('unset');
+  });
+
+  it('returns disabled when explicitly disabled', () => {
+    expect(parseAuthConfig({ AUTH_MODE: 'disabled' }).mode).toBe('disabled');
+  });
+
+  it('parses proxy mode with trusted CIDRs and a header', () => {
+    const config = parseAuthConfig({
+      AUTH_MODE: 'proxy',
+      AUTH_TRUSTED_PROXIES: '10.0.0.0/8, 192.168.1.5/32',
+      AUTH_USER_HEADER: 'Cf-Access-Authenticated-User-Email',
+    });
+    expect(config.mode).toBe('proxy');
+    if (config.mode !== 'proxy') return;
+    expect(config.trustedProxies).toEqual(['10.0.0.0/8', '192.168.1.5/32']);
+    expect(config.userHeader).toBe('cf-access-authenticated-user-email');
+    expect(config.allowedUsers).toBeNull();
+  });
+
+  it('parses an allowed-users list', () => {
+    const config = parseAuthConfig({
+      AUTH_MODE: 'proxy',
+      AUTH_TRUSTED_PROXIES: '10.0.0.0/8',
+      AUTH_USER_HEADER: 'x-user',
+      AUTH_ALLOWED_USERS: 'a@example.com, b@example.com',
+    });
+    if (config.mode !== 'proxy') throw new Error('expected proxy mode');
+    expect(config.allowedUsers).toEqual(['a@example.com', 'b@example.com']);
+  });
+
+  it('throws when proxy mode is missing its required variables', () => {
+    expect(() => parseAuthConfig({ AUTH_MODE: 'proxy' })).toThrow(/AUTH_TRUSTED_PROXIES/);
+    expect(() =>
+      parseAuthConfig({ AUTH_MODE: 'proxy', AUTH_TRUSTED_PROXIES: '10.0.0.0/8' }),
+    ).toThrow(/AUTH_USER_HEADER/);
+  });
+
+  it('throws on an unrecognized mode rather than failing open', () => {
+    expect(() => parseAuthConfig({ AUTH_MODE: 'yolo' })).toThrow(/AUTH_MODE/);
+  });
+});
+
+describe('proxyAuth', () => {
+  it('returns 503 when auth is unset, naming what to configure', async () => {
+    const response = await appWith({ mode: 'unset' }, '10.1.1.1').request('/admin/thing');
+    expect(response.status).toBe(503);
+    expect(await response.text()).toMatch(/AUTH_MODE/);
+  });
+
+  it('allows everything when auth is explicitly disabled', async () => {
+    const response = await appWith({ mode: 'disabled' }, undefined).request('/admin/thing');
+    expect(response.status).toBe(200);
+  });
+
+  it('allows a request from a trusted peer with a user header', async () => {
+    const response = await appWith(proxyMode, '10.2.3.4').request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'chad@example.com' },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ user: 'chad@example.com' });
+  });
+
+  it('denies a request from an untrusted peer even with a user header', async () => {
+    const response = await appWith(proxyMode, '203.0.113.9').request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'attacker@example.com' },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it('denies a trusted peer with no user header', async () => {
+    const response = await appWith(proxyMode, '10.2.3.4').request('/admin/thing');
+    expect(response.status).toBe(403);
+  });
+
+  it('denies a trusted peer with an empty user header', async () => {
+    const response = await appWith(proxyMode, '10.2.3.4').request('/admin/thing', {
+      headers: { 'x-forwarded-user': '   ' },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it('denies when the peer cannot be resolved, rather than failing open', async () => {
+    const response = await appWith(proxyMode, undefined).request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'chad@example.com' },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it('ignores X-Forwarded-For when deciding trust', async () => {
+    const response = await appWith(proxyMode, '203.0.113.9').request('/admin/thing', {
+      headers: { 'x-forwarded-for': '10.0.0.1', 'x-forwarded-user': 'attacker@example.com' },
+    });
+    expect(response.status).toBe(403);
+  });
+
+  it('enforces the allowed-users list', async () => {
+    const restricted: AuthConfig = { ...proxyMode, allowedUsers: ['chad@example.com'] };
+    const allowed = await appWith(restricted, '10.2.3.4').request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'chad@example.com' },
+    });
+    const denied = await appWith(restricted, '10.2.3.4').request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'someone@example.com' },
+    });
+    expect(allowed.status).toBe(200);
+    expect(denied.status).toBe(403);
+  });
+
+  it('handles an IPv6-mapped IPv4 peer address', async () => {
+    const response = await appWith(proxyMode, '::ffff:10.2.3.4').request('/admin/thing', {
+      headers: { 'x-forwarded-user': 'chad@example.com' },
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it('does not apply to unguarded routes', async () => {
+    const response = await appWith({ mode: 'unset' }, undefined).request('/open');
+    expect(response.status).toBe(200);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/server/proxy-auth.test.ts`
+Expected: FAIL — modules not found.
+
+- [ ] **Step 3: Implement `src/server/types.ts`**
+
+`Bindings` is `Partial<HttpBindings>` precisely because the bindings are absent
+under `app.request()`.
+
+```ts
+import type { HttpBindings } from '@hono/node-server';
+
+export type AppEnv = {
+  Bindings: Partial<HttpBindings>;
+  Variables: { user: string | null };
+};
+```
+
+- [ ] **Step 4: Implement `src/server/middleware/proxy-auth.ts`**
+
+```ts
+import { BlockList, isIPv4, isIPv6 } from 'node:net';
+import type { Context, MiddlewareHandler } from 'hono';
+import type { AppEnv } from '../types.js';
+
+export type AuthConfig =
+  | { mode: 'unset' }
+  | { mode: 'disabled' }
+  | {
+      mode: 'proxy';
+      trustedProxies: string[];
+      userHeader: string;
+      allowedUsers: string[] | null;
+    };
+
+export type PeerResolver = (c: Context<AppEnv>) => string | undefined;
+
+export const nodePeerResolver: PeerResolver = (c) => c.env?.incoming?.socket?.remoteAddress;
+
+function splitList(value: string | undefined): string[] | null {
+  if (value === undefined) return null;
+  const items = value
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  return items.length === 0 ? null : items;
+}
+
+export function parseAuthConfig(env: Record<string, string | undefined>): AuthConfig {
+  const mode = env['AUTH_MODE'];
+  if (mode === undefined || mode.trim().length === 0) return { mode: 'unset' };
+  if (mode === 'disabled') return { mode: 'disabled' };
+  if (mode !== 'proxy') {
+    throw new Error(`AUTH_MODE must be "proxy" or "disabled", received "${mode}"`);
+  }
+
+  const trustedProxies = splitList(env['AUTH_TRUSTED_PROXIES']);
+  if (trustedProxies === null) {
+    throw new Error('AUTH_MODE=proxy requires AUTH_TRUSTED_PROXIES, a comma-separated CIDR list');
+  }
+  const userHeader = env['AUTH_USER_HEADER'];
+  if (userHeader === undefined || userHeader.trim().length === 0) {
+    throw new Error('AUTH_MODE=proxy requires AUTH_USER_HEADER');
+  }
+
+  return {
+    mode: 'proxy',
+    trustedProxies,
+    userHeader: userHeader.trim().toLowerCase(),
+    allowedUsers: splitList(env['AUTH_ALLOWED_USERS']),
+  };
+}
+
+function buildBlockList(cidrs: string[]): BlockList {
+  const list = new BlockList();
+  for (const cidr of cidrs) {
+    const [address, prefix] = cidr.split('/');
+    if (address === undefined) continue;
+    const family = isIPv6(address) ? 'ipv6' : 'ipv4';
+    const bits = prefix === undefined ? (family === 'ipv6' ? 128 : 32) : Number.parseInt(prefix, 10);
+    if (Number.isNaN(bits)) continue;
+    list.addSubnet(address, bits, family);
+  }
+  return list;
+}
+
+// Node reports an IPv4 peer over a dual-stack listener as ::ffff:a.b.c.d.
+function normalizePeer(address: string): string {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  return mapped?.[1] ?? address;
+}
+
+export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
+  const blockList = config.mode === 'proxy' ? buildBlockList(config.trustedProxies) : null;
+
+  return async (c, next) => {
+    if (config.mode === 'unset') {
+      return c.text(
+        'The admin interface is disabled because authentication is not configured. Set AUTH_MODE=proxy with AUTH_TRUSTED_PROXIES and AUTH_USER_HEADER, or AUTH_MODE=disabled for local development.',
+        503,
+      );
+    }
+
+    if (config.mode === 'disabled') {
+      c.set('user', null);
+      await next();
+      return;
+    }
+
+    const rawPeer = resolvePeer(c);
+    if (rawPeer === undefined || blockList === null) {
+      return c.text('forbidden: peer address could not be determined', 403);
+    }
+
+    const peer = normalizePeer(rawPeer);
+    const family = isIPv4(peer) ? 'ipv4' : isIPv6(peer) ? 'ipv6' : null;
+    if (family === null || !blockList.check(peer, family)) {
+      return c.text('forbidden: request did not arrive from a trusted proxy', 403);
+    }
+
+    const user = c.req.header(config.userHeader)?.trim() ?? '';
+    if (user.length === 0) {
+      return c.text(`forbidden: ${config.userHeader} was not supplied by the proxy`, 403);
+    }
+    if (config.allowedUsers !== null && !config.allowedUsers.includes(user)) {
+      return c.text('forbidden: user is not in AUTH_ALLOWED_USERS', 403);
+    }
+
+    c.set('user', user);
+    await next();
+    return;
+  };
+}
+```
+
+Because the middleware only ever *reads* the user header after establishing peer
+trust, an untrusted caller's self-asserted header can never reach a handler —
+`c.get('user')` is set exclusively by this middleware.
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run test/server/proxy-auth.test.ts`
+Expected: PASS.
+
+- [ ] **Step 6: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add fail-closed proxy auth middleware
+
+Unset AUTH_MODE closes the admin surface with a 503 naming the variables
+to set. Trust is decided from the socket peer address via net.BlockList,
+never from X-Forwarded-For, and an unresolvable peer is denied."
+```
+
+---
+
+### Task 20: Drain route
+
+**Files:**
+- Create: `src/server/routes/drain.ts`
+- Test: `test/server/drain-route.test.ts`
+
+**Interfaces:**
+- Consumes: `verifySignature`, `decodeBody`, `PayloadTooLargeError`; `Dispatcher`; `Metrics`; `AppConfig`.
+- Produces: `type DrainDeps = { getConfig: () => AppConfig; dispatcher: Dispatcher; metrics: Metrics; log: Logger }`, `drainRoutes(deps: DrainDeps): Hono<AppEnv>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/server/drain-route.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createHmac } from 'node:crypto';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { drainRoutes } from '../../src/server/routes/drain.js';
+import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { Metrics } from '../../src/status/metrics.js';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import type { AppConfig } from '../../src/config/schema.js';
+import type { AppEnv } from '../../src/server/types.js';
+
+const gzipAsync = promisify(gzip);
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+const SECRET = 's'.repeat(32);
+
+function event(id: string, level = 'info') {
+  return { id, timestamp: 1573817187330, source: 'lambda', projectId: 'p1', level };
+}
+
+function sign(body: string | Buffer): string {
+  return createHmac('sha1', SECRET).update(body).digest('hex');
+}
+
+describe('drain route', () => {
+  let spoolRoot = '';
+  let logsRoot = '';
+  let dispatcher: Dispatcher;
+  let metrics: Metrics;
+  let config: AppConfig;
+
+  beforeEach(async () => {
+    spoolRoot = await mkdtemp(join(tmpdir(), 'vld-drain-spool-'));
+    logsRoot = await mkdtemp(join(tmpdir(), 'vld-drain-logs-'));
+    metrics = new Metrics();
+    dispatcher = new Dispatcher({ spoolRoot, logsRoot, metrics, log: silentLog });
+    config = {
+      ...defaultAppConfig(),
+      drains: [{ id: 'drain1', name: 'prod', secret: SECRET, enabled: true, createdAt: 1 }],
+      sinks: [
+        {
+          name: 'local',
+          enabled: true,
+          filter: {},
+          maxSpoolBytes: 1_048_576,
+          maxBatchEvents: 1000,
+          maxBatchBytes: 1_048_576,
+          config: {
+            type: 'file',
+            directory: join(logsRoot, 'local'),
+            filePrefix: 'events',
+            retentionDays: 0,
+            freeSpaceFloorBytes: 0,
+          },
+        },
+      ],
+    };
+    await dispatcher.applyConfig(config);
+  });
+
+  afterEach(async () => {
+    await dispatcher.stop(500);
+    await rm(spoolRoot, { recursive: true, force: true });
+    await rm(logsRoot, { recursive: true, force: true });
+  });
+
+  function app() {
+    const instance = new Hono<AppEnv>();
+    instance.route(
+      '/api/drain',
+      drainRoutes({ getConfig: () => config, dispatcher, metrics, log: silentLog }),
+    );
+    return instance;
+  }
+
+  async function post(path: string, body: string | Buffer, headers: Record<string, string> = {}) {
+    return app().request(path, { method: 'POST', body, headers });
+  }
+
+  it('accepts a correctly signed JSON array and spools it', async () => {
+    const body = JSON.stringify([event('a'), event('b')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ received: 2, accepted: 2, rejected: 0 });
+    const statuses = await dispatcher.snapshotSinks();
+    expect(statuses[0]?.queue.files).toBe(1);
+  });
+
+  it('accepts NDJSON', async () => {
+    const body = `${JSON.stringify(event('a'))}\n${JSON.stringify(event('b'))}\n`;
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ accepted: 2 });
+  });
+
+  it('accepts a gzipped body', async () => {
+    const compressed = await gzipAsync(Buffer.from(JSON.stringify([event('a')]), 'utf8'));
+    const response = await post('/api/drain/drain1', compressed, {
+      'x-vercel-signature': sign(compressed),
+      'content-encoding': 'gzip',
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ accepted: 1 });
+  });
+
+  it('rejects a bad signature with 403 and spools nothing', async () => {
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': 'f'.repeat(40) });
+
+    expect(response.status).toBe(403);
+    expect((await dispatcher.snapshotSinks())[0]?.queue.files).toBe(0);
+    const drain = metrics.snapshot().drains.find((d) => d.id === 'drain1');
+    expect(drain?.requests.badSignature).toBe(1);
+  });
+
+  it('rejects a missing signature with 401', async () => {
+    const body = JSON.stringify([event('a')]);
+    expect((await post('/api/drain/drain1', body)).status).toBe(401);
+  });
+
+  it('returns 404 for an unknown drain', async () => {
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/nope', body, { 'x-vercel-signature': sign(body) });
+    expect(response.status).toBe(404);
+  });
+
+  it('returns 403 for a disabled drain', async () => {
+    config = {
+      ...config,
+      drains: [{ ...config.drains[0]!, enabled: false }],
+    };
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+    expect(response.status).toBe(403);
+  });
+
+  it('returns 413 when the body exceeds maxBodyBytes', async () => {
+    config = { ...config, server: { ...config.server, maxBodyBytes: 32 } };
+    const body = JSON.stringify([event('a'), event('b'), event('c')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+    expect(response.status).toBe(413);
+  });
+
+  it('keeps good entries and counts bad ones without failing the request', async () => {
+    const body = `${JSON.stringify(event('a'))}\n{broken\n${JSON.stringify(event('b'))}\n`;
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ received: 3, accepted: 2, rejected: 1 });
+    expect(metrics.snapshot().recent.rejects).toHaveLength(1);
+  });
+
+  it('routes only matching events to a filtered sink', async () => {
+    config = {
+      ...config,
+      sinks: [{ ...config.sinks[0]!, filter: { minLevel: 'error' } }],
+    };
+    await dispatcher.applyConfig(config);
+
+    const body = JSON.stringify([event('a', 'info')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+
+    expect(response.status).toBe(200);
+    expect((await dispatcher.snapshotSinks())[0]?.queue.files).toBe(0);
+  });
+
+  it('records the latest event timestamp', async () => {
+    const body = JSON.stringify([event('a')]);
+    await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+    const drain = metrics.snapshot().drains.find((d) => d.id === 'drain1');
+    expect(drain?.lastEventAt).toBe(1573817187330);
+  });
+
+  it('returns 500 when spooling fails, so Vercel retries', async () => {
+    await rm(spoolRoot, { recursive: true, force: true });
+    // Recreate as a file so mkdir/write inside the spool root fails.
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(spoolRoot, 'not a directory');
+
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+    expect(response.status).toBe(500);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/server/drain-route.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/server/routes/drain.ts`**
+
+Ordering is deliberate: the cheap rejections come first, and the signature is
+checked before the body is decompressed or parsed.
+
+```ts
+import { Hono } from 'hono';
+import { verifySignature } from '../../vercel/signature.js';
+import { decodeBody, PayloadTooLargeError } from '../../vercel/decode.js';
+import type { AppConfig } from '../../config/schema.js';
+import type { Dispatcher } from '../../pipeline/dispatcher.js';
+import type { Metrics } from '../../status/metrics.js';
+import type { Logger } from '../../log.js';
+import type { AppEnv } from '../types.js';
+
+export type DrainDeps = {
+  getConfig: () => AppConfig;
+  dispatcher: Dispatcher;
+  metrics: Metrics;
+  log: Logger;
+};
+
+export function drainRoutes(deps: DrainDeps): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+
+  app.post('/:drainId', async (c) => {
+    const config = deps.getConfig();
+    const drainId = c.req.param('drainId');
+    const drain = config.drains.find((entry) => entry.id === drainId);
+
+    if (drain === undefined) {
+      deps.metrics.recordDrainRequest(drainId, 'notFound');
+      return c.json({ code: 'unknown_drain' }, 404);
+    }
+    if (!drain.enabled) {
+      deps.metrics.recordDrainRequest(drain.id, 'disabled');
+      return c.json({ code: 'drain_disabled' }, 403);
+    }
+
+    const declaredLength = Number.parseInt(c.req.header('content-length') ?? '', 10);
+    if (!Number.isNaN(declaredLength) && declaredLength > config.server.maxBodyBytes) {
+      return c.json({ code: 'payload_too_large' }, 413);
+    }
+
+    const raw = Buffer.from(await c.req.arrayBuffer());
+    if (raw.byteLength > config.server.maxBodyBytes) {
+      return c.json({ code: 'payload_too_large' }, 413);
+    }
+
+    const signature = c.req.header('x-vercel-signature');
+    if (signature === undefined) {
+      deps.metrics.recordDrainRequest(drain.id, 'badSignature');
+      return c.json({ code: 'missing_signature' }, 401);
+    }
+    if (!verifySignature(raw, signature, drain.secret)) {
+      deps.metrics.recordDrainRequest(drain.id, 'badSignature');
+      return c.json({ code: 'invalid_signature', error: "signature didn't match" }, 403);
+    }
+
+    const gzipped = c.req.header('content-encoding')?.toLowerCase().includes('gzip') ?? false;
+
+    let decoded;
+    try {
+      decoded = await decodeBody(raw, {
+        gzipped,
+        maxDecompressedBytes: config.server.maxDecompressedBytes,
+      });
+    } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        deps.metrics.recordDrainRequest(drain.id, 'malformedBody');
+        return c.json({ code: 'payload_too_large', error: error.message }, 413);
+      }
+      throw error;
+    }
+
+    if (decoded.rejected.length > 0) {
+      deps.metrics.recordRejected(drain.id, decoded.rejected);
+    }
+
+    if (decoded.events.length > 0) {
+      try {
+        await deps.dispatcher.enqueue(decoded.events);
+      } catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        deps.log.error({ drain: drain.id, err: failure.message }, 'failed to spool batch');
+        deps.metrics.recordError('ingest', failure.message);
+        // 500 makes Vercel redeliver. At-least-once is the deliberate trade.
+        return c.json({ code: 'spool_failed' }, 500);
+      }
+
+      const latest = decoded.events.reduce(
+        (max, item) => (item.timestamp > max ? item.timestamp : max),
+        0,
+      );
+      deps.metrics.recordEventsReceived(drain.id, decoded.events.length, latest);
+      deps.metrics.pushRecentEvents(decoded.events);
+    }
+
+    deps.metrics.recordDrainRequest(
+      drain.id,
+      decoded.events.length > 0 || decoded.rejected.length === 0 ? 'ok' : 'malformedBody',
+    );
+
+    return c.json({
+      received: decoded.events.length + decoded.rejected.length,
+      accepted: decoded.events.length,
+      rejected: decoded.rejected.length,
+    });
+  });
+
+  return app;
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/server/drain-route.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add drain ingest route
+
+Verifies the signature before decompressing, so an unauthenticated
+caller cannot make the process spend CPU inflating gzip. Malformed
+entries are counted without failing the delivery; a spool failure
+returns 500 so Vercel redelivers."
+```
+
+---
+
+### Task 21: Status, health, and readiness routes
+
+**Files:**
+- Create: `src/server/routes/status.ts`
+- Test: `test/server/status-route.test.ts`
+
+**Interfaces:**
+- Consumes: `Metrics`, `Dispatcher`, `AppConfig`, `StatusSnapshot` from `types/api.ts`.
+- Produces: `type StatusDeps = { getConfig: () => AppConfig; dispatcher: Dispatcher; metrics: Metrics; version: string; configDir: string; spoolDir: string }`, `statusRoutes(deps): Hono<AppEnv>`, `healthRoutes(deps): Hono<AppEnv>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/server/status-route.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { healthRoutes, statusRoutes } from '../../src/server/routes/status.js';
+import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { Metrics } from '../../src/status/metrics.js';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import type { AppConfig } from '../../src/config/schema.js';
+import type { AppEnv } from '../../src/server/types.js';
+import type { StatusSnapshot } from '../../types/api.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+describe('status routes', () => {
+  let spoolRoot = '';
+  let logsRoot = '';
+  let dispatcher: Dispatcher;
+  let metrics: Metrics;
+  let config: AppConfig;
+
+  beforeEach(async () => {
+    spoolRoot = await mkdtemp(join(tmpdir(), 'vld-status-spool-'));
+    logsRoot = await mkdtemp(join(tmpdir(), 'vld-status-logs-'));
+    metrics = new Metrics();
+    dispatcher = new Dispatcher({ spoolRoot, logsRoot, metrics, log: silentLog });
+    config = {
+      ...defaultAppConfig(),
+      drains: [{ id: 'd1', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 }],
+      sinks: [
+        {
+          name: 'local',
+          enabled: true,
+          filter: {},
+          maxSpoolBytes: 1_048_576,
+          maxBatchEvents: 1000,
+          maxBatchBytes: 1_048_576,
+          config: {
+            type: 'file',
+            directory: join(logsRoot, 'local'),
+            filePrefix: 'events',
+            retentionDays: 0,
+            freeSpaceFloorBytes: 0,
+          },
+        },
+      ],
+    };
+    await dispatcher.applyConfig(config);
+  });
+
+  afterEach(async () => {
+    await dispatcher.stop(500);
+    await rm(spoolRoot, { recursive: true, force: true });
+    await rm(logsRoot, { recursive: true, force: true });
+  });
+
+  function app() {
+    const deps = {
+      getConfig: () => config,
+      dispatcher,
+      metrics,
+      version: '9.9.9',
+      configDir: spoolRoot,
+      spoolDir: spoolRoot,
+    };
+    const instance = new Hono<AppEnv>();
+    instance.route('/api/status', statusRoutes(deps));
+    instance.route('/', healthRoutes(deps));
+    return instance;
+  }
+
+  it('reports service, volumes, drains, and sinks', async () => {
+    const response = await app().request('/api/status');
+    expect(response.status).toBe(200);
+
+    const snapshot = (await response.json()) as StatusSnapshot;
+    expect(snapshot.service.state).toBe('ok');
+    expect(snapshot.service.version).toBe('9.9.9');
+    expect(snapshot.volumes.spool.totalBytes).toBeGreaterThan(0);
+    expect(snapshot.drains[0]).toMatchObject({ id: 'd1', name: 'prod', enabled: true });
+    expect(snapshot.sinks[0]).toMatchObject({ name: 'local', type: 'file', enabled: true });
+    expect(snapshot.sinks[0]?.queue.oldestAgeSec).toBeNull();
+  });
+
+  it('never exposes a drain secret', async () => {
+    const body = await (await app().request('/api/status')).text();
+    expect(body).not.toContain('x'.repeat(32));
+  });
+
+  it('reports degraded when a sink has failed', async () => {
+    metrics.setSinkHealth('local', {
+      state: 'failed',
+      consecutiveFailures: 6,
+      lastError: 'loki down',
+      lastErrorAt: 1,
+      lastSuccessAt: null,
+      nextRetryAt: 2,
+    });
+    const snapshot = (await (await app().request('/api/status')).json()) as StatusSnapshot;
+    expect(snapshot.service.state).toBe('degraded');
+  });
+
+  it('always answers healthz with 200', async () => {
+    expect((await app().request('/healthz')).status).toBe(200);
+  });
+
+  it('answers readyz with 200 when healthy and 503 when degraded', async () => {
+    expect((await app().request('/readyz')).status).toBe(200);
+    metrics.setSinkHealth('local', {
+      state: 'failed',
+      consecutiveFailures: 6,
+      lastError: 'x',
+      lastErrorAt: 1,
+      lastSuccessAt: null,
+      nextRetryAt: 2,
+    });
+    expect((await app().request('/readyz')).status).toBe(503);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/server/status-route.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/server/routes/status.ts`**
+
+```ts
+import { statfs } from 'node:fs/promises';
+import { Hono } from 'hono';
+import type { AppConfig } from '../../config/schema.js';
+import type { Dispatcher } from '../../pipeline/dispatcher.js';
+import type { Metrics } from '../../status/metrics.js';
+import type { AppEnv } from '../types.js';
+import type { StatusSnapshot, VolumeStatus } from '../../../types/api.js';
+
+export type StatusDeps = {
+  getConfig: () => AppConfig;
+  dispatcher: Dispatcher;
+  metrics: Metrics;
+  version: string;
+  configDir: string;
+  spoolDir: string;
+};
+
+async function volumeStatus(path: string): Promise<VolumeStatus> {
+  try {
+    const stats = await statfs(path);
+    return {
+      path,
+      freeBytes: stats.bavail * stats.bsize,
+      totalBytes: stats.blocks * stats.bsize,
+    };
+  } catch {
+    return { path, freeBytes: 0, totalBytes: 0 };
+  }
+}
+
+export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+
+  app.get('/', async (c) => {
+    const config = deps.getConfig();
+    const metrics = deps.metrics.snapshot();
+    const byId = new Map(metrics.drains.map((entry) => [entry.id, entry]));
+
+    const snapshot: StatusSnapshot = {
+      service: {
+        state: deps.dispatcher.isDegraded() ? 'degraded' : 'ok',
+        uptimeSec: metrics.uptimeSec,
+        version: deps.version,
+        startedAt: metrics.startedAt,
+      },
+      volumes: {
+        config: await volumeStatus(deps.configDir),
+        spool: await volumeStatus(deps.spoolDir),
+      },
+      drains: config.drains.map((drain) => {
+        const counters = byId.get(drain.id);
+        return {
+          id: drain.id,
+          name: drain.name,
+          enabled: drain.enabled,
+          eventsReceived: counters?.eventsReceived ?? 0,
+          lastEventAt: counters?.lastEventAt ?? null,
+          requests: counters?.requests ?? {
+            ok: 0,
+            badSignature: 0,
+            notFound: 0,
+            disabled: 0,
+            malformedBody: 0,
+          },
+        };
+      }),
+      sinks: await deps.dispatcher.snapshotSinks(),
+      orphanedSpools: await deps.dispatcher.listOrphanedSpools(),
+      recent: {
+        events: metrics.recent.events,
+        rejects: metrics.recent.rejects,
+        errors: metrics.recent.errors,
+      },
+    };
+
+    return c.json(snapshot);
+  });
+
+  return app;
+}
+
+export function healthRoutes(deps: StatusDeps): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+  app.get('/healthz', (c) => c.text('ok'));
+  app.get('/readyz', (c) =>
+    deps.dispatcher.isDegraded() ? c.text('degraded', 503) : c.text('ready'),
+  );
+  return app;
+}
+```
+
+The drain list is built from config rather than metrics, so a drain that has
+never received a delivery still appears with zeroed counters — otherwise a
+misconfigured drain would be invisible on the page where you would look for it.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/server/status-route.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add status, health, and readiness routes
+
+Status is assembled from config plus metrics so a drain that has never
+fired still appears with zeroed counters. readyz reports 503 while
+degraded; healthz answers whenever the process is listening."
+```
+
+---
+
+### Task 22: Admin routes
+
+**Files:**
+- Create: `src/server/routes/admin.ts`
+- Test: `test/server/admin-route.test.ts`
+
+**Interfaces:**
+- Consumes: `ConfigStore`, `EtagMismatchError`, `redactConfig`, `restoreSecrets`, `SecretRestoreError`, `Dispatcher`, `warningsFor`, `newDrainId`, `newDrainSecret`.
+- Produces: `type AdminDeps = { store: ConfigStore; dispatcher: Dispatcher; getConfig: () => AppConfig; setConfig: (config: AppConfig, etag: string) => void; getEtag: () => string; log: Logger }`, `adminRoutes(deps): Hono<AppEnv>`.
+
+Routes: `GET /config`, `PUT /config`, `POST /drains`, `POST /sinks/:name/test`,
+`DELETE /orphans/:name`.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/server/admin-route.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { Writable } from 'node:stream';
+import { createLogger } from '../../src/log.js';
+import { adminRoutes } from '../../src/server/routes/admin.js';
+import { ConfigStore, etagOf } from '../../src/config/store.js';
+import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { Metrics } from '../../src/status/metrics.js';
+import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
+import type { AppEnv } from '../../src/server/types.js';
+
+const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+describe('admin routes', () => {
+  let configDir = '';
+  let spoolRoot = '';
+  let logsRoot = '';
+  let store: ConfigStore;
+  let dispatcher: Dispatcher;
+  let current: AppConfig;
+  let etag = '';
+
+  beforeEach(async () => {
+    configDir = await mkdtemp(join(tmpdir(), 'vld-admin-config-'));
+    spoolRoot = await mkdtemp(join(tmpdir(), 'vld-admin-spool-'));
+    logsRoot = await mkdtemp(join(tmpdir(), 'vld-admin-logs-'));
+    store = new ConfigStore(configDir);
+    const loaded = await store.load();
+    current = loaded.config;
+    etag = loaded.etag;
+    dispatcher = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics: new Metrics(),
+      log: silentLog,
+    });
+    await dispatcher.applyConfig(current);
+  });
+
+  afterEach(async () => {
+    await dispatcher.stop(500);
+    for (const dir of [configDir, spoolRoot, logsRoot]) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  function app() {
+    const instance = new Hono<AppEnv>();
+    instance.route(
+      '/api/admin',
+      adminRoutes({
+        store,
+        dispatcher,
+        getConfig: () => current,
+        getEtag: () => etag,
+        setConfig: (config, nextEtag) => {
+          current = config;
+          etag = nextEtag;
+        },
+        log: silentLog,
+      }),
+    );
+    return instance;
+  }
+
+  function fileSink(name: string): SinkEntry {
+    return {
+      name,
+      enabled: true,
+      filter: {},
+      maxSpoolBytes: 1_048_576,
+      maxBatchEvents: 1000,
+      maxBatchBytes: 1_048_576,
+      config: {
+        type: 'file',
+        directory: join(logsRoot, name),
+        filePrefix: 'events',
+        retentionDays: 0,
+        freeSpaceFloorBytes: 0,
+      },
+    };
+  }
+
+  async function put(body: unknown) {
+    return app().request('/api/admin/config', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('returns the redacted config with its etag', async () => {
+    const response = await app().request('/api/admin/config');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { etag: string; config: { drains: unknown[] } };
+    expect(body.etag).toBe(etag);
+    expect(body.config.drains).toEqual([]);
+  });
+
+  it('creates a drain and reveals the secret exactly once', async () => {
+    const response = await app().request('/api/admin/drains', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'prod' }),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(response.status).toBe(201);
+
+    const created = (await response.json()) as { id: string; secret: string };
+    expect(created.secret.length).toBeGreaterThanOrEqual(16);
+
+    const after = (await (await app().request('/api/admin/config')).json()) as {
+      config: { drains: { id: string; secret: null; hasSecret: boolean }[] };
+    };
+    expect(after.config.drains[0]?.id).toBe(created.id);
+    expect(after.config.drains[0]?.secret).toBeNull();
+    expect(after.config.drains[0]?.hasSecret).toBe(true);
+  });
+
+  it('applies a saved config and starts the sink', async () => {
+    const response = await put({ config: { ...current, sinks: [fileSink('local')] }, etag });
+    expect(response.status).toBe(200);
+    expect(current.sinks).toHaveLength(1);
+    expect((await dispatcher.snapshotSinks())[0]?.name).toBe('local');
+  });
+
+  it('returns warnings alongside a saved config', async () => {
+    const lokiSink: SinkEntry = {
+      ...fileSink('loki'),
+      config: {
+        type: 'loki',
+        url: 'http://loki:3100',
+        auth: { kind: 'none' },
+        tenantId: null,
+        labels: { static: {}, fromFields: ['requestId'] },
+        timeoutMs: 5000,
+      },
+    };
+    const response = await put({ config: { ...current, sinks: [lokiSink] }, etag });
+    const body = (await response.json()) as { warnings: string[] };
+    expect(body.warnings.join(' ')).toContain('requestId');
+  });
+
+  it('returns 409 on a stale etag', async () => {
+    await put({ config: { ...current, sinks: [fileSink('one')] }, etag });
+    const response = await put({ config: { ...current, sinks: [fileSink('two')] }, etag });
+    expect(response.status).toBe(409);
+  });
+
+  it('returns 400 on a schema-invalid config and leaves the running config alone', async () => {
+    const response = await put({
+      config: { ...current, sinks: [{ ...fileSink('Bad Name') }] },
+      etag,
+    });
+    expect(response.status).toBe(400);
+    expect(current.sinks).toHaveLength(0);
+  });
+
+  it('returns 400 when a new sink omits its required secret', async () => {
+    const lokiSink: SinkEntry = {
+      ...fileSink('loki'),
+      config: {
+        type: 'loki',
+        url: 'http://loki:3100',
+        auth: { kind: 'basic', username: 'u', password: '' },
+        tenantId: null,
+        labels: { static: {}, fromFields: [] },
+        timeoutMs: 5000,
+      },
+    };
+    const response = await put({ config: { ...current, sinks: [lokiSink] }, etag });
+    expect(response.status).toBe(400);
+  });
+
+  it('runs a sink test', async () => {
+    await put({ config: { ...current, sinks: [fileSink('probe')] }, etag });
+    const response = await app().request('/api/admin/sinks/probe/test', { method: 'POST' });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true });
+  });
+
+  it('discards an orphaned spool', async () => {
+    await put({ config: { ...current, sinks: [fileSink('temp')] }, etag });
+    await dispatcher.enqueue([{ id: 'a', timestamp: 1, source: 'lambda', projectId: 'p' }]);
+    await put({ config: { ...current, sinks: [] }, etag });
+
+    const response = await app().request('/api/admin/orphans/temp', { method: 'DELETE' });
+    expect(response.status).toBe(200);
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+  });
+
+  it('returns 404 when discarding a name that is not an orphan', async () => {
+    const response = await app().request('/api/admin/orphans/nope', { method: 'DELETE' });
+    expect(response.status).toBe(404);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/server/admin-route.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/server/routes/admin.ts`**
+
+```ts
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { EtagMismatchError } from '../../config/store.js';
+import { redactConfig, restoreSecrets, SecretRestoreError } from '../../config/redact.js';
+import { newDrainId, newDrainSecret } from '../../config/schema.js';
+import { warningsFor } from '../../sinks/registry.js';
+import type { ConfigStore } from '../../config/store.js';
+import type { AppConfig } from '../../config/schema.js';
+import type { Dispatcher } from '../../pipeline/dispatcher.js';
+import type { Logger } from '../../log.js';
+import type { AppEnv } from '../types.js';
+import type { JsonValue } from '../../../types/json.js';
+
+export type AdminDeps = {
+  store: ConfigStore;
+  dispatcher: Dispatcher;
+  getConfig: () => AppConfig;
+  getEtag: () => string;
+  setConfig: (config: AppConfig, etag: string) => void;
+  log: Logger;
+};
+
+const putBodySchema = z.object({
+  config: z.custom<JsonValue>(() => true),
+  etag: z.string().min(1),
+});
+
+const createDrainSchema = z.object({ name: z.string().min(1).max(128) });
+
+function warningsForConfig(config: AppConfig): string[] {
+  return config.sinks.flatMap((entry) =>
+    warningsFor(entry.config).map((warning) => `${entry.name}: ${warning}`),
+  );
+}
+
+export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+
+  app.get('/config', (c) => {
+    const config = deps.getConfig();
+    return c.json({
+      config: redactConfig(config),
+      etag: deps.getEtag(),
+      warnings: warningsForConfig(config),
+    });
+  });
+
+  app.put('/config', async (c) => {
+    const body = putBodySchema.safeParse(await c.req.json());
+    if (!body.success) {
+      return c.json({ code: 'bad_request', error: z.prettifyError(body.error) }, 400);
+    }
+
+    let candidate: AppConfig;
+    try {
+      candidate = restoreSecrets(body.data.config, deps.getConfig());
+    } catch (error) {
+      if (error instanceof SecretRestoreError) {
+        return c.json({ code: 'invalid_config', error: error.message }, 400);
+      }
+      throw error;
+    }
+
+    // Apply to the dispatcher first: it validates path containment and can
+    // fail before anything is persisted.
+    try {
+      await deps.dispatcher.applyConfig(candidate);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      return c.json({ code: 'invalid_config', error: failure.message }, 400);
+    }
+
+    let saved;
+    try {
+      saved = await deps.store.save(candidate, body.data.etag);
+    } catch (error) {
+      if (error instanceof EtagMismatchError) {
+        // Roll the dispatcher back to the config that is actually persisted.
+        await deps.dispatcher.applyConfig(deps.getConfig());
+        return c.json({ code: 'conflict', error: error.message }, 409);
+      }
+      const failure = error instanceof Error ? error : new Error(String(error));
+      deps.log.error({ err: failure.message }, 'failed to persist config');
+      await deps.dispatcher.applyConfig(deps.getConfig());
+      return c.json({ code: 'save_failed', error: failure.message }, 507);
+    }
+
+    deps.setConfig(saved.config, saved.etag);
+    return c.json({
+      config: redactConfig(saved.config),
+      etag: saved.etag,
+      warnings: warningsForConfig(saved.config),
+    });
+  });
+
+  app.post('/drains', async (c) => {
+    const body = createDrainSchema.safeParse(await c.req.json());
+    if (!body.success) {
+      return c.json({ code: 'bad_request', error: z.prettifyError(body.error) }, 400);
+    }
+
+    const secret = newDrainSecret();
+    const drain = {
+      id: newDrainId(),
+      name: body.data.name,
+      secret,
+      enabled: true,
+      createdAt: Date.now(),
+    };
+    const current = deps.getConfig();
+    const next: AppConfig = { ...current, drains: [...current.drains, drain] };
+
+    const saved = await deps.store.save(next, deps.getEtag());
+    deps.setConfig(saved.config, saved.etag);
+
+    // The only time a secret is ever returned by the API.
+    return c.json({ id: drain.id, name: drain.name, secret, etag: saved.etag }, 201);
+  });
+
+  app.post('/sinks/:name/test', async (c) => {
+    const result = await deps.dispatcher.testSink(c.req.param('name'));
+    return c.json(result);
+  });
+
+  app.delete('/orphans/:name', async (c) => {
+    try {
+      await deps.dispatcher.discardOrphan(c.req.param('name'));
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      return c.json({ code: 'not_found', error: failure.message }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  return app;
+}
+```
+
+Note the ordering in `PUT /config`: the dispatcher applies first because it is
+the component that can reject a config (path containment), and on a persistence
+failure the dispatcher is rolled back to the config that is actually on disk.
+Persisting a config the dispatcher rejected would leave the container unable to
+boot.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `npx vitest run test/server/admin-route.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: add admin config API
+
+Applies to the dispatcher before persisting so a config that cannot run
+is never written, and rolls the dispatcher back if the write fails. New
+drain secrets are returned exactly once at creation."
+```
+
+---
+
+### Task 23: App assembly and entrypoint
+
+**Files:**
+- Create: `src/version.ts`, `src/server/static.ts`, `src/server/app.ts`, `src/index.ts`
+- Test: `test/server/app.test.ts`
+
+**Interfaces:**
+- Consumes: all route modules, `proxyAuth`, `parseAuthConfig`, `nodePeerResolver`, `ConfigStore`, `Dispatcher`, `Metrics`, `createLogger`.
+- Produces: `VERSION`; `staticHandler(webRoot: string): MiddlewareHandler<AppEnv>`; `type AppDeps`, `buildApp(deps: AppDeps): Hono<AppEnv>`; `type BootOptions`, `boot(options: BootOptions): Promise<Booted>` where `Booted = { app: Hono<AppEnv>; dispatcher: Dispatcher; shutdown: () => Promise<void> }`.
+
+Static assets are served by a small handler rather than a dependency: the SPA
+needs an `index.html` fallback for client routing anyway, and this keeps the
+runtime dependency list at four packages.
+
+- [ ] **Step 1: Write the failing test**
+
+`test/server/app.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { boot } from '../../src/index.js';
+
+describe('boot', () => {
+  let root = '';
+  let dirs = { config: '', spool: '', logs: '', web: '' };
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'vld-boot-'));
+    dirs = {
+      config: join(root, 'config'),
+      spool: join(root, 'spool'),
+      logs: join(root, 'logs'),
+      web: join(root, 'web'),
+    };
+    for (const dir of Object.values(dirs)) await mkdir(dir, { recursive: true });
+    await writeFile(join(dirs.web, 'index.html'), '<!doctype html><title>drain</title>');
+    await writeFile(join(dirs.web, 'app.js'), 'console.log(1);');
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  async function bootWith(env: Record<string, string | undefined>) {
+    return boot({
+      env: {
+        CONFIG_DIR: dirs.config,
+        SPOOL_DIR: dirs.spool,
+        LOGS_ROOT: dirs.logs,
+        LOG_LEVEL: 'silent',
+        ...env,
+      },
+      webRoot: dirs.web,
+    });
+  }
+
+  it('serves healthz without any auth configuration', async () => {
+    const booted = await bootWith({});
+    try {
+      expect((await booted.app.request('/healthz')).status).toBe(200);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('closes the admin surface with 503 when AUTH_MODE is unset', async () => {
+    const booted = await bootWith({});
+    try {
+      expect((await booted.app.request('/api/admin/config')).status).toBe(503);
+      expect((await booted.app.request('/api/status')).status).toBe(503);
+      expect((await booted.app.request('/')).status).toBe(503);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('leaves the drain endpoint reachable when AUTH_MODE is unset', async () => {
+    const booted = await bootWith({});
+    try {
+      // 404 rather than 503: the route ran and simply has no such drain.
+      const response = await booted.app.request('/api/drain/none', { method: 'POST', body: '[]' });
+      expect(response.status).toBe(404);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('serves the SPA and its assets when auth is disabled', async () => {
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      const index = await booted.app.request('/');
+      expect(index.status).toBe(200);
+      expect(await index.text()).toContain('<title>drain</title>');
+
+      const asset = await booted.app.request('/app.js');
+      expect(asset.status).toBe(200);
+      expect(asset.headers.get('content-type')).toContain('javascript');
+
+      // Unknown paths fall back to index.html for client-side routing.
+      const deep = await booted.app.request('/sinks');
+      expect(deep.status).toBe(200);
+      expect(await deep.text()).toContain('<title>drain</title>');
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('refuses to serve a path that escapes the web root', async () => {
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      const response = await booted.app.request('/../config/config.json');
+      expect(response.status).not.toBe(200);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('creates a default config on first boot', async () => {
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      const response = await booted.app.request('/api/admin/config');
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { config: { drains: unknown[] } };
+      expect(body.config.drains).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('fails to boot with a clear message when a directory is not writable', async () => {
+    await expect(
+      boot({
+        env: {
+          CONFIG_DIR: join(root, 'config'),
+          SPOOL_DIR: join(dirs.web, 'index.html'), // a file, not a directory
+          LOGS_ROOT: dirs.logs,
+          LOG_LEVEL: 'silent',
+        },
+        webRoot: dirs.web,
+      }),
+    ).rejects.toThrow(/SPOOL_DIR/);
+  });
+
+  it('fails to boot on an invalid AUTH_MODE rather than failing open', async () => {
+    await expect(bootWith({ AUTH_MODE: 'wide-open' })).rejects.toThrow(/AUTH_MODE/);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run test/server/app.test.ts`
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `src/version.ts`**
+
+```ts
+export const VERSION = process.env['APP_VERSION'] ?? 'dev';
+```
+
+The Dockerfile sets `APP_VERSION` from a build argument. Reading
+`package.json` at runtime is avoided because its relative location differs
+between `src/` and `dist/src/`.
+
+- [ ] **Step 4: Implement `src/server/static.ts`**
+
+```ts
+import { readFile, stat } from 'node:fs/promises';
+import { extname, join, relative, resolve } from 'node:path';
+import type { MiddlewareHandler } from 'hono';
+import type { AppEnv } from './types.js';
+
+const CONTENT_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+  '.map': 'application/json; charset=utf-8',
+};
+
+export function staticHandler(webRoot: string): MiddlewareHandler<AppEnv> {
+  const root = resolve(webRoot);
+
+  return async (c) => {
+    const requested = decodeURIComponent(new URL(c.req.url).pathname);
+    const candidate = resolve(join(root, requested === '/' ? 'index.html' : requested));
+
+    // Containment: never serve anything outside the web root.
+    const rel = relative(root, candidate);
+    const contained = rel === '' || (!rel.startsWith('..') && !rel.startsWith('/'));
+
+    const target = contained && (await isFile(candidate)) ? candidate : join(root, 'index.html');
+    if (!(await isFile(target))) return c.text('not found', 404);
+
+    const body = await readFile(target);
+    const type = CONTENT_TYPES[extname(target)] ?? 'application/octet-stream';
+    return c.body(body, 200, { 'content-type': type });
+  };
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+```
+
+- [ ] **Step 5: Implement `src/server/app.ts`**
+
+```ts
+import { Hono } from 'hono';
+import { adminRoutes } from './routes/admin.js';
+import { drainRoutes } from './routes/drain.js';
+import { healthRoutes, statusRoutes } from './routes/status.js';
+import { proxyAuth } from './middleware/proxy-auth.js';
+import { staticHandler } from './static.js';
+import type { AdminDeps } from './routes/admin.js';
+import type { DrainDeps } from './routes/drain.js';
+import type { StatusDeps } from './routes/status.js';
+import type { AuthConfig, PeerResolver } from './middleware/proxy-auth.js';
+import type { AppEnv } from './types.js';
+
+export type AppDeps = {
+  authConfig: AuthConfig;
+  peerResolver: PeerResolver;
+  drain: DrainDeps;
+  status: StatusDeps;
+  admin: AdminDeps;
+  webRoot: string | null;
+};
+
+export function buildApp(deps: AppDeps): Hono<AppEnv> {
+  const app = new Hono<AppEnv>();
+
+  // Unauthenticated by design: liveness/readiness probes and the drain
+  // endpoint, which authenticates by HMAC because Vercel cannot present an
+  // SSO identity.
+  app.route('/', healthRoutes(deps.status));
+  app.route('/api/drain', drainRoutes(deps.drain));
+
+  const guard = proxyAuth(deps.authConfig, deps.peerResolver);
+  app.use('/api/admin/*', guard);
+  app.use('/api/status', guard);
+  app.route('/api/admin', adminRoutes(deps.admin));
+  app.route('/api/status', statusRoutes(deps.status));
+
+  if (deps.webRoot !== null) {
+    app.use('*', guard);
+    app.get('*', staticHandler(deps.webRoot));
+  }
+
+  return app;
+}
+```
+
+**Ordering assumption, and what to do if it does not hold.** This relies on
+Hono applying middleware only to handlers registered *after* it, so the
+`app.use('*', guard)` above does not wrap the already-registered health and
+drain routes. The Task 23 tests pin exactly that: `/api/drain/none` must return
+`404`, not `503`, with `AUTH_MODE` unset. If those tests show the guard
+swallowing the drain route, do not reorder blindly — replace the wildcard with
+an explicit non-API scope:
+
+```ts
+    app.use('*', async (c, next) => {
+      const path = new URL(c.req.url).pathname;
+      if (path.startsWith('/api/') || path === '/healthz' || path === '/readyz') {
+        await next();
+        return;
+      }
+      return guard(c, next);
+    });
+```
+
+- [ ] **Step 6: Implement `src/index.ts`**
+
+```ts
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { serve } from '@hono/node-server';
+import { buildApp } from './server/app.js';
+import { nodePeerResolver, parseAuthConfig } from './server/middleware/proxy-auth.js';
+import { ConfigStore } from './config/store.js';
+import { Dispatcher } from './pipeline/dispatcher.js';
+import { Metrics } from './status/metrics.js';
+import { createLogger } from './log.js';
+import { VERSION } from './version.js';
+import type { Hono } from 'hono';
+import type { AppConfig } from './config/schema.js';
+import type { AppEnv } from './server/types.js';
+
+export type BootOptions = {
+  env: Record<string, string | undefined>;
+  webRoot: string | null;
+};
+
+export type Booted = {
+  app: Hono<AppEnv>;
+  dispatcher: Dispatcher;
+  shutdown: () => Promise<void>;
+};
+
+async function assertWritable(label: string, dir: string): Promise<void> {
+  const probe = join(dir, `.write-probe-${String(process.pid)}`);
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(probe, 'ok');
+    await rm(probe, { force: true });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${label} (${dir}) is not writable by uid ${String(process.getuid?.() ?? -1)}: ${detail}\n` +
+        `Fix it on the host with:  chown -R 10001:10001 ${dir}`,
+    );
+  }
+}
+
+export async function boot(options: BootOptions): Promise<Booted> {
+  const env = options.env;
+  const configDir = env['CONFIG_DIR'] ?? '/config';
+  const spoolDir = env['SPOOL_DIR'] ?? '/spool';
+  const logsRoot = env['LOGS_ROOT'] ?? '/logs';
+
+  // Parse auth before touching disk: a bad AUTH_MODE must fail fast.
+  const authConfig = parseAuthConfig(env);
+
+  await assertWritable('CONFIG_DIR', configDir);
+  await assertWritable('SPOOL_DIR', spoolDir);
+  await assertWritable('LOGS_ROOT', logsRoot);
+
+  const log = createLogger(env['LOG_LEVEL'] ?? 'info');
+  if (authConfig.mode === 'disabled') {
+    log.warn(
+      'AUTH_MODE=disabled — the admin interface is UNAUTHENTICATED. Never use this outside local development.',
+    );
+  }
+  if (authConfig.mode === 'unset') {
+    log.warn(
+      'AUTH_MODE is not set — the admin interface will return 503. Ingest is unaffected. Set AUTH_MODE=proxy with AUTH_TRUSTED_PROXIES and AUTH_USER_HEADER to enable it.',
+    );
+  }
+
+  const metrics = new Metrics();
+  const store = new ConfigStore(configDir);
+  const loaded = await store.load();
+
+  let config: AppConfig = loaded.config;
+  let etag = loaded.etag;
+
+  const dispatcher = new Dispatcher({ spoolRoot: spoolDir, logsRoot, metrics, log });
+  await dispatcher.applyConfig(config);
+  dispatcher.start();
+
+  const app = buildApp({
+    authConfig,
+    peerResolver: nodePeerResolver,
+    webRoot: options.webRoot,
+    drain: { getConfig: () => config, dispatcher, metrics, log },
+    status: {
+      getConfig: () => config,
+      dispatcher,
+      metrics,
+      version: VERSION,
+      configDir,
+      spoolDir,
+    },
+    admin: {
+      store,
+      dispatcher,
+      getConfig: () => config,
+      getEtag: () => etag,
+      setConfig: (next, nextEtag) => {
+        config = next;
+        etag = nextEtag;
+      },
+      log,
+    },
+  });
+
+  return {
+    app,
+    dispatcher,
+    shutdown: async () => {
+      await dispatcher.stop(10_000);
+    },
+  };
+}
+
+async function main(): Promise<void> {
+  const booted = await boot({
+    env: process.env,
+    webRoot: process.env['WEB_ROOT'] ?? 'web/dist',
+  });
+
+  const port = Number.parseInt(process.env['PORT'] ?? '8080', 10);
+  const hostname = process.env['HOST'] ?? '0.0.0.0';
+  const server = serve({ fetch: booted.app.fetch, port, hostname });
+
+  const log = createLogger(process.env['LOG_LEVEL'] ?? 'info');
+  log.info({ port, hostname, version: VERSION }, 'vercel-log-drain listening');
+
+  let shuttingDown = false;
+  const stop = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info({ signal }, 'shutting down');
+    server.close(() => {
+      void booted.shutdown().then(() => {
+        process.exit(0);
+      });
+    });
+  };
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
+}
+
+// Only run the server when executed directly, so tests can import boot().
+if (process.argv[1]?.endsWith('index.js') === true) {
+  void main();
+}
+```
+
+- [ ] **Step 7: Run the test to verify it passes**
+
+Run: `npx vitest run test/server/app.test.ts`
+Expected: PASS.
+
+- [ ] **Step 8: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "feat: assemble app and entrypoint
+
+Health probes and the drain endpoint are unauthenticated by design;
+everything else sits behind the proxy guard, including the SPA. Boot
+probes all three volumes for writability and fails with the exact chown
+to run, rather than an EACCES trace mid-startup."
+```
+
+---
+
+### Task 24: End-to-end durability test
+
+This is the test that validates the central design claim. It has no
+implementation step — if it fails, a previous task is wrong.
+
+**Files:**
+- Test: `test/e2e/durability.test.ts`
+
+**Interfaces:**
+- Consumes: `boot` from `src/index.ts`; `newDrainSecret` from `src/config/schema.ts`.
+- Produces: nothing.
+
+- [ ] **Step 1: Write the test**
+
+`test/e2e/durability.test.ts`:
+
+```ts
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createHmac } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { boot } from '../../src/index.js';
+import { ConfigStore } from '../../src/config/store.js';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import type { Booted } from '../../src/index.js';
+
+const gunzipAsync = promisify(gunzip);
+const SECRET = 'e'.repeat(40);
+
+function event(id: string) {
+  return {
+    id,
+    timestamp: Date.UTC(2026, 8, 8, 12, 0, 0),
+    source: 'lambda',
+    projectId: 'p1',
+    projectName: 'my-app',
+    environment: 'production',
+    level: 'info',
+    message: `event ${id}`,
+  };
+}
+
+function sign(body: string): string {
+  return createHmac('sha1', SECRET).update(body).digest('hex');
+}
+
+async function post(booted: Booted, events: ReturnType<typeof event>[]) {
+  const body = JSON.stringify(events);
+  return booted.app.request('/api/drain/e2e', {
+    method: 'POST',
+    body,
+    headers: { 'x-vercel-signature': sign(body) },
+  });
+}
+
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('condition not met before timeout');
+}
+
+describe('end-to-end durability', () => {
+  let root = '';
+  let configDir = '';
+  let spoolDir = '';
+  let logsRoot = '';
+  let lokiServer: Server | null = null;
+  const lokiReceived: string[] = [];
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'vld-e2e-'));
+    configDir = join(root, 'config');
+    spoolDir = join(root, 'spool');
+    logsRoot = join(root, 'logs');
+    for (const dir of [configDir, spoolDir, logsRoot]) await mkdir(dir, { recursive: true });
+    lokiReceived.length = 0;
+  });
+
+  afterEach(async () => {
+    if (lokiServer !== null) {
+      await new Promise<void>((resolve) => lokiServer?.close(() => resolve()));
+      lokiServer = null;
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  async function startLoki(port: number): Promise<void> {
+    const instance = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        void (async () => {
+          const raw = Buffer.concat(chunks);
+          const text =
+            req.headers['content-encoding'] === 'gzip'
+              ? (await gunzipAsync(raw)).toString('utf8')
+              : raw.toString('utf8');
+          lokiReceived.push(text);
+          res.writeHead(204);
+          res.end();
+        })();
+      });
+    });
+    lokiServer = instance;
+    await new Promise<void>((resolve) => instance.listen(port, '127.0.0.1', resolve));
+  }
+
+  async function writeConfig(lokiPort: number): Promise<void> {
+    const base = defaultAppConfig();
+    await new ConfigStore(configDir).save(
+      {
+        ...base,
+        drains: [{ id: 'e2e', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 }],
+        sinks: [
+          {
+            name: 'local',
+            enabled: true,
+            filter: {},
+            maxSpoolBytes: 1_048_576,
+            maxBatchEvents: 1000,
+            maxBatchBytes: 1_048_576,
+            config: {
+              type: 'file',
+              directory: join(logsRoot, 'local'),
+              filePrefix: 'events',
+              retentionDays: 0,
+              freeSpaceFloorBytes: 0,
+            },
+          },
+          {
+            name: 'loki',
+            enabled: true,
+            filter: {},
+            maxSpoolBytes: 1_048_576,
+            maxBatchEvents: 1000,
+            maxBatchBytes: 1_048_576,
+            config: {
+              type: 'loki',
+              url: `http://127.0.0.1:${String(lokiPort)}`,
+              auth: { kind: 'none' },
+              tenantId: null,
+              labels: { static: { job: 'vercel' }, fromFields: ['level'] },
+              timeoutMs: 1000,
+            },
+          },
+        ],
+      },
+      null,
+    );
+  }
+
+  function bootService(): Promise<Booted> {
+    return boot({
+      env: {
+        CONFIG_DIR: configDir,
+        SPOOL_DIR: spoolDir,
+        LOGS_ROOT: logsRoot,
+        LOG_LEVEL: 'silent',
+        AUTH_MODE: 'disabled',
+      },
+      webRoot: null,
+    });
+  }
+
+  it('loses nothing across a sink outage and a hard restart', async () => {
+    // Pick a port nothing is listening on yet, so Loki is "down".
+    const lokiPort = 45_231;
+    await writeConfig(lokiPort);
+
+    // --- Phase 1: Loki is down. Deliveries must still be accepted. ---
+    const first = await bootService();
+
+    for (const ids of [['a1', 'a2'], ['a3'], ['a4', 'a5']]) {
+      const response = await post(first, ids.map(event));
+      expect(response.status).toBe(200);
+    }
+
+    // The file sink drains normally even though Loki cannot be reached.
+    await waitFor(async () => {
+      const files = await readdir(join(logsRoot, 'local')).catch(() => []);
+      if (files.length === 0) return false;
+      const contents = await readFile(join(logsRoot, 'local', files[0] ?? ''), 'utf8');
+      return contents.trimEnd().split('\n').length === 5;
+    });
+
+    // Loki's spool still holds the batches, undelivered.
+    const spooledBefore = (await readdir(join(spoolDir, 'loki'))).filter((f) =>
+      f.endsWith('.jsonl'),
+    );
+    expect(spooledBefore.length).toBe(3);
+    expect(lokiReceived).toEqual([]);
+
+    // --- Phase 2: simulate a crash. No graceful drain. ---
+    await first.dispatcher.stop(0);
+
+    // --- Phase 3: Loki comes back; a fresh process must replay the spool. ---
+    await startLoki(lokiPort);
+    const second = await bootService();
+
+    try {
+      await waitFor(async () => {
+        const remaining = (await readdir(join(spoolDir, 'loki'))).filter((f) =>
+          f.endsWith('.jsonl'),
+        );
+        return remaining.length === 0;
+      });
+
+      const delivered = lokiReceived
+        .flatMap((text) => {
+          const payload = JSON.parse(text) as {
+            streams: { values: [string, string][] }[];
+          };
+          return payload.streams.flatMap((stream) => stream.values);
+        })
+        .map(([, line]) => (JSON.parse(line) as { id: string }).id);
+
+      // Every event arrives, exactly once.
+      expect(delivered.sort()).toEqual(['a1', 'a2', 'a3', 'a4', 'a5']);
+
+      // And nothing was dead-lettered along the way.
+      const dead = await readdir(join(spoolDir, 'loki', 'dead')).catch(() => []);
+      expect(dead).toEqual([]);
+    } finally {
+      await second.shutdown();
+    }
+  }, 30_000);
+
+  it('keeps accepting deliveries while a sink is wedged, and reports degraded', async () => {
+    const lokiPort = 45_232;
+    await writeConfig(lokiPort);
+    const booted = await bootService();
+
+    try {
+      expect((await post(booted, [event('b1')])).status).toBe(200);
+
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
+
+      const status = await booted.app.request('/api/status');
+      const snapshot = (await status.json()) as {
+        service: { state: string };
+        sinks: { name: string; health: { state: string }; queue: { files: number } }[];
+      };
+      expect(snapshot.service.state).toBe('degraded');
+      const loki = snapshot.sinks.find((sink) => sink.name === 'loki');
+      expect(loki?.health.state).toBe('failed');
+      expect(loki?.queue.files).toBeGreaterThan(0);
+
+      expect((await booted.app.request('/readyz')).status).toBe(503);
+      expect((await booted.app.request('/healthz')).status).toBe(200);
+    } finally {
+      await booted.shutdown();
+    }
+  }, 30_000);
+});
+```
+
+- [ ] **Step 2: Run the test**
+
+Run: `npx vitest run test/e2e/durability.test.ts`
+Expected: PASS. If it fails, do not weaken the test — the defect is in the
+spool queue, the worker, or the dispatcher. Use
+`superpowers:systematic-debugging`.
+
+- [ ] **Step 3: Run all gates and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test
+git add -A
+git commit -m "test: prove durability across a sink outage and restart
+
+Accepts deliveries while Loki is unreachable, kills the dispatcher
+without draining, then brings up a fresh process and asserts every event
+arrives exactly once with nothing dead-lettered."
+```
+
+---
+
+### Task 25: SPA scaffold, API client, and Status view
+
+**Files:**
+- Create: `web/index.html`, `web/src/main.tsx`, `web/src/App.tsx`, `web/src/api.ts`, `web/src/styles.css`, `web/src/views/Status.tsx`
+- Create: `src/config/api-contract.ts`
+- Modify: `types/api.ts` (add the config DTOs the SPA consumes)
+- Delete: `web/src/placeholder.ts`
+- Test: `test/config/api-contract.test.ts`
+
+**Interfaces:**
+- Consumes: `StatusSnapshot` and the new DTOs from `types/api.ts`.
+- Produces: in `types/api.ts` — `SinkFilterDto`, `FileSinkConfigDto`, `LokiAuthDto`, `LokiSinkConfigDto`, `SinkConfigDto`, `SinkEntryDto`, `RedactedDrainDto`, `ServerConfigDto`, `RedactedConfigDto`, `ConfigResponse`, `CreatedDrain`, `TestSinkResponse`; in `web/src/api.ts` — `fetchStatus`, `fetchConfig`, `saveConfig`, `createDrain`, `testSink`, `discardOrphan`, `ApiError`.
+
+The DTOs in `types/api.ts` are hand-written so the SPA never imports zod.
+`src/config/api-contract.ts` asserts at typecheck time that they stay
+assignable from the zod-inferred server types, so drift is a build failure
+rather than a runtime surprise.
+
+- [ ] **Step 1: Add the DTOs to `types/api.ts`**
+
+Append (still no imports in this file):
+
+```ts
+export type SinkFilterDto = {
+  minLevel?: 'info' | 'warning' | 'error';
+  sources?: string[];
+  environments?: string[];
+  projectIds?: string[];
+};
+
+export type FileSinkConfigDto = {
+  type: 'file';
+  directory: string;
+  filePrefix: string;
+  retentionDays: number;
+  freeSpaceFloorBytes: number;
+};
+
+export type LokiAuthDto =
+  | { kind: 'none' }
+  | { kind: 'basic'; username: string; password: string }
+  | { kind: 'bearer'; token: string };
+
+export type LokiSinkConfigDto = {
+  type: 'loki';
+  url: string;
+  auth: LokiAuthDto;
+  tenantId: string | null;
+  labels: { static: Record<string, string>; fromFields: string[] };
+  timeoutMs: number;
+};
+
+export type SinkConfigDto = FileSinkConfigDto | LokiSinkConfigDto;
+
+export type SinkEntryDto = {
+  name: string;
+  enabled: boolean;
+  filter: SinkFilterDto;
+  maxSpoolBytes: number;
+  maxBatchEvents: number;
+  maxBatchBytes: number;
+  config: SinkConfigDto;
+};
+
+export type RedactedDrainDto = {
+  id: string;
+  name: string;
+  secret: null;
+  hasSecret: boolean;
+  enabled: boolean;
+  createdAt: number;
+};
+
+export type ServerConfigDto = {
+  maxBodyBytes: number;
+  maxDecompressedBytes: number;
+  spoolFreeSpaceFloorBytes: number;
+};
+
+export type RedactedConfigDto = {
+  version: 1;
+  drains: RedactedDrainDto[];
+  sinks: SinkEntryDto[];
+  server: ServerConfigDto;
+};
+
+export type ConfigResponse = { config: RedactedConfigDto; etag: string; warnings: string[] };
+export type CreatedDrain = { id: string; name: string; secret: string; etag: string };
+export type TestSinkResponse = { ok: boolean; detail: string };
+```
+
+- [ ] **Step 2: Write the failing contract test**
+
+`test/config/api-contract.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { redactConfig } from '../../src/config/redact.js';
+import { defaultAppConfig } from '../../src/config/schema.js';
+import { CONTRACT_OK } from '../../src/config/api-contract.js';
+import type { RedactedConfigDto } from '../../types/api.js';
+
+describe('api contract', () => {
+  it('keeps the hand-written DTOs assignable from the server types', () => {
+    // The real assertion is at typecheck time in api-contract.ts; this test
+    // exists so the file is exercised and cannot be deleted unnoticed.
+    expect(CONTRACT_OK).toBe(true);
+  });
+
+  it('produces a redacted config that satisfies the DTO shape at runtime', () => {
+    const redacted: RedactedConfigDto = redactConfig(defaultAppConfig());
+    expect(redacted.version).toBe(1);
+    expect(redacted.drains).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `npx vitest run test/config/api-contract.test.ts`
+Expected: FAIL — `src/config/api-contract.js` not found.
+
+- [ ] **Step 4: Implement `src/config/api-contract.ts`**
+
+```ts
+import type { RedactedConfig } from './redact.js';
+import type { SinkEntry } from './schema.js';
+import type { RedactedConfigDto, SinkEntryDto } from '../../types/api.js';
+
+/**
+ * Compile-time guard. If the zod-inferred server types and the hand-written
+ * DTOs in types/api.ts ever drift, `npm run typecheck` fails here rather than
+ * the SPA silently reading a field that no longer exists.
+ */
+type AssertAssignable<Target, Source extends Target> = Source;
+
+export type ConfigContract = AssertAssignable<RedactedConfigDto, RedactedConfig>;
+export type SinkEntryContract = AssertAssignable<SinkEntryDto, SinkEntry>;
+
+export const CONTRACT_OK = true;
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run test/config/api-contract.test.ts && npm run typecheck`
+Expected: PASS, and typecheck clean. If typecheck fails here, the DTOs and the
+schema disagree — fix `types/api.ts` to match the schema, never the reverse.
+
+- [ ] **Step 6: Implement the SPA shell**
+
+`web/index.html`:
+
+```html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vercel Log Drain</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+`web/src/styles.css`:
+
+```css
+:root {
+  color-scheme: light dark;
+  --border: color-mix(in srgb, currentColor 18%, transparent);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+body { margin: 0; padding: 0 1.5rem 3rem; max-width: 68rem; }
+h1 { font-size: 1.25rem; }
+nav { display: flex; gap: 0.5rem; margin: 1rem 0 1.5rem; }
+nav button { padding: 0.4rem 0.9rem; border: 1px solid var(--border); border-radius: 0.4rem;
+  background: transparent; color: inherit; cursor: pointer; font: inherit; }
+nav button[aria-current='true'] { background: color-mix(in srgb, currentColor 12%, transparent); }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
+th { font-weight: 600; opacity: 0.7; font-size: 0.8rem; text-transform: uppercase; }
+.card { border: 1px solid var(--border); border-radius: 0.6rem; padding: 1rem; margin-bottom: 1rem; }
+.row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: end; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.85rem; }
+input, select { padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 0.3rem;
+  background: transparent; color: inherit; font: inherit; }
+button.primary { padding: 0.45rem 1rem; border-radius: 0.4rem; border: 1px solid var(--border);
+  background: color-mix(in srgb, currentColor 12%, transparent); color: inherit; cursor: pointer; font: inherit; }
+.state-ok { color: #10893e; } .state-retrying { color: #b8860b; } .state-failed { color: #d13438; }
+.warn { border-left: 3px solid #b8860b; padding-left: 0.75rem; margin: 0.5rem 0; font-size: 0.9rem; }
+.err { border-left: 3px solid #d13438; padding-left: 0.75rem; margin: 0.5rem 0; font-size: 0.9rem; }
+.muted { opacity: 0.65; font-size: 0.85rem; }
+pre { overflow-x: auto; font-size: 0.8rem; }
+```
+
+`web/src/api.ts`:
+
+```ts
+import type {
+  ConfigResponse,
+  CreatedDrain,
+  RedactedConfigDto,
+  StatusSnapshot,
+  TestSinkResponse,
+} from '@shared/api';
+
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: { 'content-type': 'application/json', ...init?.headers },
+  });
+  if (!response.ok) {
+    const body: { error?: string } = await response.json().catch(() => ({}));
+    throw new ApiError(response.status, body.error ?? `request failed (${response.status})`);
+  }
+  return (await response.json()) as T;
+}
+
+export function fetchStatus(): Promise<StatusSnapshot> {
+  return request<StatusSnapshot>('/api/status');
+}
+
+export function fetchConfig(): Promise<ConfigResponse> {
+  return request<ConfigResponse>('/api/admin/config');
+}
+
+export function saveConfig(config: RedactedConfigDto, etag: string): Promise<ConfigResponse> {
+  return request<ConfigResponse>('/api/admin/config', {
+    method: 'PUT',
+    body: JSON.stringify({ config, etag }),
+  });
+}
+
+export function createDrain(name: string): Promise<CreatedDrain> {
+  return request<CreatedDrain>('/api/admin/drains', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function testSink(name: string): Promise<TestSinkResponse> {
+  return request<TestSinkResponse>(`/api/admin/sinks/${encodeURIComponent(name)}/test`, {
+    method: 'POST',
+  });
+}
+
+export function discardOrphan(name: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/api/admin/orphans/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+```
+
+`web/src/main.tsx`:
+
+```tsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { App } from './App.tsx';
+import './styles.css';
+
+const container = document.getElementById('root');
+if (container === null) throw new Error('#root is missing from index.html');
+createRoot(container).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+```
+
+`web/src/App.tsx`:
+
+```tsx
+import { useState } from 'react';
+import { Status } from './views/Status.tsx';
+import { Drains } from './views/Drains.tsx';
+import { Sinks } from './views/Sinks.tsx';
+
+type Tab = 'status' | 'drains' | 'sinks';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'status', label: 'Status' },
+  { id: 'drains', label: 'Drains' },
+  { id: 'sinks', label: 'Sinks' },
+];
+
+export function App(): React.JSX.Element {
+  const [tab, setTab] = useState<Tab>('status');
+
+  return (
+    <main>
+      <h1>Vercel Log Drain</h1>
+      <nav>
+        {TABS.map((entry) => (
+          <button
+            key={entry.id}
+            type="button"
+            aria-current={tab === entry.id}
+            onClick={() => setTab(entry.id)}
+          >
+            {entry.label}
+          </button>
+        ))}
+      </nav>
+      {tab === 'status' ? <Status /> : null}
+      {tab === 'drains' ? <Drains /> : null}
+      {tab === 'sinks' ? <Sinks /> : null}
+    </main>
+  );
+}
+```
+
+- [ ] **Step 7: Implement `web/src/views/Status.tsx`**
+
+```tsx
+import { useEffect, useState } from 'react';
+import { discardOrphan, fetchStatus } from '../api.ts';
+import type { StatusSnapshot } from '@shared/api';
+
+const POLL_MS = 2000;
+
+function bytes(value: number): string {
+  if (value < 1024) return `${String(value)} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+  let scaled = value / 1024;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024;
+    unit += 1;
+  }
+  return `${scaled.toFixed(1)} ${units[unit] ?? ''}`;
+}
+
+function ago(timestamp: number | null): string {
+  if (timestamp === null) return 'never';
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return `${String(seconds)}s ago`;
+  if (seconds < 3600) return `${String(Math.floor(seconds / 60))}m ago`;
+  return `${String(Math.floor(seconds / 3600))}h ago`;
+}
+
+export function Status(): React.JSX.Element {
+  const [snapshot, setSnapshot] = useState<StatusSnapshot | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const tick = async (): Promise<void> => {
+      try {
+        const next = await fetchStatus();
+        if (active) {
+          setSnapshot(next);
+          setError(null);
+        }
+      } catch (cause) {
+        if (active) setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    void tick();
+    const timer = setInterval(() => void tick(), POLL_MS);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  if (error !== null) return <p className="err">{error}</p>;
+  if (snapshot === null) return <p className="muted">Loading…</p>;
+
+  return (
+    <>
+      <div className="card">
+        <strong className={`state-${snapshot.service.state === 'ok' ? 'ok' : 'failed'}`}>
+          {snapshot.service.state}
+        </strong>{' '}
+        <span className="muted">
+          version {snapshot.service.version} · up {String(snapshot.service.uptimeSec)}s
+        </span>
+        <p className="muted">
+          spool volume {bytes(snapshot.volumes.spool.freeBytes)} free of{' '}
+          {bytes(snapshot.volumes.spool.totalBytes)} · config volume{' '}
+          {bytes(snapshot.volumes.config.freeBytes)} free
+        </p>
+      </div>
+
+      <h2>Sinks</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Health</th>
+            <th>Queued</th>
+            <th>Head age</th>
+            <th>Delivered</th>
+            <th>Dropped</th>
+            <th>Dead</th>
+          </tr>
+        </thead>
+        <tbody>
+          {snapshot.sinks.map((sink) => (
+            <tr key={sink.name}>
+              <td>{sink.name}</td>
+              <td>{sink.type}</td>
+              <td className={`state-${sink.health.state}`} title={sink.health.lastError ?? ''}>
+                {sink.enabled ? sink.health.state : 'disabled'}
+              </td>
+              <td>
+                {String(sink.queue.files)} files / {bytes(sink.queue.bytes)}
+              </td>
+              <td>
+                {sink.queue.oldestAgeSec === null ? '—' : `${String(sink.queue.oldestAgeSec)}s`}
+              </td>
+              <td>{String(sink.counters.delivered)}</td>
+              <td>{String(sink.counters.dropped)}</td>
+              <td>{String(sink.counters.deadLettered)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="muted">
+        Counters are in-memory and reset when the container restarts. A steadily climbing head age
+        means delivery is falling behind ingest.
+      </p>
+
+      <h2>Drains</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Events</th>
+            <th>Last event</th>
+            <th>OK</th>
+            <th>Bad signature</th>
+            <th>Malformed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {snapshot.drains.map((drain) => (
+            <tr key={drain.id}>
+              <td>{drain.enabled ? drain.name : `${drain.name} (disabled)`}</td>
+              <td>{String(drain.eventsReceived)}</td>
+              <td>{ago(drain.lastEventAt)}</td>
+              <td>{String(drain.requests.ok)}</td>
+              <td>{String(drain.requests.badSignature)}</td>
+              <td>{String(drain.requests.malformedBody)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {snapshot.orphanedSpools.length > 0 ? (
+        <>
+          <h2>Orphaned spools</h2>
+          <p className="muted">
+            Queues left behind by removed or renamed sinks. Their data is still on disk.
+          </p>
+          <table>
+            <tbody>
+              {snapshot.orphanedSpools.map((orphan) => (
+                <tr key={orphan.name}>
+                  <td>{orphan.name}</td>
+                  <td>
+                    {String(orphan.files)} files / {bytes(orphan.bytes)}
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void discardOrphan(orphan.name);
+                      }}
+                    >
+                      Discard
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      ) : null}
+
+      {snapshot.recent.errors.length > 0 ? (
+        <>
+          <h2>Recent errors</h2>
+          <table>
+            <tbody>
+              {snapshot.recent.errors
+                .slice(-10)
+                .reverse()
+                .map((entry, index) => (
+                  <tr key={`${String(entry.at)}-${String(index)}`}>
+                    <td>{entry.scope}</td>
+                    <td>{entry.message}</td>
+                    <td className="muted">{ago(entry.at)}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </>
+      ) : null}
+
+      <h2>Recent events</h2>
+      <p className="muted">
+        Newest {String(Math.min(10, snapshot.recent.events.length))} of{' '}
+        {String(snapshot.recent.events.length)} buffered. This is a tail to confirm arrival, not a
+        log browser — query Loki for that.
+      </p>
+      <pre>
+        {snapshot.recent.events
+          .slice(-10)
+          .reverse()
+          .map((event) => JSON.stringify(event))
+          .join('\n')}
+      </pre>
+    </>
+  );
+}
+```
+
+- [ ] **Step 8: Delete the placeholder and verify the build**
+
+```bash
+rm web/src/placeholder.ts
+npm run lint && npm run typecheck && npm test && npm run build:web
+```
+
+`npm run build:web` must produce `web/dist/index.html`. Note that `Drains.tsx`
+and `Sinks.tsx` do not exist yet, so create them as temporary stubs to make the
+build pass, and fill them in during Task 26:
+
+```tsx
+export function Drains(): React.JSX.Element {
+  return <p className="muted">Not implemented yet.</p>;
+}
+```
+
+(Do the same for `Sinks`.)
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add SPA shell, API client, and status view
+
+DTOs are hand-written in types/api.ts so the browser bundle never
+includes zod, with a compile-time assertion in api-contract.ts that they
+stay assignable from the zod-inferred server types."
+```
+
+---
+
+### Task 26: Drains and Sinks views
+
+**Files:**
+- Create (replacing the stubs): `web/src/views/Drains.tsx`, `web/src/views/Sinks.tsx`
+- Create: `web/src/useConfig.ts`
+
+**Interfaces:**
+- Consumes: `fetchConfig`, `saveConfig`, `createDrain`, `testSink`, `ApiError` from `web/src/api.ts`; the DTOs from `@shared/api`.
+- Produces: `useConfig()` hook returning `{ config, etag, warnings, error, notice, reload, save, mutate }`.
+
+- [ ] **Step 1: Implement `web/src/useConfig.ts`**
+
+```tsx
+import { useCallback, useEffect, useState } from 'react';
+import { fetchConfig, saveConfig } from './api.ts';
+import type { RedactedConfigDto } from '@shared/api';
+
+export type UseConfig = {
+  config: RedactedConfigDto | null;
+  etag: string;
+  warnings: string[];
+  error: string | null;
+  notice: string | null;
+  setNotice: (value: string | null) => void;
+  reload: () => void;
+  save: (next: RedactedConfigDto) => void;
+};
+
+export function useConfig(): UseConfig {
+  const [config, setConfig] = useState<RedactedConfigDto | null>(null);
+  const [etag, setEtag] = useState('');
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const reload = useCallback(() => {
+    void (async () => {
+      try {
+        const response = await fetchConfig();
+        setConfig(response.config);
+        setEtag(response.etag);
+        setWarnings(response.warnings);
+        setError(null);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+  }, []);
+
+  useEffect(reload, [reload]);
+
+  const save = useCallback(
+    (next: RedactedConfigDto) => {
+      void (async () => {
+        try {
+          const response = await saveConfig(next, etag);
+          setConfig(response.config);
+          setEtag(response.etag);
+          setWarnings(response.warnings);
+          setError(null);
+          setNotice('Saved.');
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      })();
+    },
+    [etag],
+  );
+
+  return { config, etag, warnings, error, notice, setNotice, reload, save };
+}
+```
+
+- [ ] **Step 2: Implement `web/src/views/Drains.tsx`**
+
+The created secret is shown once, in a dismissible panel, because the API will
+never return it again.
+
+```tsx
+import { useState } from 'react';
+import { createDrain } from '../api.ts';
+import { useConfig } from '../useConfig.ts';
+import type { CreatedDrain } from '@shared/api';
+
+export function Drains(): React.JSX.Element {
+  const { config, error, save, reload } = useConfig();
+  const [name, setName] = useState('');
+  const [created, setCreated] = useState<CreatedDrain | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  const drainUrl = (id: string): string => `${window.location.origin}/api/drain/${id}`;
+
+  const add = (): void => {
+    void (async () => {
+      try {
+        setCreated(await createDrain(name));
+        setName('');
+        setCreateError(null);
+        reload();
+      } catch (cause) {
+        setCreateError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+  };
+
+  const toggle = (id: string, enabled: boolean): void => {
+    if (config === null) return;
+    save({
+      ...config,
+      drains: config.drains.map((drain) => (drain.id === id ? { ...drain, enabled } : drain)),
+    });
+  };
+
+  const remove = (id: string): void => {
+    if (config === null) return;
+    if (!window.confirm('Delete this drain? Vercel will start getting 404s for it.')) return;
+    save({ ...config, drains: config.drains.filter((drain) => drain.id !== id) });
+  };
+
+  return (
+    <>
+      {error !== null ? <p className="err">{error}</p> : null}
+      {createError !== null ? <p className="err">{createError}</p> : null}
+
+      {created !== null ? (
+        <div className="card">
+          <strong>Drain created — copy the secret now.</strong>
+          <p className="muted">This is the only time it will be shown.</p>
+          <table>
+            <tbody>
+              <tr>
+                <th>Endpoint URL</th>
+                <td>
+                  <code>{drainUrl(created.id)}</code>
+                </td>
+              </tr>
+              <tr>
+                <th>Signature secret</th>
+                <td>
+                  <code>{created.secret}</code>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <p className="muted">
+            In Vercel, create a Drain with this endpoint and secret. Either JSON or NDJSON encoding
+            works, with or without gzip.
+          </p>
+          <button
+            type="button"
+            className="primary"
+            onClick={() => {
+              setCreated(null);
+            }}
+          >
+            I have saved it
+          </button>
+        </div>
+      ) : null}
+
+      <div className="card row">
+        <label>
+          New drain name
+          <input
+            value={name}
+            onChange={(changed) => setName(changed.target.value)}
+            placeholder="production"
+          />
+        </label>
+        <button type="button" className="primary" disabled={name.trim().length === 0} onClick={add}>
+          Create drain
+        </button>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Endpoint</th>
+            <th>Secret</th>
+            <th>Enabled</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {(config?.drains ?? []).map((drain) => (
+            <tr key={drain.id}>
+              <td>{drain.name}</td>
+              <td>
+                <code>{drainUrl(drain.id)}</code>
+              </td>
+              <td className="muted">{drain.hasSecret ? 'set (hidden)' : 'missing'}</td>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={drain.enabled}
+                  onChange={(changed) => toggle(drain.id, changed.target.checked)}
+                />
+              </td>
+              <td>
+                <button type="button" onClick={() => remove(drain.id)}>
+                  Delete
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {config !== null && config.drains.length === 0 ? (
+        <p className="muted">No drains yet. Create one, then paste its URL and secret into Vercel.</p>
+      ) : null}
+    </>
+  );
+}
+```
+
+- [ ] **Step 3: Implement `web/src/views/Sinks.tsx`**
+
+```tsx
+import { useState } from 'react';
+import { testSink } from '../api.ts';
+import { useConfig } from '../useConfig.ts';
+import type { RedactedConfigDto, SinkEntryDto } from '@shared/api';
+
+const MIB = 1_048_576;
+
+const HIGH_CARDINALITY = ['id', 'requestId', 'deploymentId', 'path', 'host', 'traceId', 'spanId'];
+
+function newFileSink(index: number): SinkEntryDto {
+  return {
+    name: `file-${String(index)}`,
+    enabled: true,
+    filter: {},
+    maxSpoolBytes: 512 * MIB,
+    maxBatchEvents: 1000,
+    maxBatchBytes: 4 * MIB,
+    config: {
+      type: 'file',
+      directory: '/logs',
+      filePrefix: 'events',
+      retentionDays: 14,
+      freeSpaceFloorBytes: 256 * MIB,
+    },
+  };
+}
+
+function newLokiSink(index: number): SinkEntryDto {
+  return {
+    name: `loki-${String(index)}`,
+    enabled: true,
+    filter: {},
+    maxSpoolBytes: 512 * MIB,
+    maxBatchEvents: 1000,
+    maxBatchBytes: 4 * MIB,
+    config: {
+      type: 'loki',
+      url: 'http://loki:3100',
+      auth: { kind: 'none' },
+      tenantId: null,
+      labels: { static: { job: 'vercel' }, fromFields: ['projectName', 'environment', 'source', 'level'] },
+      timeoutMs: 10_000,
+    },
+  };
+}
+
+export function Sinks(): React.JSX.Element {
+  const { config, warnings, error, notice, setNotice, save } = useConfig();
+  const [draft, setDraft] = useState<RedactedConfigDto | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+
+  const working = draft ?? config;
+  if (working === null) return <p className="muted">{error ?? 'Loading…'}</p>;
+
+  const update = (index: number, next: SinkEntryDto): void => {
+    const sinks = working.sinks.map((sink, position) => (position === index ? next : sink));
+    setDraft({ ...working, sinks });
+    setNotice(null);
+  };
+
+  const add = (sink: SinkEntryDto): void => {
+    setDraft({ ...working, sinks: [...working.sinks, sink] });
+  };
+
+  const remove = (index: number): void => {
+    const sink = working.sinks[index];
+    if (sink === undefined) return;
+    if (
+      !window.confirm(
+        `Remove sink "${sink.name}"? Its queued batches stay on disk and appear as an orphaned spool.`,
+      )
+    ) {
+      return;
+    }
+    setDraft({ ...working, sinks: working.sinks.filter((_unused, position) => position !== index) });
+  };
+
+  const commit = (): void => {
+    save(working);
+    setDraft(null);
+  };
+
+  return (
+    <>
+      {error !== null ? <p className="err">{error}</p> : null}
+      {notice !== null ? <p className="muted">{notice}</p> : null}
+      {warnings.map((warning) => (
+        <p className="warn" key={warning}>
+          {warning}
+        </p>
+      ))}
+      {testResult !== null ? <p className="muted">{testResult}</p> : null}
+
+      {working.sinks.map((sink, index) => (
+        <div className="card" key={`${sink.name}-${String(index)}`}>
+          <div className="row">
+            <label>
+              Name
+              <input
+                value={sink.name}
+                onChange={(changed) => update(index, { ...sink, name: changed.target.value })}
+              />
+            </label>
+            <label>
+              Enabled
+              <input
+                type="checkbox"
+                checked={sink.enabled}
+                onChange={(changed) => update(index, { ...sink, enabled: changed.target.checked })}
+              />
+            </label>
+            <label>
+              Min level
+              <select
+                value={sink.filter.minLevel ?? ''}
+                onChange={(changed) =>
+                  update(index, {
+                    ...sink,
+                    filter:
+                      changed.target.value === ''
+                        ? { ...sink.filter, minLevel: undefined }
+                        : {
+                            ...sink.filter,
+                            minLevel: changed.target.value as 'info' | 'warning' | 'error',
+                          },
+                  })
+                }
+              >
+                <option value="">any</option>
+                <option value="info">info</option>
+                <option value="warning">warning</option>
+                <option value="error">error</option>
+              </select>
+            </label>
+            <label>
+              Spool budget (MiB)
+              <input
+                type="number"
+                value={Math.round(sink.maxSpoolBytes / MIB)}
+                onChange={(changed) =>
+                  update(index, {
+                    ...sink,
+                    maxSpoolBytes: Math.max(1, Number(changed.target.value)) * MIB,
+                  })
+                }
+              />
+            </label>
+          </div>
+
+          {sink.config.type === 'file' ? (
+            <div className="row">
+              <label>
+                Directory
+                <input
+                  value={sink.config.directory}
+                  onChange={(changed) =>
+                    update(index, {
+                      ...sink,
+                      config: { ...sink.config, type: 'file', directory: changed.target.value },
+                    })
+                  }
+                />
+              </label>
+              <label>
+                File prefix
+                <input
+                  value={sink.config.filePrefix}
+                  onChange={(changed) =>
+                    update(index, {
+                      ...sink,
+                      config: { ...sink.config, type: 'file', filePrefix: changed.target.value },
+                    })
+                  }
+                />
+              </label>
+              <label>
+                Retention (days, 0 = forever)
+                <input
+                  type="number"
+                  value={sink.config.retentionDays}
+                  onChange={(changed) =>
+                    update(index, {
+                      ...sink,
+                      config: {
+                        ...sink.config,
+                        type: 'file',
+                        retentionDays: Math.max(0, Number(changed.target.value)),
+                      },
+                    })
+                  }
+                />
+              </label>
+            </div>
+          ) : (
+            <>
+              <div className="row">
+                <label>
+                  Loki URL
+                  <input
+                    value={sink.config.url}
+                    onChange={(changed) =>
+                      update(index, {
+                        ...sink,
+                        config: { ...sink.config, type: 'loki', url: changed.target.value },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Tenant (X-Scope-OrgID)
+                  <input
+                    value={sink.config.tenantId ?? ''}
+                    onChange={(changed) =>
+                      update(index, {
+                        ...sink,
+                        config: {
+                          ...sink.config,
+                          type: 'loki',
+                          tenantId: changed.target.value === '' ? null : changed.target.value,
+                        },
+                      })
+                    }
+                  />
+                </label>
+                <label>
+                  Auth
+                  <select
+                    value={sink.config.auth.kind}
+                    onChange={(changed) => {
+                      const kind = changed.target.value;
+                      const auth =
+                        kind === 'basic'
+                          ? { kind: 'basic' as const, username: '', password: '' }
+                          : kind === 'bearer'
+                            ? { kind: 'bearer' as const, token: '' }
+                            : { kind: 'none' as const };
+                      update(index, { ...sink, config: { ...sink.config, type: 'loki', auth } });
+                    }}
+                  >
+                    <option value="none">none</option>
+                    <option value="basic">basic</option>
+                    <option value="bearer">bearer</option>
+                  </select>
+                </label>
+              </div>
+
+              {sink.config.auth.kind === 'basic' ? (
+                <div className="row">
+                  <label>
+                    Username
+                    <input
+                      value={sink.config.auth.username}
+                      onChange={(changed) =>
+                        update(index, {
+                          ...sink,
+                          config: {
+                            ...sink.config,
+                            type: 'loki',
+                            auth: {
+                              kind: 'basic',
+                              username: changed.target.value,
+                              password:
+                                sink.config.type === 'loki' && sink.config.auth.kind === 'basic'
+                                  ? sink.config.auth.password
+                                  : '',
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Password (leave blank to keep the stored one)
+                    <input
+                      type="password"
+                      placeholder="unchanged"
+                      onChange={(changed) =>
+                        update(index, {
+                          ...sink,
+                          config: {
+                            ...sink.config,
+                            type: 'loki',
+                            auth: {
+                              kind: 'basic',
+                              username:
+                                sink.config.type === 'loki' && sink.config.auth.kind === 'basic'
+                                  ? sink.config.auth.username
+                                  : '',
+                              password: changed.target.value,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              {sink.config.auth.kind === 'bearer' ? (
+                <div className="row">
+                  <label>
+                    Token (leave blank to keep the stored one)
+                    <input
+                      type="password"
+                      placeholder="unchanged"
+                      onChange={(changed) =>
+                        update(index, {
+                          ...sink,
+                          config: {
+                            ...sink.config,
+                            type: 'loki',
+                            auth: { kind: 'bearer', token: changed.target.value },
+                          },
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              <label>
+                Label fields (comma separated)
+                <input
+                  value={sink.config.labels.fromFields.join(', ')}
+                  onChange={(changed) =>
+                    update(index, {
+                      ...sink,
+                      config: {
+                        ...sink.config,
+                        type: 'loki',
+                        labels: {
+                          static:
+                            sink.config.type === 'loki' ? sink.config.labels.static : { job: 'vercel' },
+                          fromFields: changed.target.value
+                            .split(',')
+                            .map((field) => field.trim())
+                            .filter((field) => field.length > 0),
+                        },
+                      },
+                    })
+                  }
+                />
+              </label>
+              {sink.config.labels.fromFields.some((field) => HIGH_CARDINALITY.includes(field)) ? (
+                <p className="warn">
+                  One or more of these fields is high-cardinality. Every distinct value creates a new
+                  Loki stream; prefer filtering them from the log line with <code>| json</code>.
+                </p>
+              ) : null}
+            </>
+          )}
+
+          <div className="row">
+            <button
+              type="button"
+              onClick={() => {
+                void (async () => {
+                  const result = await testSink(sink.name);
+                  setTestResult(`${sink.name}: ${result.ok ? 'OK' : 'FAILED'} — ${result.detail}`);
+                })();
+              }}
+            >
+              Send test event
+            </button>
+            <button type="button" onClick={() => remove(index)}>
+              Remove
+            </button>
+          </div>
+        </div>
+      ))}
+
+      <div className="row">
+        <button type="button" onClick={() => add(newFileSink(working.sinks.length + 1))}>
+          Add file sink
+        </button>
+        <button type="button" onClick={() => add(newLokiSink(working.sinks.length + 1))}>
+          Add Loki sink
+        </button>
+        <button type="button" className="primary" disabled={draft === null} onClick={commit}>
+          Save changes
+        </button>
+        {draft !== null ? (
+          <button
+            type="button"
+            onClick={() => {
+              setDraft(null);
+            }}
+          >
+            Discard edits
+          </button>
+        ) : null}
+      </div>
+      <p className="muted">
+        A test event is sent through the saved configuration, so save before testing. Renaming a
+        sink abandons its queued batches, which then appear as an orphaned spool on the Status page.
+      </p>
+    </>
+  );
+}
+```
+
+- [ ] **Step 4: Verify and commit**
+
+```bash
+npm run lint && npm run typecheck && npm test && npm run build:web
+git add -A
+git commit -m "feat: add drains and sinks admin views
+
+Drain secrets are shown once at creation. Password and token fields
+submit blank to mean 'keep the stored value', matching the write-only
+secret handling in the API. The Loki label field warns inline on
+high-cardinality choices."
+```
+
+---
+
+### Task 27: Container, compose example, proxy configs, and smoke test
+
+**Files:**
+- Create: `Dockerfile`, `docker-compose.example.yml`, `examples/Caddyfile`, `examples/nginx.conf`, `scripts/smoke.sh`, `.github/workflows/ci.yml`
+- Modify: `package.json` (add the `smoke` script)
+
+**Interfaces:**
+- Consumes: the built `dist/src/index.js` and `web/dist`.
+- Produces: a runnable image and `npm run smoke`.
+
+- [ ] **Step 1: Write the `Dockerfile`**
+
+```dockerfile
+# syntax=docker/dockerfile:1
+ARG NODE_IMAGE=node:24-alpine
+
+FROM ${NODE_IMAGE} AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM deps AS build-web
+WORKDIR /app
+COPY vite.config.ts ./
+COPY types ./types
+COPY web ./web
+RUN npm run build:web
+
+FROM deps AS build-server
+WORKDIR /app
+COPY tsconfig.json tsconfig.build.json ./
+COPY types ./types
+COPY src ./src
+RUN npm run build:server
+
+FROM ${NODE_IMAGE} AS runtime
+ARG APP_VERSION=dev
+ENV NODE_ENV=production \
+    APP_VERSION=${APP_VERSION} \
+    PORT=8080 \
+    HOST=0.0.0.0 \
+    CONFIG_DIR=/config \
+    SPOOL_DIR=/spool \
+    LOGS_ROOT=/logs \
+    WEB_ROOT=/app/web/dist \
+    LOG_LEVEL=info
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=build-server /app/dist ./dist
+COPY --from=build-web /app/web/dist ./web/dist
+
+RUN addgroup -g 10001 -S app \
+ && adduser -u 10001 -S app -G app \
+ && mkdir -p /config /spool /logs \
+ && chown -R 10001:10001 /config /spool /logs
+
+USER 10001:10001
+EXPOSE 8080
+VOLUME ["/config", "/spool", "/logs"]
+
+# busybox wget; alpine has no curl.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
+
+CMD ["node", "dist/src/index.js"]
+```
+
+- [ ] **Step 2: Write `docker-compose.example.yml`**
+
+```yaml
+# Example stack: the drain service behind Caddy, shipping to Loki, viewed in
+# Grafana. Copy to docker-compose.yml and adjust before using.
+services:
+  drain:
+    build:
+      context: .
+      args:
+        APP_VERSION: '0.1.0'
+    init: true
+    restart: unless-stopped
+    environment:
+      AUTH_MODE: proxy
+      # The Docker bridge network. Narrow this to your proxy's actual address.
+      AUTH_TRUSTED_PROXIES: '172.16.0.0/12'
+      AUTH_USER_HEADER: X-Forwarded-User
+      # AUTH_ALLOWED_USERS: 'you@example.com'
+      LOG_LEVEL: info
+    volumes:
+      - drain-config:/config
+      - drain-spool:/spool
+      - drain-logs:/logs
+    # No published port: only Caddy should reach it.
+    expose:
+      - '8080'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '8080:80'
+    volumes:
+      - ./examples/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - drain
+
+  loki:
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    expose:
+      - '3100'
+    volumes:
+      - loki-data:/loki
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    depends_on:
+      - loki
+
+volumes:
+  drain-config:
+  drain-spool:
+  drain-logs:
+  loki-data:
+  caddy-data:
+```
+
+Separate named volumes for config, spool, and logs are the point: a full logs
+volume then becomes backpressure rather than a failure that also takes the
+queue down.
+
+- [ ] **Step 3: Write `examples/Caddyfile`**
+
+```caddyfile
+# The split that matters: Vercel must reach /api/drain/* WITHOUT SSO, because
+# it authenticates by HMAC signature and cannot present an identity. Everything
+# else is the admin surface and must be authenticated.
+:80 {
+	# --- Unauthenticated: the drain endpoint and health probes. ---
+	@public path /api/drain/* /healthz /readyz
+	handle @public {
+		reverse_proxy drain:8080
+	}
+
+	# --- Authenticated: the admin API and the SPA. ---
+	handle {
+		# Replace with a real hash: `caddy hash-password`
+		basic_auth {
+			admin $2a$14$REPLACE_WITH_YOUR_OWN_BCRYPT_HASH
+		}
+		reverse_proxy drain:8080 {
+			# The service reads this header, but only for requests whose socket
+			# peer is inside AUTH_TRUSTED_PROXIES.
+			header_up X-Forwarded-User {http.auth.user.id}
+		}
+	}
+}
+```
+
+In production, swap `basic_auth` for a real identity provider — Cloudflare
+Access, oauth2-proxy, or Tailscale — and point `AUTH_USER_HEADER` at whatever
+header it sets (for Cloudflare Access, `Cf-Access-Authenticated-User-Email`).
+
+- [ ] **Step 4: Write `examples/nginx.conf`**
+
+```nginx
+# Same split as the Caddyfile: /api/drain/* is unauthenticated because Vercel
+# authenticates by HMAC; everything else requires a logged-in operator.
+upstream drain {
+    server drain:8080;
+}
+
+server {
+    listen 80;
+
+    # --- Unauthenticated: the drain endpoint and health probes. ---
+    location /api/drain/ {
+        proxy_pass http://drain;
+        proxy_set_header Host $host;
+        # Never forward a client-supplied identity header here.
+        proxy_set_header X-Forwarded-User "";
+    }
+
+    location = /healthz { proxy_pass http://drain; }
+    location = /readyz  { proxy_pass http://drain; }
+
+    # --- Authenticated: the admin API and the SPA. ---
+    location / {
+        auth_basic "drain admin";
+        auth_basic_user_file /etc/nginx/htpasswd;
+
+        proxy_pass http://drain;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-User $remote_user;
+    }
+}
+```
+
+- [ ] **Step 5: Write `scripts/smoke.sh`**
+
+This is the test unit tests structurally cannot replace: it catches a wrong
+`CMD`, a dev dependency needed at runtime, and volume permission mistakes.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="vercel-log-drain:smoke"
+NAME="vld-smoke-$$"
+PORT="18080"
+
+cleanup() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo "==> building image"
+docker build --build-arg APP_VERSION=smoke -t "$IMAGE" .
+
+echo "==> starting container"
+docker run -d --name "$NAME" \
+  -p "127.0.0.1:${PORT}:8080" \
+  -e AUTH_MODE=disabled \
+  -e LOG_LEVEL=info \
+  --tmpfs /config:uid=10001,gid=10001 \
+  --tmpfs /spool:uid=10001,gid=10001 \
+  --tmpfs /logs:uid=10001,gid=10001 \
+  "$IMAGE" >/dev/null
+
+echo "==> waiting for health"
+for _ in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null || {
+  echo "FAIL: healthz never became ready"; docker logs "$NAME"; exit 1; }
+
+echo "==> creating a drain"
+CREATED=$(curl -fsS -X POST "http://127.0.0.1:${PORT}/api/admin/drains" \
+  -H 'content-type: application/json' -d '{"name":"smoke"}')
+DRAIN_ID=$(printf '%s' "$CREATED" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+SECRET=$(printf '%s' "$CREATED" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).secret))')
+
+echo "==> configuring a file sink"
+CONFIG=$(curl -fsS "http://127.0.0.1:${PORT}/api/admin/config")
+UPDATED=$(printf '%s' "$CONFIG" | SECRET="$SECRET" node -e '
+let raw = "";
+process.stdin.on("data", (d) => (raw += d)).on("end", () => {
+  const { config, etag } = JSON.parse(raw);
+  config.sinks = [
+    {
+      name: "smoke-file",
+      enabled: true,
+      filter: {},
+      maxSpoolBytes: 1048576,
+      maxBatchEvents: 1000,
+      maxBatchBytes: 1048576,
+      config: {
+        type: "file",
+        directory: "/logs",
+        filePrefix: "events",
+        retentionDays: 0,
+        freeSpaceFloorBytes: 0,
+      },
+    },
+  ];
+  process.stdout.write(JSON.stringify({ config, etag }));
+});')
+curl -fsS -X PUT "http://127.0.0.1:${PORT}/api/admin/config" \
+  -H 'content-type: application/json' -d "$UPDATED" >/dev/null
+
+echo "==> posting a signed delivery"
+BODY='[{"id":"smoke-1","timestamp":1573817187330,"source":"lambda","projectId":"p1","level":"info","message":"smoke test"}]'
+SIG=$(SECRET="$SECRET" BODY="$BODY" node -e '
+const { createHmac } = require("node:crypto");
+process.stdout.write(createHmac("sha1", process.env.SECRET).update(process.env.BODY).digest("hex"));')
+
+STATUS=$(curl -s -o /tmp/vld-smoke-response -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/api/drain/${DRAIN_ID}" \
+  -H "x-vercel-signature: ${SIG}" -H 'content-type: application/json' -d "$BODY")
+[ "$STATUS" = "200" ] || { echo "FAIL: expected 200, got $STATUS"; cat /tmp/vld-smoke-response; docker logs "$NAME"; exit 1; }
+
+echo "==> asserting a rejected signature is refused"
+BAD=$(curl -s -o /dev/null -w '%{http_code}' \
+  -X POST "http://127.0.0.1:${PORT}/api/drain/${DRAIN_ID}" \
+  -H "x-vercel-signature: $(printf 'f%.0s' $(seq 1 40))" -d "$BODY")
+[ "$BAD" = "403" ] || { echo "FAIL: expected 403 for a bad signature, got $BAD"; exit 1; }
+
+echo "==> waiting for the file sink to write"
+for _ in $(seq 1 30); do
+  if docker exec "$NAME" sh -c 'grep -q smoke-1 /logs/events-*.jsonl' 2>/dev/null; then break; fi
+  sleep 1
+done
+docker exec "$NAME" sh -c 'grep -q smoke-1 /logs/events-*.jsonl' || {
+  echo "FAIL: file sink never wrote the event"
+  docker exec "$NAME" sh -c 'ls -la /logs /spool/smoke-file 2>&1' || true
+  docker logs "$NAME"
+  exit 1
+}
+
+echo "==> asserting readiness and a drained spool"
+curl -fsS "http://127.0.0.1:${PORT}/readyz" >/dev/null || {
+  echo "FAIL: readyz reported not ready"; docker logs "$NAME"; exit 1; }
+
+echo "==> asserting the process runs as uid 10001"
+UID_IN_CONTAINER=$(docker exec "$NAME" id -u)
+[ "$UID_IN_CONTAINER" = "10001" ] || { echo "FAIL: expected uid 10001, got $UID_IN_CONTAINER"; exit 1; }
+
+echo "SMOKE PASSED"
+```
+
+Make it executable and register the script:
+
+```bash
+chmod +x scripts/smoke.sh
+npm pkg set scripts.smoke="bash scripts/smoke.sh"
+```
+
+- [ ] **Step 6: Write `.github/workflows/ci.yml`**
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm run smoke
+```
+
+No image is published; that is deliberate and stays out of scope until asked
+for.
+
+- [ ] **Step 7: Run the smoke test locally**
+
+Run: `npm run smoke`
+Expected: ends with `SMOKE PASSED`. If the container exits immediately, read
+`docker logs` — the most likely causes are a wrong `CMD` path (remember the
+entrypoint is `dist/src/index.js`, not `dist/index.js`) or a dependency that
+was pruned by `--omit=dev` but is needed at runtime.
+
+- [ ] **Step 8: Commit**
+
+```bash
+npm run lint && npm run typecheck && npm test && npm run build
+git add -A
+git commit -m "feat: add container, compose example, proxy configs, and smoke test
+
+Four-stage build running as uid 10001 with three separate volumes. The
+Caddy and nginx examples both demonstrate the split that is easy to get
+wrong: /api/drain/* must bypass SSO because Vercel authenticates by
+HMAC, while everything else requires an operator identity."
+```
+
+---
+
+### Task 28: README
+
+**Files:**
+- Modify: `README.md`
+
+**Interfaces:**
+- Consumes: everything.
+- Produces: operator documentation.
+
+- [ ] **Step 1: Write `README.md`**
+
+Replace the existing two-line file. Cover exactly these sections, in order,
+with no invented claims — every behavior described must be one this
+implementation actually has:
+
+1. **What it is** — one paragraph: receives Vercel Drain deliveries, spools each
+   event to disk per sink, forwards to a local file and/or Loki. Docker only.
+2. **Quick start** — `docker compose -f docker-compose.example.yml up`, then
+   open `http://localhost:8080`, create a drain, copy the URL and secret into
+   Vercel, add a sink.
+3. **Configuring the Vercel side** — create a Drain pointing at
+   `https://your-host/api/drain/<drainId>`, paste the signature secret, and note
+   that both `json` and `ndjson` encodings work with or without gzip.
+4. **Authentication** — the full table of `AUTH_MODE`, `AUTH_TRUSTED_PROXIES`,
+   `AUTH_USER_HEADER`, `AUTH_ALLOWED_USERS`. State plainly: **unset means the
+   admin UI returns 503, while ingest keeps working**, and `disabled` is for
+   local development only. Include the warning that the reverse proxy must
+   leave `/api/drain/*` unauthenticated, with a pointer to
+   `examples/Caddyfile`.
+5. **Volumes** — the three mounts, what lives in each, and why they should be
+   separate: a full logs volume becomes backpressure instead of data loss.
+   Include the `chown -R 10001:10001` note.
+6. **Sinks** — the file sink (date-partitioned JSONL, `retentionDays`,
+   free-space floor) and the Loki sink (push URL, auth modes, tenant, label
+   allowlist). Include the cardinality warning and the recommended default
+   label set.
+7. **Delivery semantics** — at-least-once, stated plainly: a spool write
+   failure returns 500 so Vercel redelivers, which can duplicate events into
+   sinks that already succeeded. Loki collapses identical entries; the file
+   sink does not.
+8. **Operations** — reading the status page, what a climbing head age means,
+   what dead-lettered means and where those files live
+   (`/spool/<sink>/dead/`), what an orphaned spool is, and that counters reset
+   on restart.
+9. **Troubleshooting** — a table of symptom → cause → fix covering at minimum:
+   403 `invalid_signature` (wrong secret), 404 from Vercel (wrong drain id),
+   admin UI 503 (`AUTH_MODE` unset), admin 403 (`AUTH_TRUSTED_PROXIES` does not
+   include the proxy's address), Loki sink `failed` with 401 (credentials),
+   Loki sink dead-lettering with 400 (`reject_old_samples_max_age` shorter than
+   the outage), container exits with a `chown` message (volume ownership).
+10. **Development** — `npm ci`, `npm run dev` is not defined; use
+    `npm run build && npm start` with `AUTH_MODE=disabled` and local
+    directories, or `npm run test:watch`. Document `npm run lint`,
+    `typecheck`, `test`, `build`, `smoke`.
+11. **Design** — link `docs/superpowers/specs/2026-09-08-vercel-log-drain-design.md`
+    and note that the rejected alternatives are recorded there.
+
+Keep it factual and free of marketing language. Where a default is stated,
+copy it from `src/config/schema.ts` rather than recalling it.
+
+- [ ] **Step 2: Verify every command in the README actually works**
+
+Run each shell command the README tells the reader to run, in a scratch
+directory, and correct the README where reality differs. In particular confirm
+the compose file's port, the SPA URL, and the script names.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add -A
+git commit -m "docs: document setup, auth, volumes, and troubleshooting"
+```
+
+---
+
+## Definition of Done
+
+- [ ] `npm run lint` clean.
+- [ ] `npm run typecheck` clean for both the server and web projects.
+- [ ] `npm test` green, including `test/e2e/durability.test.ts`.
+- [ ] `npm run build` produces `dist/src/index.js` and `web/dist/index.html`.
+- [ ] `npm run smoke` ends with `SMOKE PASSED`.
+- [ ] No `any` and no `unknown` outside the two documented parse boundaries
+      (`src/vercel/decode.ts`) and the one documented display payload
+      (`types/api.ts`).
+- [ ] No `*Sync` call anywhere in `src/` or `web/` — the ESLint rule enforces
+      this, so a clean lint is the proof.
+- [ ] The branch is **not** pushed. Ask before pushing or opening a PR.
