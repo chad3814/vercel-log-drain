@@ -537,8 +537,15 @@ Caddy specifically to demonstrate the SSO split described in §9.
 Runtime dependencies: `hono` 4.13, `@hono/node-server` 2.1, `zod` 4.5, `pino`
 10.3. CIDR matching uses the built-in `net.BlockList`; ID generation uses
 `node:crypto`. Front end: `react` 19.2, built by `vite` 8.2. Tooling:
-`typescript` 7.0, `vitest` 5.0, `eslint` 10.10 with `@typescript-eslint` 8.70,
-`prettier` 3.9. Versions verified against the registry on 2026-09-08.
+`typescript` **6.0**, `vitest` 5.0, `eslint` 10.10 with `@typescript-eslint`
+8.70, `prettier` 3.9. Versions verified against the registry on 2026-09-08.
+
+TypeScript is pinned to 6.0 rather than the current 7.0 because
+`typescript-eslint` 8.70 declares `typescript@>=4.8.4 <6.1.0` as a peer
+dependency: with TypeScript 7 installed, `npm ci` fails outright with
+`ERESOLVE`. The 6.0.3 / ESLint 10.10 / typescript-eslint 8.70 combination was
+installed and exercised on 2026-09-08, including type-aware rules. Revisit the
+pin once typescript-eslint supports the 7.x native compiler.
 
 Because `zod` 4 can express recursive JSON with `z.lazy` plus `.catchall()`, the
 event schema validates unknown passthrough fields as a `JsonValue` union rather
