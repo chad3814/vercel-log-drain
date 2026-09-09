@@ -537,15 +537,18 @@ Caddy specifically to demonstrate the SSO split described in §9.
 Runtime dependencies: `hono` 4.13, `@hono/node-server` 2.1, `zod` 4.5, `pino`
 10.3. CIDR matching uses the built-in `net.BlockList`; ID generation uses
 `node:crypto`. Front end: `react` 19.2, built by `vite` 8.2. Tooling:
-`typescript` **6.0**, `vitest` 5.0, `eslint` 10.10 with `@typescript-eslint`
-8.70, `prettier` 3.9. Versions verified against the registry on 2026-09-08.
+`typescript` 7.0 (the native compiler), `vitest` 5.0, `oxlint` 1.82 with
+`oxlint-tsgolint` 7.0 for type-aware rules, `prettier` 3.9. Versions verified
+against the registry on 2026-09-08.
 
-TypeScript is pinned to 6.0 rather than the current 7.0 because
-`typescript-eslint` 8.70 declares `typescript@>=4.8.4 <6.1.0` as a peer
-dependency: with TypeScript 7 installed, `npm ci` fails outright with
-`ERESOLVE`. The 6.0.3 / ESLint 10.10 / typescript-eslint 8.70 combination was
-installed and exercised on 2026-09-08, including type-aware rules. Revisit the
-pin once typescript-eslint supports the 7.x native compiler.
+Linting is oxlint rather than ESLint. Beyond being far faster, it is what makes
+TypeScript 7 usable here: `typescript-eslint` 8.70 declares
+`typescript@>=4.8.4 <6.1.0` as a peer dependency, so an ESLint-based setup
+fails `npm ci` outright with `ERESOLVE` against TypeScript 7. oxlint has no
+`typescript` peer dependency, and its optional `oxlint-tsgolint` companion is
+versioned against the 7.x native compiler. The TypeScript 7.0.2 / oxlint 1.82 /
+oxlint-tsgolint 7.0.2001 combination was installed and exercised on 2026-09-08,
+including emit and type-aware linting.
 
 Because `zod` 4 can express recursive JSON with `z.lazy` plus `.catchall()`, the
 event schema validates unknown passthrough fields as a `JsonValue` union rather
@@ -591,13 +594,24 @@ Vitest, in layers.
    unit tests structurally cannot — a wrong `CMD`, a dev dependency needed at
    runtime, volume permissions.
 
-**Tooling.** ESLint 9 flat config with `@typescript-eslint` (`no-explicit-any`
-and the `no-unsafe-*` rules enabled), plus a `no-restricted-syntax` rule
-banning any `*Sync` call so the async-over-sync preference is enforced in CI
-rather than in review. Prettier at two-space indentation with semicolons.
+**Tooling.** oxlint with the typescript, node, promise, unicorn, and react
+plugins, run with `--type-aware` so the type-dependent rules
+(`no-floating-promises`, `no-unsafe-type-assertion`, `require-await`) are
+available. Two rules carry project policy: `typescript/no-explicit-any` bans
+`any`, and `node/no-sync` bans every `*Sync` call — verified to catch both
+`fs.readFileSync(p)` and a directly imported `readFileSync(p)`, and to extend
+to `zlib.gunzipSync`, so the async-over-sync rule is enforced in CI rather than
+in review. `react/react-in-jsx-scope` is disabled because the project uses the
+modern JSX transform. Prettier at two-space indentation with semicolons.
 `tsc --noEmit` over both projects with `strict`, `noUncheckedIndexedAccess`,
 and `exactOptionalPropertyTypes`. GitHub Actions runs lint → typecheck → test →
 build → docker smoke. No image is published.
+
+There is no lint rule banning `unknown`; oxlint has no such rule and neither
+does ESLint. That prohibition is upheld by design — `JsonValue` exists so no
+module needs `unknown` for data — and by review, with the two parse boundaries
+in `vercel/decode.ts` and the one opaque display payload in `types/api.ts` as
+the documented exceptions.
 
 Implementation is test-driven.
 

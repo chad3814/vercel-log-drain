@@ -6,7 +6,7 @@
 
 **Architecture:** A single Node process runs a Hono server (drain endpoint, admin API, static React SPA) plus a Dispatcher owning one async worker per enabled sink. Ingest verifies the drain HMAC, decodes the body, filters per sink, writes a batch file to that sink's spool directory, fsyncs, and only then acknowledges Vercel. Each worker drains its own directory oldest-first and unlinks a batch only after the sink accepts it, which makes restarts and sink outages non-lossy.
 
-**Tech Stack:** TypeScript 6.0 (strict), Node 24, Hono 4.13 + @hono/node-server 2.1, Zod 4.5, pino 10.3, React 19.2 + Vite 8.2, Vitest 5.0, ESLint 10.10 + @typescript-eslint 8.70, Prettier 3.9, Docker (node:24-alpine).
+**Tech Stack:** TypeScript 7.0 (strict, native compiler), Node 24, Hono 4.13 + @hono/node-server 2.1, Zod 4.5, pino 10.3, React 19.2 + Vite 8.2, Vitest 5.0, oxlint 1.82 + oxlint-tsgolint 7.0, Prettier 3.9, Docker (node:24-alpine).
 
 **Spec:** `docs/superpowers/specs/2026-09-08-vercel-log-drain-design.md` — read it before starting. This plan implements that spec and does not restate its rationale.
 
@@ -14,11 +14,12 @@
 
 Every task's requirements implicitly include this section.
 
-- **No `any`. No `unknown`.** Where JSON of unknown shape must be typed, use `JsonValue` from `types/json.ts`. This is a project rule enforced by ESLint.
-- **No synchronous I/O.** Never `fs.*Sync`, `zlib.*Sync`, or any `*Sync` call in `src/` or `web/`. Use `node:fs/promises` and `promisify`'d `zlib`. Enforced by an ESLint `no-restricted-syntax` rule.
+- **No `any`. No `unknown`.** Where JSON of unknown shape must be typed, use `JsonValue` from `types/json.ts`. `any` is enforced by `typescript/no-explicit-any`; **`unknown` has no lint rule in oxlint or ESLint**, so it is upheld by design and review. The only sanctioned exceptions are the two `JSON.parse` boundaries in `src/vercel/decode.ts` and the one opaque display payload in `types/api.ts`, both commented at the site.
+- **No synchronous I/O.** Never `fs.*Sync`, `zlib.*Sync`, or any `*Sync` call in `src/` or `web/`. Use `node:fs/promises` and `promisify`'d `zlib`. Enforced by oxlint's `node/no-sync`, verified to catch `fs.readFileSync(p)`, a directly imported `readFileSync(p)`, and `zlib.gunzipSync` alike.
 - **Formatting:** 2-space indent; always terminate statements with semicolons, including optional ones. Enforced by Prettier.
-- **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output).
-- **TypeScript is pinned to 6.0.3, not 7.x.** `typescript-eslint` 8.70 peer-requires `typescript@>=4.8.4 <6.1.0`; with TypeScript 7 installed `npm ci` fails with `ERESOLVE`. Do not "helpfully" upgrade it.
+- **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output). **TypeScript 7 removed `baseUrl`** — never add it to either tsconfig; `paths` resolve relative to the declaring tsconfig instead.
+- **Lint with oxlint, not ESLint.** oxlint has no `typescript` peer dependency, which is what allows TypeScript 7 here: an ESLint setup would need `typescript-eslint`, whose `typescript@>=4.8.4 <6.1.0` peer makes `npm ci` fail with `ERESOLVE` against TypeScript 7. Do not reintroduce ESLint.
+- **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
 - **Vercel signature scheme (verified against docs 2026-09-08):** `x-vercel-signature` is the hex `HMAC-SHA1` of the **raw** request body, keyed with the drain secret. 40 hex characters. Verify before decompressing or parsing.
 - **Sink name pattern:** `^[a-z0-9][a-z0-9-]{0,63}$`. A sink name is also a directory name; nothing else is acceptable.
@@ -282,7 +283,7 @@ Establishes the gates every later task must pass, plus the `JsonValue` type and
 the redacting logger that everything depends on.
 
 **Files:**
-- Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `web/tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `eslint.config.js`, `.prettierrc.json`, `.gitignore`, `.dockerignore`
+- Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `web/tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `.oxlintrc.json`, `.prettierrc.json`, `.gitignore`, `.dockerignore`
 - Create: `types/json.ts`, `src/log.ts`
 - Test: `test/log.test.ts`
 
@@ -300,12 +301,13 @@ npm pkg delete main
 
 npm install hono@4.13.7 @hono/node-server@2.1.1 zod@4.5.4 pino@10.3.1
 npm install react@19.2.8 react-dom@19.2.8
-npm install -D typescript@6.0.3 @types/node@24 vitest@5.0.0 vite@8.2.2 \
+npm install -D typescript@7.0.2 @types/node@24 vitest@5.0.0 vite@8.2.2 \
   @vitejs/plugin-react@6.1.1 @types/react@19 @types/react-dom@19 \
-  eslint@10.10.0 @eslint/js typescript-eslint@8.70.0 prettier@3.9.6
+  oxlint@1.82.0 oxlint-tsgolint@7.0.2001 prettier@3.9.6
 ```
 
-Do not use version ranges other than these. TypeScript must be 6.0.3.
+Do not substitute ESLint. `oxlint-tsgolint` is what provides the type-aware
+rules; its version tracks the TypeScript 7 native compiler.
 
 - [ ] **Step 2: Write the config files**
 
@@ -314,7 +316,7 @@ Do not use version ranges other than these. TypeScript must be 6.0.3.
 ```json
 {
   "scripts": {
-    "lint": "eslint .",
+    "lint": "oxlint --type-aware",
     "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -384,12 +386,18 @@ Do not use version ranges other than these. TypeScript must be 6.0.3.
     "noEmit": true,
     "skipLibCheck": true,
     "types": ["vite/client"],
-    "baseUrl": ".",
     "paths": { "@shared/*": ["../types/*"] }
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "../types/**/*.ts", "../vite.config.ts"]
 }
 ```
+
+**Do not add `baseUrl`.** TypeScript 7 removed it and errors out with
+`TS5102: Option 'baseUrl' has been removed`, which fails the whole typecheck
+before any file is examined. In TypeScript 7 `paths` entries resolve relative
+to the `tsconfig.json` that declares them, so `../types/*` is correct as
+written. Verified on 2026-09-08, including that a real type error in a `.tsx`
+file is still reported.
 
 The `@shared/*` alias is how the SPA imports shared types without extension
 ambiguity between `nodenext` and `bundler` resolution. Server code imports the
@@ -435,43 +443,72 @@ export default defineConfig({
 });
 ```
 
-`eslint.config.js` — this exact content was installed and exercised on
-2026-09-08; both `no-restricted-syntax` selectors are required, because the
-`MemberExpression` selector alone misses `readFileSync(p)` imported directly:
+`.oxlintrc.json` — this exact content was installed and exercised on
+2026-09-08:
 
-```js
-import js from '@eslint/js';
-import tseslint from 'typescript-eslint';
-
-const NO_SYNC_IO = [
-  'error',
-  {
-    selector: 'CallExpression > MemberExpression[property.name=/Sync$/]',
-    message: 'Synchronous I/O is banned; use the promise-based API.',
+```json
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "node", "promise", "unicorn", "react"],
+  "categories": { "correctness": "error", "suspicious": "error" },
+  "ignorePatterns": ["node_modules/**", "dist/**", "web/dist/**", "coverage/**"],
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "node/no-sync": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-unsafe-type-assertion": "error",
+    "react/react-in-jsx-scope": "off"
   },
-  {
-    selector: 'CallExpression > Identifier[name=/Sync$/]',
-    message: 'Synchronous I/O is banned; use the promise-based API.',
-  },
-];
-
-export default tseslint.config(
-  { ignores: ['dist/**', 'web/dist/**', 'node_modules/**', 'coverage/**'] },
-  js.configs.recommended,
-  ...tseslint.configs.recommendedTypeChecked,
-  {
-    languageOptions: {
-      parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },
+  "overrides": [
+    {
+      "files": ["web/**/*.ts", "web/**/*.tsx"],
+      "rules": { "node/no-sync": "off" }
     },
-    rules: {
-      '@typescript-eslint/no-explicit-any': 'error',
-      'no-restricted-syntax': NO_SYNC_IO,
-    },
-  },
-  // The flat config file is plain JS and sits outside the TS project.
-  { files: ['**/*.js'], extends: [tseslint.configs.disableTypeChecked] },
-);
+    {
+      "files": ["scripts/**", "*.config.ts"],
+      "rules": { "node/no-sync": "off" }
+    }
+  ]
+}
 ```
+
+Six things about this config are load-bearing and were each checked against the
+real binary on 2026-09-08. Changing any of them will either break the run or
+silently weaken it:
+
+- **`node/no-sync` replaces the ESLint selector hack.** One rule catches
+  `fs.readFileSync(p)`, a directly imported `readFileSync(p)`, and
+  `zlib.gunzipSync(buf)` alike. It is name-based, so it generalizes to any
+  `*Sync` call.
+- **`no-restricted-syntax` does not exist in oxlint.** Configuring it aborts
+  the whole run with `Rule 'no-restricted-syntax' not found in plugin
+  'eslint'` — not a warning, a config-parse failure. Do not add it.
+- **`node_modules/**` must be listed in `ignorePatterns` explicitly.** With a
+  bare `oxlint` invocation and no positional path, oxlint walks
+  `node_modules/` and reports thousands of errors from dependency `.d.ts`
+  files, including from TypeScript's own bundled declarations. Passing explicit
+  paths avoids it too, but listing the pattern keeps the script short and works
+  either way.
+- **Do not enable the `pedantic` category.** It turns on `max-lines`, which
+  caps files at 300 lines; several modules in this project are legitimately
+  longer, and the failure looks like a code problem rather than a config
+  choice. `correctness` plus `suspicious` is the intended level.
+- **`react/react-in-jsx-scope` must be off.** The project uses
+  `jsx: "react-jsx"`, so `React` need not be in scope, but oxlint's react
+  plugin enables that legacy rule by default and every `.tsx` file would fail.
+- **`node/no-sync` is off for `web/`, `scripts/`, and config files.** Browser
+  code has no Node sync API to misuse, and build scripts are exactly where a
+  sync call is acceptable.
+
+Type-aware rules only run when `--type-aware` is passed, which the `lint`
+script does. Without that flag, `no-floating-promises` and
+`no-unsafe-type-assertion` are silently inert — a clean lint would prove
+nothing. The flag requires the `oxlint-tsgolint` devDependency.
+
+Verified acceptance for this config: it exits `0` on clean source (including a
+400-line file, confirming `max-lines` is off) and reports `no-explicit-any`,
+`no-sync`, `no-floating-promises`, and `no-unsafe-type-assertion` on code that
+violates them.
 
 `.prettierrc.json`:
 
@@ -628,10 +665,10 @@ Expected: all pass. `npm run typecheck` will fail on `web/tsconfig.json` until
 git add -A
 git commit -m "chore: scaffold project tooling and redacting logger
 
-Pins TypeScript to 6.0.3 because typescript-eslint 8.70 peer-requires
-<6.1.0 and npm ci fails with ERESOLVE against TypeScript 7. ESLint bans
-any/unknown and all *Sync calls so the project's I/O rule is enforced in
-CI rather than in review."
+Lints with oxlint rather than ESLint, which is what allows TypeScript 7:
+typescript-eslint peer-requires <6.1.0, so an ESLint setup fails npm ci
+outright against TS 7. node/no-sync enforces the project's async-over-sync
+rule in CI, covering both member and direct-import call forms."
 ```
 
 ---
@@ -3993,15 +4030,17 @@ export type StatusSnapshot = {
 
 `recent.events` is the single permitted `unknown[]` in the codebase: it is
 opaque JSON passed straight to the browser for display and never inspected by
-type-dependent logic. Add the ESLint disable comment on that line only:
+type-dependent logic. No lint directive is needed — neither oxlint nor ESLint
+has a rule against `unknown` — but comment the intent at the site:
 
 ```ts
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opaque display payload
+  /** Opaque JSON passed straight to the browser for display. Never inspected. */
+  recent: { events: unknown[]; rejects: RejectRecord[]; errors: ErrorRecord[] };
 ```
 
-If ESLint objects to `unknown[]` here under a future rule, change it to
-`JsonValue[]` by importing from `./json.js` — but that adds an import to this
-otherwise import-free file, so prefer the narrow disable.
+Do not "fix" this to `JsonValue[]`: that would add an import to this
+deliberately import-free file, which is what keeps the SPA's type resolution
+free of extension ambiguity.
 
 - [ ] **Step 4: Implement `src/status/metrics.ts`**
 
@@ -9309,6 +9348,6 @@ git commit -m "docs: document setup, auth, volumes, and troubleshooting"
 - [ ] No `any` and no `unknown` outside the two documented parse boundaries
       (`src/vercel/decode.ts`) and the one documented display payload
       (`types/api.ts`).
-- [ ] No `*Sync` call anywhere in `src/` or `web/` — the ESLint rule enforces
-      this, so a clean lint is the proof.
+- [ ] No `*Sync` call anywhere in `src/` or `web/` — `node/no-sync` enforces
+      this, so a clean `npm run lint` is the proof.
 - [ ] The branch is **not** pushed. Ask before pushing or opening a PR.
