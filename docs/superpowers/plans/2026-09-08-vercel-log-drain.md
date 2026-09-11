@@ -2368,6 +2368,22 @@ describe('resolveLabels', () => {
     expect(resolved).toEqual({ trace_id: 'abc' });
   });
 
+  it('lets a field-derived label override a static label of the same name', () => {
+    const resolved = resolveLabels(event({ level: 'error' }), {
+      static: { level: 'from-static' },
+      fromFields: ['level'],
+    });
+    expect(resolved['level']).toBe('error');
+  });
+
+  it('truncates over-long static label values too', () => {
+    const resolved = resolveLabels(event(), {
+      static: { note: 'y'.repeat(2000) },
+      fromFields: [],
+    });
+    expect(resolved['note']?.length).toBe(1024);
+  });
+
   it('truncates over-long label values', () => {
     const resolved = resolveLabels(event({ message: 'x'.repeat(2000) }), {
       static: {},
@@ -2411,6 +2427,19 @@ describe('buildPushPayload', () => {
     const payload = buildPushPayload([event()], labels);
     const line = JSON.parse(payload.streams[0]?.values[0]?.[1] ?? '{}');
     expect(line).toMatchObject({ id: 'e1', projectName: 'my-app', message: 'hello' });
+  });
+
+  it('keeps same-timestamp events in arrival order', () => {
+    // A comparator that never returns 0 leaves ties implementation-defined.
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const payload = buildPushPayload(
+      ids.map((id) => event({ id, timestamp: 5000 })),
+      labels,
+    );
+    const order = (payload.streams[0]?.values ?? []).map(
+      ([, line]) => (JSON.parse(line) as { id: string }).id,
+    );
+    expect(order).toEqual(ids);
   });
 
   it('returns no streams for an empty batch', () => {
@@ -2496,6 +2525,10 @@ export function sanitizeLabelName(name: string): string {
 export function resolveLabels(event: LogEvent, config: LokiLabelConfig): Record<string, string> {
   const labels: Record<string, string> = {};
 
+  // Static labels are written first, so a field-derived label with the same
+  // sanitized name overwrites them. That precedence is deliberate: `fromFields`
+  // names a property of the event, which is more specific than a blanket
+  // static value, and an operator who sets both plainly meant the event's.
   for (const [name, value] of Object.entries(config.static)) {
     if (value.length === 0) continue;
     labels[sanitizeLabelName(name)] = value.slice(0, LABEL_VALUE_LIMIT);
@@ -2534,9 +2567,19 @@ export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): L
   for (const stream of streams) {
     // Reassign rather than sort in place: oxlint's unicorn/no-array-sort bans
     // the mutating Array#sort, and toSorted returns a new array.
-    stream.values = stream.values.toSorted((left, right) =>
-      BigInt(left[0]) < BigInt(right[0]) ? -1 : 1,
-    );
+    stream.values = stream.values.toSorted((left, right) => {
+      const leftNanos = BigInt(left[0]);
+      const rightNanos = BigInt(right[0]);
+      if (leftNanos < rightNanos) return -1;
+      if (leftNanos > rightNanos) return 1;
+      // Equal timestamps must return 0. A comparator that answers 1 for a tie
+      // claims each side sorts after the other, which is antisymmetric-
+      // violating: the engine is then free to order same-millisecond events
+      // arbitrarily. Vercel batches routinely carry several lines on one
+      // millisecond (a request's start and end, for instance), and returning 0
+      // lets the stable sort keep them in arrival order.
+      return 0;
+    });
   }
   return { streams };
 }
