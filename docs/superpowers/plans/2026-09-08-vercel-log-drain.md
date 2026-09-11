@@ -19,6 +19,7 @@ Every task's requirements implicitly include this section.
 - **Formatting:** 2-space indent; always terminate statements with semicolons, including optional ones. Enforced by Prettier.
 - **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output). **TypeScript 7 removed `baseUrl`** — never add it to either tsconfig; `paths` resolve relative to the declaring tsconfig instead.
 - **Lint with oxlint, not ESLint.** oxlint has no `typescript` peer dependency, which is what allows TypeScript 7 here: an ESLint setup would need `typescript-eslint`, whose `typescript@>=4.8.4 <6.1.0` peer makes `npm ci` fail with `ERESOLVE` against TypeScript 7. Do not reintroduce ESLint.
+- **Never write `JSON.parse(x) as T`.** oxlint's type-aware `typescript/no-unsafe-type-assertion` rejects asserting away `JSON.parse`'s `any`. Use an annotated assignment instead — `const value: T = JSON.parse(x);` — which is lint-clean AND type-checked. Do **not** simply drop the annotation (`const value = JSON.parse(x)`): that silences the rule by leaving an inferred `any`, which is the invisible form of the thing the project bans.
 - **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
@@ -2436,9 +2437,10 @@ describe('buildPushPayload', () => {
       ids.map((id) => event({ id, timestamp: 5000 })),
       labels,
     );
-    const order = (payload.streams[0]?.values ?? []).map(
-      ([, line]) => (JSON.parse(line) as { id: string }).id,
-    );
+    const order = (payload.streams[0]?.values ?? []).map(([, line]) => {
+      const entry: { id: string } = JSON.parse(line);
+      return entry.id;
+    });
     expect(order).toEqual(ids);
   });
 
@@ -3777,7 +3779,10 @@ function canonicalize(value: JsonValue): JsonValue {
 }
 
 export function etagOf(config: AppConfig): string {
-  const canonical = canonicalize(JSON.parse(JSON.stringify(config)) as JsonValue);
+  // Annotated assignment rather than `as JsonValue`: oxlint's
+  // no-unsafe-type-assertion rejects asserting away JSON.parse's `any`.
+  const cloned: JsonValue = JSON.parse(JSON.stringify(config));
+  const canonical = canonicalize(cloned);
   return createHash('sha256').update(JSON.stringify(canonical)).digest('hex').slice(0, 32);
 }
 
@@ -3809,7 +3814,8 @@ export class ConfigStore {
 
     let raw: JsonValue;
     try {
-      raw = JSON.parse(text) as JsonValue;
+      // `raw` is already annotated, so no assertion is needed or permitted.
+      raw = JSON.parse(text);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new ConfigInvalidError(
@@ -3869,7 +3875,8 @@ export class ConfigStore {
   private async backupHint(): Promise<string> {
     try {
       const text = await readFile(this.backupPath, 'utf8');
-      const parsed = appConfigSchema.safeParse(JSON.parse(text) as JsonValue);
+      const backup: JsonValue = JSON.parse(text);
+      const parsed = appConfigSchema.safeParse(backup);
       if (parsed.success) {
         return `\n\nThe backup at ${this.backupPath} parses cleanly. To recover, copy it over ${this.path} and restart.`;
       }
@@ -7949,12 +7956,13 @@ describe('end-to-end durability', () => {
 
       const delivered = lokiReceived
         .flatMap((text) => {
-          const payload = JSON.parse(text) as {
-            streams: { values: [string, string][] }[];
-          };
+          const payload: { streams: { values: [string, string][] }[] } = JSON.parse(text);
           return payload.streams.flatMap((stream) => stream.values);
         })
-        .map(([, line]) => (JSON.parse(line) as { id: string }).id);
+        .map(([, line]) => {
+          const entry: { id: string } = JSON.parse(line);
+          return entry.id;
+        });
 
       // Every event arrives, exactly once.
       expect(delivered.toSorted()).toEqual(['a1', 'a2', 'a3', 'a4', 'a5']);
