@@ -56,7 +56,6 @@ export function resolveLogsDirectory(candidate: string, logsRoot: string): strin
 class FileSink implements Sink {
   readonly type = 'file';
   private readonly handles = new Map<string, FileHandle>();
-  private directoryReady = false;
 
   constructor(
     readonly name: string,
@@ -64,10 +63,16 @@ class FileSink implements Sink {
     private readonly ctx: SinkContext,
   ) {}
 
+  /**
+   * Called on every deliver, deliberately uncached. `mkdir` with `recursive`
+   * is idempotent and costs one syscall per coalesced batch, whereas caching a
+   * "directory exists" flag means that if the directory is removed externally
+   * — an operator cleaning up, a volume remount — every later write fails with
+   * ENOENT permanently, until the process restarts. That trades a negligible
+   * saving for an unrecoverable durability regression.
+   */
   private async ensureDirectory(): Promise<void> {
-    if (this.directoryReady) return;
     await mkdir(this.config.directory, { recursive: true });
-    this.directoryReady = true;
   }
 
   private async handleFor(dateKey: string): Promise<FileHandle> {
@@ -89,9 +94,21 @@ class FileSink implements Sink {
     while (this.handles.size > HANDLE_CACHE_LIMIT) {
       const oldest = this.handles.keys().next();
       if (oldest.done === true) break;
-      const evicted = this.handles.get(oldest.value);
-      this.handles.delete(oldest.value);
-      if (evicted !== undefined) await evicted.close();
+      const key = oldest.value;
+      const evicted = this.handles.get(key);
+      try {
+        if (evicted !== undefined) await evicted.close();
+      } catch (error) {
+        // A failed close must not fail the delivery that triggered eviction —
+        // the write we are here for would otherwise have succeeded.
+        const message = error instanceof Error ? error.message : String(error);
+        this.ctx.log.warn({ sink: this.name, err: message }, 'failed to close evicted handle');
+      } finally {
+        // Untrack in `finally`: closing first is what avoids leaking a
+        // descriptor, but the key must go regardless or a throwing close
+        // would spin this loop forever.
+        this.handles.delete(key);
+      }
     }
     return handle;
   }

@@ -152,6 +152,42 @@ describe('fileSinkType', () => {
     expect(first.trimEnd().split('\n')).toHaveLength(2);
   });
 
+  it('handles a single batch spanning more dates than the handle cache holds', async () => {
+    // Distinct from the test above: that one makes a separate deliver() call
+    // per date, so eviction happens BETWEEN calls. Here one batch spans five
+    // dates, so eviction happens mid-loop, inside a single deliver().
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    const events = [0, 1, 2, 3, 4].map((offset) =>
+      event(`b${String(offset)}`, Date.UTC(2026, 5, 1 + offset)),
+    );
+    await sink.deliver(events);
+    await sink.close();
+
+    const files = (await readdir(dir)).toSorted();
+    expect(files).toHaveLength(5);
+    for (const [offset, name] of files.entries()) {
+      const contents = await readFile(join(dir, name), 'utf8');
+      expect(contents.trimEnd().split('\n')).toHaveLength(1);
+      expect(JSON.parse(contents.trimEnd())).toMatchObject({ id: `b${String(offset)}` });
+    }
+  });
+
+  it('recreates the directory if it is removed between deliveries', async () => {
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    await sink.deliver([event('first', beforeMidnight)]);
+    await sink.close();
+
+    // Simulate an operator cleanup or a volume remount.
+    await rm(dir, { recursive: true, force: true });
+
+    const revived = fileSinkType.create('local', config(), { log: silentLog });
+    await revived.deliver([event('second', beforeMidnight)]);
+    await revived.close();
+
+    const contents = await readFile(join(dir, 'events-2019-11-15.jsonl'), 'utf8');
+    expect(JSON.parse(contents.trimEnd())).toMatchObject({ id: 'second' });
+  });
+
   it('reports no warnings for a valid config', () => {
     expect(fileSinkType.warnings(config())).toEqual([]);
   });
