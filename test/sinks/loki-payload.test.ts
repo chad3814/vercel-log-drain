@@ -87,6 +87,22 @@ describe('resolveLabels', () => {
     expect(resolved).toEqual({ trace_id: 'abc' });
   });
 
+  it('lets a field-derived label override a static label of the same name', () => {
+    const resolved = resolveLabels(event({ level: 'error' }), {
+      static: { level: 'from-static' },
+      fromFields: ['level'],
+    });
+    expect(resolved['level']).toBe('error');
+  });
+
+  it('truncates over-long static label values too', () => {
+    const resolved = resolveLabels(event(), {
+      static: { note: 'y'.repeat(2000) },
+      fromFields: [],
+    });
+    expect(resolved['note']?.length).toBe(1024);
+  });
+
   it('truncates over-long label values', () => {
     const resolved = resolveLabels(event({ message: 'x'.repeat(2000) }), {
       static: {},
@@ -130,6 +146,22 @@ describe('buildPushPayload', () => {
     const payload = buildPushPayload([event()], labels);
     const line = JSON.parse(payload.streams[0]?.values[0]?.[1] ?? '{}');
     expect(line).toMatchObject({ id: 'e1', projectName: 'my-app', message: 'hello' });
+  });
+
+  it('keeps same-timestamp events in arrival order', () => {
+    // A comparator that never returns 0 leaves ties implementation-defined.
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const payload = buildPushPayload(
+      ids.map((id) => event({ id, timestamp: 5000 })),
+      labels,
+    );
+    const order = (payload.streams[0]?.values ?? []).map(
+      ([, line]) => {
+        const parsed = JSON.parse(line);
+        return parsed.id;
+      },
+    );
+    expect(order).toEqual(ids);
   });
 
   it('returns no streams for an empty batch', () => {

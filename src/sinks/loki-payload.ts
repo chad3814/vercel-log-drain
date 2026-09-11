@@ -33,6 +33,10 @@ export function sanitizeLabelName(name: string): string {
 export function resolveLabels(event: LogEvent, config: LokiLabelConfig): Record<string, string> {
   const labels: Record<string, string> = {};
 
+  // Static labels are written first, so a field-derived label with the same
+  // sanitized name overwrites them. That precedence is deliberate: `fromFields`
+  // names a property of the event, which is more specific than a blanket
+  // static value, and an operator who sets both plainly meant the event's.
   for (const [name, value] of Object.entries(config.static)) {
     if (value.length === 0) continue;
     labels[sanitizeLabelName(name)] = value.slice(0, LABEL_VALUE_LIMIT);
@@ -71,9 +75,19 @@ export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): L
   for (const stream of streams) {
     // Reassign rather than sort in place: oxlint's unicorn/no-array-sort bans
     // the mutating Array#sort, and toSorted returns a new array.
-    stream.values = stream.values.toSorted((left, right) =>
-      BigInt(left[0]) < BigInt(right[0]) ? -1 : 1,
-    );
+    stream.values = stream.values.toSorted((left, right) => {
+      const leftNanos = BigInt(left[0]);
+      const rightNanos = BigInt(right[0]);
+      if (leftNanos < rightNanos) return -1;
+      if (leftNanos > rightNanos) return 1;
+      // Equal timestamps must return 0. A comparator that answers 1 for a tie
+      // claims each side sorts after the other, which is antisymmetric-
+      // violating: the engine is then free to order same-millisecond events
+      // arbitrarily. Vercel batches routinely carry several lines on one
+      // millisecond (a request's start and end, for instance), and returning 0
+      // lets the stable sort keep them in arrival order.
+      return 0;
+    });
   }
   return { streams };
 }
