@@ -19,6 +19,7 @@ Every task's requirements implicitly include this section.
 - **Formatting:** 2-space indent; always terminate statements with semicolons, including optional ones. Enforced by Prettier.
 - **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output). **TypeScript 7 removed `baseUrl`** — never add it to either tsconfig; `paths` resolve relative to the declaring tsconfig instead.
 - **Lint with oxlint, not ESLint.** oxlint has no `typescript` peer dependency, which is what allows TypeScript 7 here: an ESLint setup would need `typescript-eslint`, whose `typescript@>=4.8.4 <6.1.0` peer makes `npm ci` fail with `ERESOLVE` against TypeScript 7. Do not reintroduce ESLint.
+- **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
 - **Vercel signature scheme (verified against docs 2026-09-08):** `x-vercel-signature` is the hex `HMAC-SHA1` of the **raw** request body, keyed with the drain secret. 40 hex characters. Verify before decompressing or parsing.
@@ -1537,7 +1538,7 @@ describe('groupByUtcDate', () => {
       event('b', afterMidnight),
       event('c', beforeMidnight),
     ]);
-    expect([...grouped.keys()].sort()).toEqual(['2019-11-15', '2019-11-16']);
+    expect([...grouped.keys()].toSorted()).toEqual(['2019-11-15', '2019-11-16']);
     expect(grouped.get('2019-11-15')).toHaveLength(2);
     expect(grouped.get('2019-11-16')).toHaveLength(1);
   });
@@ -1604,7 +1605,7 @@ describe('fileSinkType', () => {
     await sink.deliver([event('a', beforeMidnight), event('b', afterMidnight)]);
     await sink.close();
 
-    const files = (await readdir(dir)).sort();
+    const files = (await readdir(dir)).toSorted();
     expect(files).toEqual(['events-2019-11-15.jsonl', 'events-2019-11-16.jsonl']);
   });
 
@@ -1636,7 +1637,7 @@ describe('fileSinkType', () => {
     await sink.deliver([event('again', days[0] ?? 0)]);
     await sink.close();
 
-    const files = (await readdir(dir)).sort();
+    const files = (await readdir(dir)).toSorted();
     expect(files).toHaveLength(5);
     const first = await readFile(join(dir, 'events-2026-09-01.jsonl'), 'utf8');
     expect(first.trimEnd().split('\n')).toHaveLength(2);
@@ -1864,8 +1865,8 @@ describe('pruneRetention', () => {
 
     const deleted = await pruneRetention(dir, 'events', 3, now);
 
-    expect(deleted.sort()).toEqual(['events-2026-08-20.jsonl', 'events-2026-09-01.jsonl']);
-    expect((await readdir(dir)).sort()).toEqual([
+    expect(deleted.toSorted()).toEqual(['events-2026-08-20.jsonl', 'events-2026-09-01.jsonl']);
+    expect((await readdir(dir)).toSorted()).toEqual([
       'events-2026-09-06.jsonl',
       'events-2026-09-08.jsonl',
     ]);
@@ -1880,7 +1881,7 @@ describe('pruneRetention', () => {
     const deleted = await pruneRetention(dir, 'events', 1, now);
 
     expect(deleted).toEqual(['events-2020-01-01.jsonl']);
-    expect((await readdir(dir)).sort()).toEqual([
+    expect((await readdir(dir)).toSorted()).toEqual([
       'events-not-a-date.jsonl',
       'important-notes.txt',
       'other-2020-01-01.jsonl',
@@ -2377,7 +2378,7 @@ export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): L
   for (const event of events) {
     const labels = resolveLabels(event, config);
     // Sorted keys make the grouping key stable regardless of field order.
-    const key = JSON.stringify(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : 1)));
+    const key = JSON.stringify(Object.entries(labels).toSorted(([a], [b]) => (a < b ? -1 : 1)));
     const nanos = String(BigInt(Math.trunc(event.timestamp)) * 1_000_000n);
     const entry: [string, string] = [nanos, JSON.stringify(event)];
 
@@ -2391,7 +2392,11 @@ export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): L
 
   const streams = [...byLabelSet.values()];
   for (const stream of streams) {
-    stream.values.sort((left, right) => (BigInt(left[0]) < BigInt(right[0]) ? -1 : 1));
+    // Reassign rather than sort in place: oxlint's unicorn/no-array-sort bans
+    // the mutating Array#sort, and toSorted returns a new array.
+    stream.values = stream.values.toSorted((left, right) =>
+      BigInt(left[0]) < BigInt(right[0]) ? -1 : 1,
+    );
   }
   return { streams };
 }
@@ -3579,7 +3584,7 @@ function canonicalize(value: JsonValue): JsonValue {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value !== null && typeof value === 'object') {
     const sorted: { [key: string]: JsonValue } = {};
-    for (const key of Object.keys(value).sort()) {
+    for (const key of Object.keys(value).toSorted()) {
       const entry = value[key];
       if (entry !== undefined) sorted[key] = canonicalize(entry);
     }
@@ -4676,12 +4681,15 @@ export class SpoolQueue {
       }
       if (BATCH_NAME.test(name)) batches.push(name);
     }
-    batches.sort();
+    // toSorted, not sort: oxlint's unicorn/no-array-sort bans the mutating
+    // form. Lexicographic order is deliberate — the 12-digit zero padding
+    // makes it identical to numeric order.
+    const ordered = batches.toSorted();
 
     const entries: Entry[] = [];
     let total = 0;
     let maxSeq = -1;
-    for (const name of batches) {
+    for (const name of ordered) {
       const stats = await stat(join(this.dir, name));
       entries.push({ name, bytes: stats.size });
       total += stats.size;
@@ -5070,7 +5078,7 @@ describe('SinkWorker', () => {
     await worker.stop(1000);
 
     expect(queue.fileCount()).toBe(0);
-    expect(sink.received.flat().map((e) => e['id']).sort()).toEqual(['a', 'b']);
+    expect(sink.received.flat().map((e) => e['id']).toSorted()).toEqual(['a', 'b']);
   });
 });
 ```
@@ -5353,7 +5361,7 @@ describe('Dispatcher', () => {
 
   it('creates a spool directory per enabled sink', async () => {
     await dispatcher.applyConfig(configWith([fileSink('one'), fileSink('two')]));
-    expect((await readdir(spoolRoot)).sort()).toEqual(['one', 'two']);
+    expect((await readdir(spoolRoot)).toSorted()).toEqual(['one', 'two']);
   });
 
   it('routes events only to sinks whose filter matches', async () => {
@@ -7766,7 +7774,7 @@ describe('end-to-end durability', () => {
         .map(([, line]) => (JSON.parse(line) as { id: string }).id);
 
       // Every event arrives, exactly once.
-      expect(delivered.sort()).toEqual(['a1', 'a2', 'a3', 'a4', 'a5']);
+      expect(delivered.toSorted()).toEqual(['a1', 'a2', 'a3', 'a4', 'a5']);
 
       // And nothing was dead-lettered along the way.
       const dead = await readdir(join(spoolDir, 'loki', 'dead')).catch(() => []);
