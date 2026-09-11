@@ -19,6 +19,7 @@ Every task's requirements implicitly include this section.
 - **Formatting:** 2-space indent; always terminate statements with semicolons, including optional ones. Enforced by Prettier.
 - **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output). **TypeScript 7 removed `baseUrl`** — never add it to either tsconfig; `paths` resolve relative to the declaring tsconfig instead.
 - **Lint with oxlint, not ESLint.** oxlint has no `typescript` peer dependency, which is what allows TypeScript 7 here: an ESLint setup would need `typescript-eslint`, whose `typescript@>=4.8.4 <6.1.0` peer makes `npm ci` fail with `ERESOLVE` against TypeScript 7. Do not reintroduce ESLint.
+- **Read a Node error's `code` with `in` narrowing**, never a weak-typed annotation or an assertion. `if ('code' in error && typeof error.code === 'string')` is the only form that satisfies both the compiler and the linter: `const c: { code?: string } = error;` fails `TS2559` because `Error` has no properties in common with that shape, and `error as { code?: string }` trips oxlint's `no-unsafe-type-assertion` for narrowing. Verified 2026-09-11.
 - **Never write `JSON.parse(x) as T`.** oxlint's type-aware `typescript/no-unsafe-type-assertion` rejects asserting away `JSON.parse`'s `any`. Use an annotated assignment instead — `const value: T = JSON.parse(x);` — which is lint-clean AND type-checked. Do **not** simply drop the annotation (`const value = JSON.parse(x)`): that silences the rule by leaving an inferred `any`, which is the invisible form of the thing the project bans.
 - **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
@@ -1223,8 +1224,12 @@ function snippet(text: string): string {
 }
 
 function errorCode(error: Error): string | undefined {
-  const candidate: { code?: string } = error;
-  return candidate.code;
+  // `in` narrowing, deliberately. Two tempting alternatives both fail:
+  //   const candidate: { code?: string } = error;  -> TS2559, weak-type check
+  //   error as { code?: string }                   -> oxlint no-unsafe-type-assertion
+  // This form needs neither an assertion nor `unknown`.
+  if ('code' in error && typeof error.code === 'string') return error.code;
+  return undefined;
 }
 
 function validateEntry(candidate: unknown, index: number, into: DecodeResult): void {
@@ -3881,8 +3886,11 @@ export class EtagMismatchError extends Error {
 }
 
 function isErrno(error: Error, code: string): boolean {
-  const candidate: { code?: string } = error;
-  return candidate.code === code;
+  // `in` narrowing, deliberately — see the note in src/vercel/decode.ts.
+  // `const candidate: { code?: string } = error;` fails TS2559 (weak-type
+  // check: Error has no properties in common), and an `as` assertion trips
+  // oxlint's no-unsafe-type-assertion.
+  return 'code' in error && error.code === code;
 }
 
 function canonicalize(value: JsonValue): JsonValue {
