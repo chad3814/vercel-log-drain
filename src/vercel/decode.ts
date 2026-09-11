@@ -114,30 +114,6 @@ export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<D
   const firstNonSpace = text.search(/\S/);
   if (firstNonSpace === -1) return result;
 
-  if (text[firstNonSpace] === '{' && !text.includes('\n')) {
-    // Attempting to send a single JSON object instead of an array or NDJSON is a
-    // misconfiguration. Try to parse it to confirm, then reject the whole body.
-    let obj: unknown;
-    try {
-      obj = JSON.parse(text);
-    } catch (error) {
-      result.rejected.push({
-        index: WHOLE_BODY_INDEX,
-        reason: error instanceof Error ? error.message : 'invalid JSON',
-        snippet: snippet(text),
-      });
-      return result;
-    }
-    if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
-      result.rejected.push({
-        index: WHOLE_BODY_INDEX,
-        reason: 'body is a JSON object, not an array or newline-delimited entries',
-        snippet: snippet(text),
-      });
-      return result;
-    }
-  }
-
   if (text[firstNonSpace] === '[') {
     let entries: unknown;
     try {

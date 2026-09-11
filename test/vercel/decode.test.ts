@@ -102,9 +102,28 @@ describe('decodeBody', () => {
     expect(firstEntry.events.map((e) => e['id'])).toEqual(['b']);
   });
 
-  it('reports a non-array JSON body with the whole-body sentinel index', async () => {
-    const result = await decodeBody(Buffer.from('{"not":"an array"}', 'utf8'), options);
-    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+  it('accepts a single-event NDJSON body with no trailing newline', async () => {
+    const result = await decodeBody(Buffer.from(JSON.stringify(eventA), 'utf8'), options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a']);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('accepts a single-event NDJSON body with a trailing newline', async () => {
+    const result = await decodeBody(Buffer.from(`${JSON.stringify(eventA)}\n`, 'utf8'), options);
+    expect(result.events.map((e) => e['id'])).toEqual(['a']);
+    expect(result.rejected).toEqual([]);
+  });
+
+  it('treats a lone JSON object as a single NDJSON entry, not a whole-body failure', async () => {
+    // A body starting with '{' sniffs as NDJSON, so it is one line. A schema
+    // failure there is a PER-ENTRY failure at index 0 — not a whole-body
+    // failure. Do NOT add a special case for object bodies: a single-event
+    // ndjson delivery is exactly one JSON object with no newline, and
+    // rejecting it would silently drop real events.
+    const result = await decodeBody(Buffer.from('{"not":"an event"}', 'utf8'), options);
+    expect(result.events).toEqual([]);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(0);
   });
 
   it('reports a corrupt gzip body as a reject, not as PayloadTooLargeError', async () => {
