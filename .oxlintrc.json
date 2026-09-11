@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "oxc", "node", "promise", "unicorn", "react"],
+  "categories": { "correctness": "error", "suspicious": "error" },
+  "ignorePatterns": ["node_modules/**", "dist/**", "web/dist/**", "coverage/**"],
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "node/no-sync": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-unsafe-type-assertion": "error",
+    "react/react-in-jsx-scope": "off"
+  },
+  "overrides": [
+    {
+      "files": ["web/**/*.ts", "web/**/*.tsx"],
+      "rules": { "node/no-sync": "off" }
+    },
+    {
+      "files": ["scripts/**", "*.config.ts"],
+      "rules": { "node/no-sync": "off" }
+    }
+  ]
+}
