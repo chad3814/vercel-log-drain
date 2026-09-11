@@ -3795,7 +3795,9 @@ describe('ConfigStore', () => {
       second.etag,
     );
 
-    const backup = JSON.parse(await readFile(join(dir, 'config.json.bak'), 'utf8'));
+    const backup: { server: { maxBodyBytes: number } } = JSON.parse(
+      await readFile(join(dir, 'config.json.bak'), 'utf8'),
+    );
     expect(backup.server.maxBodyBytes).toBe(8192);
   });
 
@@ -3815,7 +3817,55 @@ describe('ConfigStore', () => {
   it('allows a save with a null etag, for boot-time writes', async () => {
     const store = new ConfigStore(dir);
     await store.load();
-    await expect(store.save(defaultAppConfig(), null)).resolves.toBeDefined();
+    const saved = await store.save(
+      { ...defaultAppConfig(), server: { ...defaultAppConfig().server, maxBodyBytes: 5555 } },
+      null,
+    );
+    expect(saved.config.server.maxBodyBytes).toBe(5555);
+    expect(saved.etag).toBe(etagOf(saved.config));
+    const reloaded = await new ConfigStore(dir).load();
+    expect(reloaded.config.server.maxBodyBytes).toBe(5555);
+  });
+
+  it('serializes concurrent saves: the second sees a stale etag', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+
+    const results = await Promise.allSettled([
+      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 1111 } }, initial.etag),
+      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2222 } }, initial.etag),
+    ]);
+
+    // Exactly one wins; the loser gets a meaningful conflict, never a raw
+    // ENOENT from two saves sharing one temp path.
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((r) => r.status === 'rejected');
+    expect(rejected?.status === 'rejected' && rejected.reason).toBeInstanceOf(EtagMismatchError);
+
+    const reloaded = await new ConfigStore(dir).load();
+    expect([1111, 2222]).toContain(reloaded.config.server.maxBodyBytes);
+  });
+
+  it('survives many concurrent null-etag saves with a valid file and no temp litter', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, (_unused, index) =>
+        store
+          .save(
+            { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2048 + index } },
+            null,
+          )
+          .then(() => 'ok')
+          .catch(() => 'failed'),
+      ),
+    );
+
+    expect(outcomes.every((outcome) => outcome === 'ok')).toBe(true);
+    const reloaded = await new ConfigStore(dir).load();
+    expect(reloaded.config.server.maxBodyBytes).toBeGreaterThanOrEqual(2048);
+    expect((await readdir(dir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
   });
 
   it('refuses to start on malformed JSON rather than resetting', async () => {
@@ -3861,7 +3911,7 @@ Without that, a save/load round trip could change key order and produce a
 spurious `409` on the next edit.
 
 ```ts
-import { copyFile, mkdir, open, readFile, rename } from 'node:fs/promises';
+import { copyFile, mkdir, open, readdir, readFile, rename, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -3917,16 +3967,47 @@ export function etagOf(config: AppConfig): string {
 export class ConfigStore {
   private readonly path: string;
   private readonly backupPath: string;
-  private readonly tmpPath: string;
+  private tmpCounter = 0;
+  /**
+   * Saves are serialized through this chain. `save()` reads the current etag
+   * and only then writes, with several `await` points in between — without
+   * serialization two concurrent callers (a double-submitted form, two open
+   * admin tabs, a retried request racing the original) both pass the etag
+   * check and both proceed to write. Measured before this was added: of eight
+   * concurrent saves, one succeeded and seven failed with a bare
+   * `ENOENT ... rename`, because they all shared one temp path and the first
+   * rename moved it out from under the rest. An operator would see "no such
+   * file or directory" for what is really a write conflict, and two handles
+   * opened `'w'` on the same path can in principle interleave into a corrupt
+   * file that then gets renamed over the live config.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly dir: string) {
     this.path = join(dir, 'config.json');
     this.backupPath = join(dir, 'config.json.bak');
-    this.tmpPath = join(dir, 'config.json.tmp');
+  }
+
+  /** Per-save temp path, so concurrent or crashed writes cannot collide. */
+  private nextTmpPath(): string {
+    this.tmpCounter += 1;
+    return join(this.dir, `config.json.${String(process.pid)}.${String(this.tmpCounter)}.tmp`);
+  }
+
+  private serialize<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(work, work);
+    // Keep the chain alive whatever happens, so one failed save does not
+    // wedge every later one.
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   async load(): Promise<LoadedConfig> {
     await mkdir(this.dir, { recursive: true });
+    await this.sweepStaleTemps();
 
     let text: string;
     try {
@@ -3960,18 +4041,22 @@ export class ConfigStore {
     return { config: result.data, etag: etagOf(result.data) };
   }
 
-  async save(config: AppConfig, expectedEtag: string | null): Promise<LoadedConfig> {
-    const validated = appConfigSchema.parse(config);
-    if (expectedEtag !== null) {
-      const current = await this.load();
-      if (current.etag !== expectedEtag) {
-        throw new EtagMismatchError(
-          'the configuration changed since it was read; reload and reapply your edit',
-        );
+  save(config: AppConfig, expectedEtag: string | null): Promise<LoadedConfig> {
+    // Serialized: the read-check-write sequence below must not interleave with
+    // another save, or the etag check it performs is meaningless.
+    return this.serialize(async () => {
+      const validated = appConfigSchema.parse(config);
+      if (expectedEtag !== null) {
+        const current = await this.load();
+        if (current.etag !== expectedEtag) {
+          throw new EtagMismatchError(
+            'the configuration changed since it was read; reload and reapply your edit',
+          );
+        }
       }
-    }
-    await this.writeAtomic(validated);
-    return { config: validated, etag: etagOf(validated) };
+      await this.writeAtomic(validated);
+      return { config: validated, etag: etagOf(validated) };
+    });
   }
 
   private async writeAtomic(config: AppConfig): Promise<void> {
@@ -3979,24 +4064,61 @@ export class ConfigStore {
 
     try {
       await copyFile(this.path, this.backupPath);
+      // Make the backup durable too. The design calls `.bak` the operator's
+      // recovery path, and without this its bytes can sit in the page cache
+      // indefinitely — a later unrelated crash could lose the one copy someone
+      // is told to restore from.
+      const backupHandle = await open(this.backupPath, 'r+');
+      try {
+        await backupHandle.sync();
+      } finally {
+        await backupHandle.close();
+      }
     } catch (error) {
       if (!(error instanceof Error && isErrno(error, 'ENOENT'))) throw error;
     }
 
-    const handle = await open(this.tmpPath, 'w');
+    const tmpPath = this.nextTmpPath();
     try {
-      await handle.writeFile(`${JSON.stringify(config, null, 2)}\n`, 'utf8');
-      await handle.sync();
-    } finally {
-      await handle.close();
+      const handle = await open(tmpPath, 'w');
+      try {
+        await handle.writeFile(`${JSON.stringify(config, null, 2)}\n`, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(tmpPath, this.path);
+    } catch (error) {
+      // A failed save must not leave its temp file behind.
+      await rm(tmpPath, { force: true });
+      throw error;
     }
-    await rename(this.tmpPath, this.path);
 
     const dirHandle = await open(this.dir, 'r');
     try {
       await dirHandle.sync();
     } finally {
       await dirHandle.close();
+    }
+  }
+
+  /**
+   * Temp files are per-save and unique, so a crash mid-write leaves one behind
+   * forever. `load()` runs at boot, which is the natural place to clear them.
+   * A stray temp is harmless to correctness — `load()` only ever reads
+   * `config.json` — but they would accumulate on the config volume.
+   */
+  private async sweepStaleTemps(): Promise<void> {
+    let entries: string[];
+    try {
+      entries = await readdir(this.dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (/^config\.json\.\d+\.\d+\.tmp$/.test(entry)) {
+        await rm(join(this.dir, entry), { force: true });
+      }
     }
   }
 
