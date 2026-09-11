@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
-import { decodeBody, PayloadTooLargeError } from '../../src/vercel/decode.js';
+import { decodeBody, PayloadTooLargeError, WHOLE_BODY_INDEX } from '../../src/vercel/decode.js';
 
 const gzipAsync = promisify(gzip);
 
@@ -83,11 +83,44 @@ describe('decodeBody', () => {
     expect(result.rejected).toEqual([]);
   });
 
-  it('reports a whole-body parse failure when a JSON array is malformed', async () => {
+  it('reports a whole-body parse failure with the whole-body sentinel index', async () => {
     const raw = Buffer.from('[{"id":"a"},', 'utf8');
     const result = await decodeBody(raw, options);
     expect(result.events).toEqual([]);
     expect(result.rejected).toHaveLength(1);
-    expect(result.rejected[0]?.index).toBe(0);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+  });
+
+  it('distinguishes a whole-body failure from a first-entry failure by index', async () => {
+    const wholeBody = await decodeBody(Buffer.from('[{"id":"a"},', 'utf8'), options);
+    const firstEntry = await decodeBody(
+      Buffer.from(JSON.stringify([{ id: 'no-required-fields' }, eventB]), 'utf8'),
+      options,
+    );
+    expect(wholeBody.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+    expect(firstEntry.rejected[0]?.index).toBe(0);
+    expect(firstEntry.events.map((e) => e['id'])).toEqual(['b']);
+  });
+
+  it('reports a non-array JSON body with the whole-body sentinel index', async () => {
+    const result = await decodeBody(Buffer.from('{"not":"an array"}', 'utf8'), options);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+  });
+
+  it('reports a corrupt gzip body as a reject, not as PayloadTooLargeError', async () => {
+    const notGzip = Buffer.from('this is not gzip at all', 'utf8');
+    const result = await decodeBody(notGzip, { gzipped: true, maxDecompressedBytes: 1_000_000 });
+    expect(result.events).toEqual([]);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+    expect(result.rejected[0]?.reason).toMatch(/inflation failed/);
+  });
+
+  it('reports a truncated gzip stream as a reject, not as PayloadTooLargeError', async () => {
+    const full = await gzipAsync(Buffer.from(JSON.stringify([eventA]), 'utf8'));
+    const truncated = full.subarray(0, full.length - 4);
+    const result = await decodeBody(truncated, { gzipped: true, maxDecompressedBytes: 1_000_000 });
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
   });
 });

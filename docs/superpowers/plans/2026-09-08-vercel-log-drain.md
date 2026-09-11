@@ -100,10 +100,11 @@ export function levelRank(level: EventLevel): number;
 export function verifySignature(raw: Buffer, header: string | undefined, secret: string): boolean;
 
 // src/vercel/decode.ts
+export const WHOLE_BODY_INDEX = -1;   // sentinel: the failure is the whole body, not an entry
 export type RejectedEntry = { index: number; reason: string; snippet: string };
 export type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] };
 export type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number };
-export class PayloadTooLargeError extends Error {}
+export class PayloadTooLargeError extends Error {}   // size cap only
 export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult>;
 
 // src/pipeline/filter.ts
@@ -1012,7 +1013,7 @@ explicit length check, since timingSafeEqual throws on length mismatch."
 
 **Interfaces:**
 - Consumes: `logEventSchema`, `LogEvent` from `src/vercel/event.ts`.
-- Produces: `type RejectedEntry = { index: number; reason: string; snippet: string }`, `type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] }`, `type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number }`, `class PayloadTooLargeError`, `decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult>`.
+- Produces: `WHOLE_BODY_INDEX = -1`, `type RejectedEntry = { index: number; reason: string; snippet: string }`, `type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] }`, `type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number }`, `class PayloadTooLargeError` (size cap ONLY — a corrupt or truncated gzip stream becomes a whole-body reject, not a throw), `decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult>`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1022,7 +1023,7 @@ explicit length check, since timingSafeEqual throws on length mismatch."
 import { describe, expect, it } from 'vitest';
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
-import { decodeBody, PayloadTooLargeError } from '../../src/vercel/decode.js';
+import { decodeBody, PayloadTooLargeError, WHOLE_BODY_INDEX } from '../../src/vercel/decode.js';
 
 const gzipAsync = promisify(gzip);
 
@@ -1104,12 +1105,47 @@ describe('decodeBody', () => {
     expect(result.rejected).toEqual([]);
   });
 
-  it('reports a whole-body parse failure when a JSON array is malformed', async () => {
+  it('reports a whole-body parse failure with the whole-body sentinel index', async () => {
     const raw = Buffer.from('[{"id":"a"},', 'utf8');
     const result = await decodeBody(raw, options);
     expect(result.events).toEqual([]);
     expect(result.rejected).toHaveLength(1);
-    expect(result.rejected[0]?.index).toBe(0);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+  });
+
+  it('distinguishes a whole-body failure from a first-entry failure by index', async () => {
+    const wholeBody = await decodeBody(Buffer.from('[{"id":"a"},', 'utf8'), options);
+    const firstEntry = await decodeBody(
+      Buffer.from(JSON.stringify([{ id: 'no-required-fields' }, eventB]), 'utf8'),
+      options,
+    );
+    // Both are "the first thing went wrong", but they are not the same failure
+    // and a status-page consumer must be able to tell them apart.
+    expect(wholeBody.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+    expect(firstEntry.rejected[0]?.index).toBe(0);
+    expect(firstEntry.events.map((e) => e['id'])).toEqual(['b']);
+  });
+
+  it('reports a non-array JSON body with the whole-body sentinel index', async () => {
+    const result = await decodeBody(Buffer.from('{"not":"an array"}', 'utf8'), options);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+  });
+
+  it('reports a corrupt gzip body as a reject, not as PayloadTooLargeError', async () => {
+    const notGzip = Buffer.from('this is not gzip at all', 'utf8');
+    const result = await decodeBody(notGzip, { gzipped: true, maxDecompressedBytes: 1_000_000 });
+    expect(result.events).toEqual([]);
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
+    expect(result.rejected[0]?.reason).toMatch(/inflation failed/);
+  });
+
+  it('reports a truncated gzip stream as a reject, not as PayloadTooLargeError', async () => {
+    const full = await gzipAsync(Buffer.from(JSON.stringify([eventA]), 'utf8'));
+    const truncated = full.subarray(0, full.length - 4);
+    const result = await decodeBody(truncated, { gzipped: true, maxDecompressedBytes: 1_000_000 });
+    expect(result.rejected).toHaveLength(1);
+    expect(result.rejected[0]?.index).toBe(WHOLE_BODY_INDEX);
   });
 });
 ```
@@ -1134,6 +1170,15 @@ const gunzipAsync = promisify(gunzip);
 
 const SNIPPET_LIMIT = 200;
 
+/**
+ * Index used for a reject that describes the WHOLE body rather than one entry:
+ * a corrupt gzip stream, an unparseable JSON array, or a non-array body. A real
+ * per-entry failure always carries its own non-negative index, so a consumer
+ * can tell "nothing parsed" apart from "the first entry was invalid" — which a
+ * shared index of 0 could not express.
+ */
+export const WHOLE_BODY_INDEX = -1;
+
 export type RejectedEntry = { index: number; reason: string; snippet: string };
 export type DecodeResult = { events: LogEvent[]; rejected: RejectedEntry[] };
 export type DecodeOptions = { gzipped: boolean; maxDecompressedBytes: number };
@@ -1145,8 +1190,20 @@ export class PayloadTooLargeError extends Error {
   }
 }
 
+class CorruptBodyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CorruptBodyError';
+  }
+}
+
 function snippet(text: string): string {
   return text.length > SNIPPET_LIMIT ? `${text.slice(0, SNIPPET_LIMIT - 1)}…` : text;
+}
+
+function errorCode(error: Error): string | undefined {
+  const candidate: { code?: string } = error;
+  return candidate.code;
 }
 
 function validateEntry(candidate: unknown, index: number, into: DecodeResult): void {
@@ -1158,7 +1215,7 @@ function validateEntry(candidate: unknown, index: number, into: DecodeResult): v
   into.rejected.push({
     index,
     reason: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; '),
-    snippet: snippet(JSON.stringify(candidate) ?? String(candidate)),
+    snippet: snippet(JSON.stringify(candidate)),
   });
 }
 
@@ -1172,15 +1229,47 @@ async function inflate(raw: Buffer, options: DecodeOptions): Promise<Buffer> {
   try {
     return await gunzipAsync(raw, { maxOutputLength: options.maxDecompressedBytes });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new PayloadTooLargeError(`gzip inflation refused: ${message}`);
+    const failure = error instanceof Error ? error : new Error(String(error));
+    // zlib reports these distinctly, verified on Node 24:
+    //   cap exceeded  -> RangeError, code ERR_BUFFER_TOO_LARGE
+    //   not gzip      -> Error, code Z_DATA_ERROR ("incorrect header check")
+    //   truncated     -> Error, code Z_BUF_ERROR ("unexpected end of file")
+    // Collapsing all three into PayloadTooLargeError would report a corrupt
+    // body as an oversized one and mislead whoever reads the status page.
+    if (errorCode(failure) === 'ERR_BUFFER_TOO_LARGE') {
+      throw new PayloadTooLargeError(
+        `gzip inflation exceeded ${String(options.maxDecompressedBytes)} bytes`,
+      );
+    }
+    throw new CorruptBodyError(`gzip inflation failed: ${failure.message}`);
   }
 }
 
 export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<DecodeResult> {
-  const body = await inflate(raw, options);
-  const text = body.toString('utf8');
   const result: DecodeResult = { events: [], rejected: [] };
+
+  let body: Buffer;
+  try {
+    body = await inflate(raw, options);
+  } catch (error) {
+    // A corrupt body yields no events but is NOT an exception: nothing is
+    // salvageable, and the signature already proved these are the bytes Vercel
+    // sent, so redelivery would reproduce it byte for byte. Report it the same
+    // way an unparseable JSON array is reported — one whole-body reject — and
+    // let the caller answer 200 with a rejected count. PayloadTooLargeError
+    // still propagates, because that one the caller answers with 413.
+    if (error instanceof CorruptBodyError) {
+      result.rejected.push({
+        index: WHOLE_BODY_INDEX,
+        reason: error.message,
+        snippet: '',
+      });
+      return result;
+    }
+    throw error;
+  }
+
+  const text = body.toString('utf8');
 
   const firstNonSpace = text.search(/\S/);
   if (firstNonSpace === -1) return result;
@@ -1191,14 +1280,18 @@ export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<D
       entries = JSON.parse(text);
     } catch (error) {
       result.rejected.push({
-        index: 0,
+        index: WHOLE_BODY_INDEX,
         reason: error instanceof Error ? error.message : 'invalid JSON array',
         snippet: snippet(text),
       });
       return result;
     }
     if (!Array.isArray(entries)) {
-      result.rejected.push({ index: 0, reason: 'body is not an array', snippet: snippet(text) });
+      result.rejected.push({
+        index: WHOLE_BODY_INDEX,
+        reason: 'body is not an array',
+        snippet: snippet(text),
+      });
       return result;
     }
     entries.forEach((entry, index) => {
@@ -5987,7 +6080,8 @@ never from X-Forwarded-For, and an unresolvable peer is denied."
 - Test: `test/server/drain-route.test.ts`
 
 **Interfaces:**
-- Consumes: `verifySignature`, `decodeBody`, `PayloadTooLargeError`; `Dispatcher`; `Metrics`; `AppConfig`.
+- Consumes: `verifySignature`, `decodeBody`, `PayloadTooLargeError`, `WHOLE_BODY_INDEX`; `Dispatcher`; `Metrics`; `AppConfig`.
+- Note on `decodeBody`'s contract: it throws `PayloadTooLargeError` **only** for the size cap, which this route answers with `413`. A corrupt or truncated gzip body does NOT throw — it returns a `DecodeResult` carrying one reject at `WHOLE_BODY_INDEX`, so this route answers `200` with `rejected: 1`, exactly as it does for an unparseable JSON array. Do not add a second `catch` for corruption.
 - Produces: `type DrainDeps = { getConfig: () => AppConfig; dispatcher: Dispatcher; metrics: Metrics; log: Logger }`, `drainRoutes(deps: DrainDeps): Hono<AppEnv>`.
 
 - [ ] **Step 1: Write the failing test**
