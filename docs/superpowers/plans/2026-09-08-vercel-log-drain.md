@@ -1479,7 +1479,7 @@ git commit -m "feat: define the sink contract and delivery error classes"
 - Test: `test/sinks/file.test.ts`
 
 **Interfaces:**
-- Consumes: `Sink`, `SinkType`, `SinkContext`, `RetryableDeliveryError` from `src/sinks/types.ts`; `LogEvent` from `src/vercel/event.ts`.
+- Consumes: `Sink`, `SinkType`, `SinkContext` from `src/sinks/types.ts`; `LogEvent` from `src/vercel/event.ts`. (`RetryableDeliveryError` is consumed by Task 7, not here — this task throws no classified delivery errors. A raw fs `ErrnoException` from `open`/`write`/`mkdir` propagates unclassified, which the Task 17 worker treats as retryable, leaving the batch spooled. That is the intended safe default.)
 - Produces: `type FileSinkConfig`, `fileSinkConfigSchema`, `fileSinkType`, `utcDateKey(timestampMs: number): string`, `dailyFileName(prefix: string, timestampMs: number): string`, `groupByUtcDate(events: LogEvent[]): Map<string, LogEvent[]>`, `resolveLogsDirectory(candidate: string, logsRoot: string): string`.
 
 Retention and the free-space guard are Task 7; this task delivers writing.
@@ -1643,6 +1643,26 @@ describe('fileSinkType', () => {
     expect(first.trimEnd().split('\n')).toHaveLength(2);
   });
 
+  it('handles a single batch spanning more dates than the handle cache holds', async () => {
+    // Distinct from the test above: that one makes a separate deliver() call
+    // per date, so eviction happens BETWEEN calls. Here one batch spans five
+    // dates, so eviction happens mid-loop, inside a single deliver().
+    const sink = fileSinkType.create('local', config(), { log: silentLog });
+    const events = [0, 1, 2, 3, 4].map((offset) =>
+      event(`b${String(offset)}`, Date.UTC(2026, 5, 1 + offset)),
+    );
+    await sink.deliver(events);
+    await sink.close();
+
+    const files = (await readdir(dir)).toSorted();
+    expect(files).toHaveLength(5);
+    for (const [offset, name] of files.entries()) {
+      const contents = await readFile(join(dir, name), 'utf8');
+      expect(contents.trimEnd().split('\n')).toHaveLength(1);
+      expect(JSON.parse(contents.trimEnd())).toMatchObject({ id: `b${String(offset)}` });
+    }
+  });
+
   it('reports no warnings for a valid config', () => {
     expect(fileSinkType.warnings(config())).toEqual([]);
   });
@@ -1726,7 +1746,6 @@ export function resolveLogsDirectory(candidate: string, logsRoot: string): strin
 class FileSink implements Sink {
   readonly type = 'file';
   private readonly handles = new Map<string, FileHandle>();
-  private directoryReady = false;
 
   constructor(
     readonly name: string,
@@ -1734,10 +1753,16 @@ class FileSink implements Sink {
     private readonly ctx: SinkContext,
   ) {}
 
+  /**
+   * Called on every deliver, deliberately uncached. `mkdir` with `recursive`
+   * is idempotent and costs one syscall per coalesced batch, whereas caching a
+   * "directory exists" flag means that if the directory is removed externally
+   * — an operator cleaning up, a volume remount — every later write fails with
+   * ENOENT permanently, until the process restarts. That trades a negligible
+   * saving for an unrecoverable durability regression.
+   */
   private async ensureDirectory(): Promise<void> {
-    if (this.directoryReady) return;
     await mkdir(this.config.directory, { recursive: true });
-    this.directoryReady = true;
   }
 
   private async handleFor(dateKey: string): Promise<FileHandle> {
@@ -1759,9 +1784,21 @@ class FileSink implements Sink {
     while (this.handles.size > HANDLE_CACHE_LIMIT) {
       const oldest = this.handles.keys().next();
       if (oldest.done === true) break;
-      const evicted = this.handles.get(oldest.value);
-      this.handles.delete(oldest.value);
-      if (evicted !== undefined) await evicted.close();
+      const key = oldest.value;
+      const evicted = this.handles.get(key);
+      try {
+        if (evicted !== undefined) await evicted.close();
+      } catch (error) {
+        // A failed close must not fail the delivery that triggered eviction —
+        // the write we are here for would otherwise have succeeded.
+        const message = error instanceof Error ? error.message : String(error);
+        this.ctx.log.warn({ sink: this.name, err: message }, 'failed to close evicted handle');
+      } finally {
+        // Untrack in `finally`: closing first is what avoids leaking a
+        // descriptor, but the key must go regardless or a throwing close
+        // would spin this loop forever.
+        this.handles.delete(key);
+      }
     }
     return handle;
   }
