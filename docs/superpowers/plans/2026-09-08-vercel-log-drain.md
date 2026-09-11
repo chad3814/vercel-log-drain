@@ -3189,9 +3189,20 @@ export function warningsFor(config: AnySinkConfig): string[] {
 }
 ```
 
-The `switch` on the discriminant with no `default` is deliberate: adding a
-third sink type makes TypeScript report both functions as non-exhaustive, which
-is exactly the reminder a future implementer needs.
+Exhaustiveness is the point here: adding a third sink type must fail to
+compile. Two forms achieve that, and either is acceptable —
+
+- a bare `switch` with no `default`, which errors with
+  `TS2366: Function lacks ending return statement`; or
+- a trailing `const _: never = config; return _;` after the switch, which
+  errors with `Type 'X' is not assignable to type 'never'`.
+
+Both were verified to fail on a third variant. The second names the intent
+explicitly and gives the clearer message, at the cost of two lines that are
+unreachable at runtime. What is NOT acceptable is a `default` branch that
+throws a generic "unknown type" error without a `never` assignment: that
+silences the compile-time check entirely and defers a structural mistake to
+runtime.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
