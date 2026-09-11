@@ -40,13 +40,16 @@ export const sinkEntrySchema = z
     maxBatchBytes: z.number().int().min(1024),
     config: sinkConfigSchema,
   })
-  // An operator-sanity guard, NOT a correctness fix. `maxBatchBytes` bounds how
-  // much the worker coalesces per delivery, and the queue tolerates the
-  // mismatch either way: enqueue writes an over-budget batch regardless after
-  // draining to make room, and nextBatch always returns at least its first
-  // file. So this cannot deadlock. But a coalescing bound larger than the whole
-  // spool budget can never actually be reached, which is almost always a typo
-  // worth catching at save time rather than leaving to puzzle over later.
+  // Purpose: catch a typo. A coalescing bound larger than the whole spool
+  // budget can never actually be reached, so configuring one is almost always a
+  // mistake, and it is kinder to reject it at save time than to leave someone
+  // puzzling over why a setting appears to do nothing.
+  //
+  // This is NOT a correctness fix, and the distinction matters if you are
+  // tempted to lean on it: the queue tolerates the mismatch fine. `enqueue`
+  // writes an over-budget batch regardless, after draining to make room, and
+  // `nextBatch` always returns at least its first file. Do not re-derive a
+  // deadlock theory here and then weaken something else on the strength of it.
   .refine((entry) => entry.maxBatchBytes <= entry.maxSpoolBytes, {
     message: 'maxBatchBytes must not exceed maxSpoolBytes',
     path: ['maxBatchBytes'],
