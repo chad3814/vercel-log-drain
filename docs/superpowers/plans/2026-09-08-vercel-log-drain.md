@@ -20,6 +20,7 @@ Every task's requirements implicitly include this section.
 - **TypeScript:** `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes` all on. Module resolution `nodenext`; server imports use `.js` extensions for local files (compiled ESM output). **TypeScript 7 removed `baseUrl`** — never add it to either tsconfig; `paths` resolve relative to the declaring tsconfig instead.
 - **Lint with oxlint, not ESLint.** oxlint has no `typescript` peer dependency, which is what allows TypeScript 7 here: an ESLint setup would need `typescript-eslint`, whose `typescript@>=4.8.4 <6.1.0` peer makes `npm ci` fail with `ERESOLVE` against TypeScript 7. Do not reintroduce ESLint.
 - **Read a Node error's `code` with `in` narrowing**, never a weak-typed annotation or an assertion. `if ('code' in error && typeof error.code === 'string')` is the only form that satisfies both the compiler and the linter: `const c: { code?: string } = error;` fails `TS2559` because `Error` has no properties in common with that shape, and `error as { code?: string }` trips oxlint's `no-unsafe-type-assertion` for narrowing. Verified 2026-09-11.
+- **Never `String(x)` a `JsonValue`.** oxlint's type-aware `typescript/no-base-to-string` rejects it, because an object would stringify to `[object Object]`. Narrow first (`typeof x === 'string' ? x : …`) or use `JSON.stringify`. Verified 2026-09-11.
 - **Never write `JSON.parse(x) as T`.** oxlint's type-aware `typescript/no-unsafe-type-assertion` rejects asserting away `JSON.parse`'s `any`. Use an annotated assignment instead — `const value: T = JSON.parse(x);` — which is lint-clean AND type-checked. Do **not** simply drop the annotation (`const value = JSON.parse(x)`): that silences the rule by leaving an inferred `any`, which is the invisible form of the thing the project bans.
 - **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
@@ -3354,15 +3355,36 @@ describe('appConfigSchema', () => {
     expect(appConfigSchema.safeParse({ ...defaultAppConfig(), version: 2 }).success).toBe(false);
   });
 
-  it('rejects duplicate sink names, since the name is a directory', () => {
+  it('rejects duplicate sink names, and for that reason alone', () => {
     const config = { ...defaultAppConfig(), sinks: [validSink, { ...validSink }] };
-    expect(appConfigSchema.safeParse(config).success).toBe(false);
+
+    const result = appConfigSchema.safeParse(config);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    // `validSink` is otherwise valid, so the duplicate must be the sole issue.
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.message).toMatch(/sink names must be unique/);
   });
 
-  it('rejects duplicate drain ids', () => {
-    const drain = { id: 'd1', name: 'a', secret: 'x'.repeat(24), enabled: true, createdAt: 1 };
+  it('rejects duplicate drain ids, and for that reason alone', () => {
+    // The id must satisfy min(8) so the ONLY thing wrong with this config is
+    // the duplicate. With a short id the parse also fails on length, so the
+    // test would pass even with the uniqueness refine deleted — asserting
+    // `success === false` alone does not pin the property it names.
+    const drain = {
+      id: 'drain001',
+      name: 'a',
+      secret: 'x'.repeat(24),
+      enabled: true,
+      createdAt: 1,
+    };
     const config = { ...defaultAppConfig(), drains: [drain, { ...drain, name: 'b' }] };
-    expect(appConfigSchema.safeParse(config).success).toBe(false);
+
+    const result = appConfigSchema.safeParse(config);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.message).toMatch(/drain ids must be unique/);
   });
 
   it('rejects a drain secret that is too short to be meaningful', () => {
@@ -4207,7 +4229,7 @@ function configWithSecrets(): AppConfig {
   return {
     ...defaultAppConfig(),
     drains: [
-      { id: 'd1', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 },
+      { id: 'drain001', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 },
     ],
     sinks: [
       {
@@ -4280,7 +4302,7 @@ describe('restoreSecrets', () => {
     const current = configWithSecrets();
     const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
     incoming.drains.push({
-      id: 'd2',
+      id: 'drain002',
       name: 'new',
       secret: null,
       hasSecret: false,
@@ -4436,15 +4458,21 @@ function restoreSinkSecret(
   const existingAuth =
     existing !== undefined && existing.config.type === 'loki' ? existing.config.auth : null;
 
-  const field = auth['kind'] === 'basic' ? 'password' : auth['kind'] === 'bearer' ? 'token' : null;
+  // Narrow `kind` rather than stringifying it: oxlint's no-base-to-string
+  // rejects String() on a JsonValue, since an object would render as
+  // "[object Object]".
+  const kind = auth['kind'];
+  let field: 'password' | 'token' | null = null;
+  if (kind === 'basic') field = 'password';
+  else if (kind === 'bearer') field = 'token';
   if (field === null) return raw;
 
   const supplied = auth[field];
   if (typeof supplied === 'string' && supplied.length > 0) return raw;
 
-  if (existingAuth === null || existingAuth.kind !== auth['kind']) {
+  if (existingAuth === null || existingAuth.kind !== kind) {
     throw new SecretRestoreError(
-      `sink "${name}" uses ${String(auth['kind'])} auth and must be saved with its ${field}`,
+      `sink "${name}" uses ${kind} auth and must be saved with its ${field}`,
     );
   }
   const carried = existingAuth.kind === 'basic' ? existingAuth.password : existingAuth.token;
