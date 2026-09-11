@@ -150,6 +150,7 @@ export class ConfigStore {
   constructor(dir: string);
   load(): Promise<LoadedConfig>;
   save(config: AppConfig, expectedEtag: string | null): Promise<LoadedConfig>;
+  sweepStaleTemps(): Promise<void>;   // BOOT ONLY — see its doc comment
 }
 export function etagOf(config: AppConfig): string;
 
@@ -4007,7 +4008,6 @@ export class ConfigStore {
 
   async load(): Promise<LoadedConfig> {
     await mkdir(this.dir, { recursive: true });
-    await this.sweepStaleTemps();
 
     let text: string;
     try {
@@ -4062,20 +4062,31 @@ export class ConfigStore {
   private async writeAtomic(config: AppConfig): Promise<void> {
     await mkdir(this.dir, { recursive: true });
 
+    let backedUp = false;
     try {
       await copyFile(this.path, this.backupPath);
-      // Make the backup durable too. The design calls `.bak` the operator's
+      backedUp = true;
+    } catch (error) {
+      // ENOENT here means first run: there is no primary to back up yet.
+      if (!(error instanceof Error && isErrno(error, 'ENOENT'))) throw error;
+    }
+
+    if (backedUp) {
+      // Make the backup durable. The design calls `.bak` the operator's
       // recovery path, and without this its bytes can sit in the page cache
       // indefinitely — a later unrelated crash could lose the one copy someone
       // is told to restore from.
+      //
+      // Deliberately outside the catch above. An ENOENT from THIS open means
+      // "the backup we just wrote has vanished", which is nothing like "there
+      // was nothing to back up", and must not be silently swallowed as though
+      // it were.
       const backupHandle = await open(this.backupPath, 'r+');
       try {
         await backupHandle.sync();
       } finally {
         await backupHandle.close();
       }
-    } catch (error) {
-      if (!(error instanceof Error && isErrno(error, 'ENOENT'))) throw error;
     }
 
     const tmpPath = this.nextTmpPath();
@@ -4103,12 +4114,26 @@ export class ConfigStore {
   }
 
   /**
-   * Temp files are per-save and unique, so a crash mid-write leaves one behind
-   * forever. `load()` runs at boot, which is the natural place to clear them.
-   * A stray temp is harmless to correctness — `load()` only ever reads
-   * `config.json` — but they would accumulate on the config volume.
+   * Reaps temp files left by a crashed predecessor. Temp names are per-save and
+   * unique, so a crash mid-write strands one permanently; a stray temp is
+   * harmless to correctness (`load()` only ever reads `config.json`) but they
+   * would accumulate on the config volume.
+   *
+   * CALL THIS ONCE AT BOOT, before the server starts accepting requests, and
+   * nowhere else. It deliberately reaps temps from ANY pid, because the whole
+   * point is clearing a dead predecessor's litter — which means it cannot tell
+   * a dead temp from a live one. Calling it while any writer is between its
+   * `open` and its `rename` unlinks that writer's file and makes the rename
+   * fail with ENOENT.
+   *
+   * This used to be called from `load()`, which was wrong twice over: `load()`
+   * also runs inside every non-null-etag `save()`, and a second `ConfigStore`
+   * instance on the same directory calls it at will. Measured: a planted
+   * foreign-pid temp was deleted both by another instance's `load()` and by a
+   * `save()` in progress — reproducing the very ENOENT-on-rename failure the
+   * unique temp paths were introduced to eliminate.
    */
-  private async sweepStaleTemps(): Promise<void> {
+  async sweepStaleTemps(): Promise<void> {
     let entries: string[];
     try {
       entries = await readdir(this.dir);
@@ -7891,6 +7916,9 @@ export async function boot(options: BootOptions): Promise<Booted> {
 
   const metrics = new Metrics();
   const store = new ConfigStore(configDir);
+  // Once, before anything can write: reaps temp files stranded by a crashed
+  // predecessor. Safe only here — see the note on sweepStaleTemps.
+  await store.sweepStaleTemps();
   const loaded = await store.load();
 
   let config: AppConfig = loaded.config;
