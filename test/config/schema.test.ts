@@ -51,6 +51,35 @@ describe('sinkEntrySchema', () => {
     expect(sinkEntrySchema.safeParse({ ...validSink, name: '../etc' }).success).toBe(false);
   });
 
+  it('keeps an absent predicate distinct from an empty one', () => {
+    // Task 12's filter compiler reads absent as "match everything" and an empty
+    // array as "match nothing", so parsing must not collapse the two.
+    const absent = sinkEntrySchema.safeParse(validSink);
+    const empty = sinkEntrySchema.safeParse({ ...validSink, filter: { sources: [] } });
+    expect(absent.success && empty.success).toBe(true);
+    if (!absent.success || !empty.success) return;
+    expect(absent.data.filter.sources).toBeUndefined();
+    expect(empty.data.filter.sources).toEqual([]);
+  });
+
+  it('rejects a batch bound larger than the whole spool budget', () => {
+    const result = sinkEntrySchema.safeParse({
+      ...validSink,
+      maxSpoolBytes: 1_048_576,
+      maxBatchBytes: 100_000_000,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a batch bound equal to the spool budget', () => {
+    const result = sinkEntrySchema.safeParse({
+      ...validSink,
+      maxSpoolBytes: 4_194_304,
+      maxBatchBytes: 4_194_304,
+    });
+    expect(result.success).toBe(true);
+  });
+
   it('accepts a filter with all predicates', () => {
     const result = sinkEntrySchema.safeParse({
       ...validSink,

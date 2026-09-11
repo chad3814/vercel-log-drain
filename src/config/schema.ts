@@ -30,15 +30,27 @@ export const drainEntrySchema = z.object({
 
 export type DrainEntry = z.infer<typeof drainEntrySchema>;
 
-export const sinkEntrySchema = z.object({
-  name: z.string().regex(SINK_NAME_PATTERN, 'sink name must match ^[a-z0-9][a-z0-9-]{0,63}$'),
-  enabled: z.boolean(),
-  filter: sinkFilterSchema,
-  maxSpoolBytes: z.number().int().min(1_048_576),
-  maxBatchEvents: z.number().int().min(1).max(100_000),
-  maxBatchBytes: z.number().int().min(1024),
-  config: sinkConfigSchema,
-});
+export const sinkEntrySchema = z
+  .object({
+    name: z.string().regex(SINK_NAME_PATTERN, 'sink name must match ^[a-z0-9][a-z0-9-]{0,63}$'),
+    enabled: z.boolean(),
+    filter: sinkFilterSchema,
+    maxSpoolBytes: z.number().int().min(1_048_576),
+    maxBatchEvents: z.number().int().min(1).max(100_000),
+    maxBatchBytes: z.number().int().min(1024),
+    config: sinkConfigSchema,
+  })
+  // An operator-sanity guard, NOT a correctness fix. `maxBatchBytes` bounds how
+  // much the worker coalesces per delivery, and the queue tolerates the
+  // mismatch either way: enqueue writes an over-budget batch regardless after
+  // draining to make room, and nextBatch always returns at least its first
+  // file. So this cannot deadlock. But a coalescing bound larger than the whole
+  // spool budget can never actually be reached, which is almost always a typo
+  // worth catching at save time rather than leaving to puzzle over later.
+  .refine((entry) => entry.maxBatchBytes <= entry.maxSpoolBytes, {
+    message: 'maxBatchBytes must not exceed maxSpoolBytes',
+    path: ['maxBatchBytes'],
+  });
 
 export type SinkEntry = z.infer<typeof sinkEntrySchema>;
 
