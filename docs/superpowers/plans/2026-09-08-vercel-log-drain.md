@@ -2815,6 +2815,34 @@ describe('loki sink delivery', () => {
     await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
   });
 
+  it('does not hang when the server stalls the response body', async () => {
+    // Headers arrive at once; the body never completes. The abort must still
+    // bound the exchange, or a sink's sequential worker stops forever.
+    const stalling = createServer((req, res) => {
+      req.on('data', () => undefined);
+      req.on('end', () => {
+        res.writeHead(500, { 'content-type': 'text/plain', 'content-length': '100' });
+        res.write('partial');
+        // deliberately never res.end()
+      });
+    });
+    server = stalling;
+    await new Promise<void>((resolve) => stalling.listen(0, '127.0.0.1', resolve));
+    const address = stalling.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    const sink = lokiSinkType.create(
+      'loki',
+      config(`http://127.0.0.1:${String(port)}`, { timeoutMs: 200 }),
+      { log: silentLog },
+    );
+
+    const started = Date.now();
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+    // Generous bound: the point is that it returns at all, not the exact timing.
+    expect(Date.now() - started).toBeLessThan(3000);
+  }, 10_000);
+
   it('does not call the server for an empty batch', async () => {
     const captured: Captured[] = [];
     const url = await startServer(204, '', captured);
@@ -2944,39 +2972,57 @@ class LokiSink implements Sink {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
 
-    let response: Response;
+    // The timer stays armed for the WHOLE exchange, headers and body alike.
+    // Clearing it as soon as fetch() resolves would leave the body read
+    // unprotected: a server that returns a status promptly and then stalls the
+    // body would hang deliver() forever, with no timer left to recover it.
+    // Measured: with timeoutMs 300 and a stalled body, deliver() was still
+    // pending after 3s. Because a sink's worker is sequential, that halts the
+    // sink entirely until the spool budget starts dropping data.
     try {
-      response = await fetch(this.pushUrl, {
-        method: 'POST',
-        headers: this.headers(),
-        body,
-        signal: controller.signal,
-      });
-    } catch (error) {
-      const cause = error instanceof Error ? error : new Error(String(error));
-      throw new RetryableDeliveryError(`loki push to ${this.pushUrl} failed: ${cause.message}`, cause);
+      let response: Response;
+      try {
+        response = await fetch(this.pushUrl, {
+          method: 'POST',
+          headers: this.headers(),
+          body,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        const cause = error instanceof Error ? error : new Error(String(error));
+        throw new RetryableDeliveryError(
+          `loki push to ${this.pushUrl} failed: ${cause.message}`,
+          cause,
+        );
+      }
+
+      const classification = classifyLokiStatus(response.status);
+      if (classification === 'ok') {
+        // Release the socket back to undici's pool. An unconsumed body on the
+        // success path — the common path — holds a connection per delivery.
+        await response.body?.cancel().catch(() => undefined);
+        this.ctx.log.debug({ sink: this.name, count: events.length }, 'loki push accepted');
+        return;
+      }
+
+      // Still inside the armed timer: if the body stalls, the abort rejects
+      // this read, the catch yields an empty detail, and we go on to throw the
+      // correct classification error rather than hanging.
+      const detail = (await response.text().catch(() => '')).slice(0, DETAIL_LIMIT);
+      const summary = `loki responded ${String(response.status)}: ${detail}`;
+
+      if (classification === 'permanent') {
+        throw new PermanentDeliveryError(
+          `${summary} — batch cannot be accepted as-is; dead-lettering. If this is 413, lower the sink's maxBatchBytes.`,
+        );
+      }
+      if (classification === 'auth') {
+        throw new AuthDeliveryError(`${summary} — check the sink's credentials and URL`);
+      }
+      throw new RetryableDeliveryError(summary);
     } finally {
       clearTimeout(timer);
     }
-
-    const classification = classifyLokiStatus(response.status);
-    if (classification === 'ok') {
-      this.ctx.log.debug({ sink: this.name, count: events.length }, 'loki push accepted');
-      return;
-    }
-
-    const detail = (await response.text().catch(() => '')).slice(0, DETAIL_LIMIT);
-    const summary = `loki responded ${String(response.status)}: ${detail}`;
-
-    if (classification === 'permanent') {
-      throw new PermanentDeliveryError(
-        `${summary} — batch cannot be accepted as-is; dead-lettering. If this is 413, lower the sink's maxBatchBytes.`,
-      );
-    }
-    if (classification === 'auth') {
-      throw new AuthDeliveryError(`${summary} — check the sink's credentials and URL`);
-    }
-    throw new RetryableDeliveryError(summary);
   }
 
   close(): Promise<void> {
