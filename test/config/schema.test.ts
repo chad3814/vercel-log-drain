@@ -109,15 +109,36 @@ describe('appConfigSchema', () => {
     expect(appConfigSchema.safeParse({ ...defaultAppConfig(), version: 2 }).success).toBe(false);
   });
 
-  it('rejects duplicate sink names, since the name is a directory', () => {
+  it('rejects duplicate sink names, and for that reason alone', () => {
     const config = { ...defaultAppConfig(), sinks: [validSink, { ...validSink }] };
-    expect(appConfigSchema.safeParse(config).success).toBe(false);
+
+    const result = appConfigSchema.safeParse(config);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    // `validSink` is otherwise valid, so the duplicate must be the sole issue.
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.message).toMatch(/sink names must be unique/);
   });
 
-  it('rejects duplicate drain ids', () => {
-    const drain = { id: 'd1', name: 'a', secret: 'x'.repeat(24), enabled: true, createdAt: 1 };
+  it('rejects duplicate drain ids, and for that reason alone', () => {
+    // The id must satisfy min(8) so the ONLY thing wrong with this config is
+    // the duplicate. With a short id the parse also fails on length, so the
+    // test would pass even with the uniqueness refine deleted — asserting
+    // `success === false` alone does not pin the property it names.
+    const drain = {
+      id: 'drain001',
+      name: 'a',
+      secret: 'x'.repeat(24),
+      enabled: true,
+      createdAt: 1,
+    };
     const config = { ...defaultAppConfig(), drains: [drain, { ...drain, name: 'b' }] };
-    expect(appConfigSchema.safeParse(config).success).toBe(false);
+
+    const result = appConfigSchema.safeParse(config);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.message).toMatch(/drain ids must be unique/);
   });
 
   it('rejects a drain secret that is too short to be meaningful', () => {

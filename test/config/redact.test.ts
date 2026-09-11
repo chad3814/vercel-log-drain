@@ -76,6 +76,49 @@ describe('restoreSecrets', () => {
     expect(restored.drains[0]?.secret).toBe('y'.repeat(32));
   });
 
+  it('replaces a loki password when a new one is supplied', () => {
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    incoming.sinks[0].config.auth.password = 'replacement-pw';
+    const restored = restoreSecrets(incoming, current);
+    const auth = restored.sinks[0]?.config;
+    expect(auth?.type === 'loki' && auth.auth.kind === 'basic' && auth.auth.password).toBe(
+      'replacement-pw',
+    );
+  });
+
+  it('round-trips a bearer token unchanged', () => {
+    const current: AppConfig = {
+      ...configWithSecrets(),
+      sinks: [
+        {
+          ...configWithSecrets().sinks[0]!,
+          name: 'loki-bearer',
+          config: {
+            type: 'loki',
+            url: 'http://loki:3100',
+            auth: { kind: 'bearer', token: 'tok-abcdefghij' },
+            tenantId: null,
+            labels: { static: {}, fromFields: [] },
+            timeoutMs: 5000,
+          },
+        },
+      ],
+    };
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    expect(JSON.stringify(incoming)).not.toContain('tok-abcdefghij');
+    expect(restoreSecrets(incoming, current)).toEqual(current);
+  });
+
+  it('requires a fresh secret when the auth kind changes', () => {
+    // basic -> bearer is a different credential entirely; there is no stored
+    // token to carry forward, so the caller must supply one.
+    const current = configWithSecrets();
+    const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
+    incoming.sinks[0].config.auth = { kind: 'bearer', token: '' };
+    expect(() => restoreSecrets(incoming, current)).toThrow(SecretRestoreError);
+  });
+
   it('fails when a brand-new drain arrives with no secret', () => {
     const current = configWithSecrets();
     const incoming = JSON.parse(JSON.stringify(redactConfig(current)));
