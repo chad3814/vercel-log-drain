@@ -16,6 +16,19 @@ describe('Metrics', () => {
     expect(drain?.requests).toMatchObject({ ok: 2, badSignature: 1 });
   });
 
+  it('aggregates unknown-drain requests without creating a map entry each', () => {
+    // The drain id comes from the request path, so a per-id counter would let
+    // anyone grow this map without bound.
+    const metrics = new Metrics();
+    for (let index = 0; index < 5000; index += 1) {
+      metrics.recordUnknownDrainRequest();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.unknownDrainRequests).toBe(5000);
+    expect(snapshot.drains).toHaveLength(0);
+  });
+
   it('tracks events received and the latest event timestamp', () => {
     const metrics = new Metrics();
     metrics.recordEventsReceived('d1', 3, 5000);

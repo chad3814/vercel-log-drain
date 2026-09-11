@@ -15,6 +15,7 @@ const RECENT_RECORD_LIMIT = 100;
 export type MetricsSnapshot = {
   uptimeSec: number;
   startedAt: number;
+  unknownDrainRequests: number;
   drains: {
     id: string;
     eventsReceived: number;
@@ -38,7 +39,7 @@ export function initialSinkHealth(): SinkHealth {
 }
 
 function emptyRequestCounters(): DrainRequestCounters {
-  return { ok: 0, badSignature: 0, notFound: 0, disabled: 0, malformedBody: 0 };
+  return { ok: 0, badSignature: 0, disabled: 0, malformedBody: 0 };
 }
 
 function pushBounded<T>(buffer: T[], items: T[], limit: number): void {
@@ -54,6 +55,7 @@ type DrainCounters = {
 
 export class Metrics {
   private readonly startedAt = Date.now();
+  private unknownDrainRequests = 0;
   private readonly drains = new Map<string, DrainCounters>();
   private readonly sinkCounters = new Map<string, SinkCounters>();
   private readonly sinkHealth = new Map<string, SinkHealth>();
@@ -83,6 +85,18 @@ export class Metrics {
 
   recordDrainRequest(drainId: string, outcome: DrainOutcome): void {
     this.drainCounters(drainId).requests[outcome] += 1;
+  }
+
+  /**
+   * A request for a drain id that is not configured. Counted in aggregate, not
+   * per id: the id comes straight from the request path, so a per-id counter
+   * would let anyone grow this map without bound by inventing ids — and the
+   * status page lists drains from the config, so such an entry would never be
+   * shown. Measured before this was separated: 5000 invented ids produced 5000
+   * permanent map entries, none of them displayable.
+   */
+  recordUnknownDrainRequest(): void {
+    this.unknownDrainRequests += 1;
   }
 
   recordEventsReceived(drainId: string, count: number, latestTimestampMs: number): void {
@@ -138,6 +152,7 @@ export class Metrics {
     return {
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       startedAt: this.startedAt,
+      unknownDrainRequests: this.unknownDrainRequests,
       drains: [...this.drains.entries()].map(([id, counters]) => ({ id, ...counters })),
       sinkCounters: Object.fromEntries(this.sinkCounters),
       sinkHealth: Object.fromEntries(this.sinkHealth),
