@@ -165,11 +165,19 @@ export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConf
 // types/api.ts (created in Task 15) — these are declared there, NOT in
 // src/status/metrics.ts, so the SPA can import them without pulling in zod.
 // metrics.ts imports them from types/api.ts and re-exports nothing.
-export type DrainOutcome = 'ok' | 'badSignature' | 'notFound' | 'disabled' | 'malformedBody';
+/**
+ * Outcomes attributable to a KNOWN drain. `notFound` is deliberately absent: a
+ * request for an id that is not in the config belongs to no drain, so counting
+ * it per-id would create a permanent map entry for every id an attacker
+ * invents, and the status page — which lists drains from the config — would
+ * never display it. Those are aggregated into `unknownDrainRequests` instead.
+ */
+export type DrainOutcome = 'ok' | 'badSignature' | 'disabled' | 'malformedBody';
 export type SinkHealthState = 'ok' | 'retrying' | 'failed';
 export type SinkHealth = { state: SinkHealthState; consecutiveFailures: number; lastError: string | null; lastErrorAt: number | null; lastSuccessAt: number | null; nextRetryAt: number | null };
 export class Metrics {
   recordDrainRequest(drainId: string, outcome: DrainOutcome): void;
+  recordUnknownDrainRequest(): void;
   recordEventsReceived(drainId: string, count: number, latestTimestampMs: number): void;
   recordRejected(drainId: string, entries: RejectedEntry[]): void;
   recordDelivered(sinkName: string, count: number): void;
@@ -4542,6 +4550,19 @@ describe('Metrics', () => {
     expect(drain?.requests).toMatchObject({ ok: 2, badSignature: 1 });
   });
 
+  it('aggregates unknown-drain requests without creating a map entry each', () => {
+    // The drain id comes from the request path, so a per-id counter would let
+    // anyone grow this map without bound.
+    const metrics = new Metrics();
+    for (let index = 0; index < 5000; index += 1) {
+      metrics.recordUnknownDrainRequest();
+    }
+
+    const snapshot = metrics.snapshot();
+    expect(snapshot.unknownDrainRequests).toBe(5000);
+    expect(snapshot.drains).toHaveLength(0);
+  });
+
   it('tracks events received and the latest event timestamp', () => {
     const metrics = new Metrics();
     metrics.recordEventsReceived('d1', 3, 5000);
@@ -4626,7 +4647,7 @@ Expected: FAIL — module not found.
 - [ ] **Step 3: Create `types/api.ts`**
 
 ```ts
-export type DrainOutcome = 'ok' | 'badSignature' | 'notFound' | 'disabled' | 'malformedBody';
+export type DrainOutcome = 'ok' | 'badSignature' | 'disabled' | 'malformedBody';  // notFound is aggregated, not per-drain
 
 export type SinkHealthState = 'ok' | 'retrying' | 'failed';
 
@@ -4642,7 +4663,6 @@ export type SinkHealth = {
 export type DrainRequestCounters = {
   ok: number;
   badSignature: number;
-  notFound: number;
   disabled: number;
   malformedBody: number;
 };
@@ -4676,11 +4696,31 @@ export type RejectRecord = { drainId: string; index: number; reason: string; sni
 export type ErrorRecord = { scope: string; message: string; at: number };
 
 export type StatusSnapshot = {
-  service: { state: 'ok' | 'degraded'; uptimeSec: number; version: string; startedAt: number };
+  service: {
+    state: 'ok' | 'degraded';
+    uptimeSec: number;
+    version: string;
+    startedAt: number;
+    /**
+     * Requests to a drain id that is not configured, aggregated rather than
+     * counted per id. A non-zero and climbing value means something is probing
+     * the endpoint, or a drain was deleted while Vercel still has its URL.
+     */
+    unknownDrainRequests: number;
+  };
   volumes: { config: VolumeStatus; spool: VolumeStatus };
   drains: DrainStatus[];
   sinks: SinkStatus[];
   orphanedSpools: OrphanedSpool[];
+  /**
+   * `events` is `unknown[]` on purpose. It is opaque JSON forwarded to the
+   * browser for display and never inspected by type-dependent logic.
+   *
+   * Do NOT "improve" this to `JsonValue[]`: that needs an import, and this
+   * file must stay import-free so the Node server and the Vite browser bundle
+   * can both consume it without module-resolution friction. Typing it costs
+   * the shared contract and buys nothing, since nothing here reads the values.
+   */
   recent: { events: unknown[]; rejects: RejectRecord[]; errors: ErrorRecord[] };
 };
 ```
@@ -4719,6 +4759,7 @@ const RECENT_RECORD_LIMIT = 100;
 export type MetricsSnapshot = {
   uptimeSec: number;
   startedAt: number;
+  unknownDrainRequests: number;
   drains: {
     id: string;
     eventsReceived: number;
@@ -4742,7 +4783,7 @@ export function initialSinkHealth(): SinkHealth {
 }
 
 function emptyRequestCounters(): DrainRequestCounters {
-  return { ok: 0, badSignature: 0, notFound: 0, disabled: 0, malformedBody: 0 };
+  return { ok: 0, badSignature: 0, disabled: 0, malformedBody: 0 };
 }
 
 function pushBounded<T>(buffer: T[], items: T[], limit: number): void {
@@ -4758,6 +4799,7 @@ type DrainCounters = {
 
 export class Metrics {
   private readonly startedAt = Date.now();
+  private unknownDrainRequests = 0;
   private readonly drains = new Map<string, DrainCounters>();
   private readonly sinkCounters = new Map<string, SinkCounters>();
   private readonly sinkHealth = new Map<string, SinkHealth>();
@@ -4787,6 +4829,18 @@ export class Metrics {
 
   recordDrainRequest(drainId: string, outcome: DrainOutcome): void {
     this.drainCounters(drainId).requests[outcome] += 1;
+  }
+
+  /**
+   * A request for a drain id that is not configured. Counted in aggregate, not
+   * per id: the id comes straight from the request path, so a per-id counter
+   * would let anyone grow this map without bound by inventing ids — and the
+   * status page lists drains from the config, so such an entry would never be
+   * shown. Measured before this was separated: 5000 invented ids produced 5000
+   * permanent map entries, none of them displayable.
+   */
+  recordUnknownDrainRequest(): void {
+    this.unknownDrainRequests += 1;
   }
 
   recordEventsReceived(drainId: string, count: number, latestTimestampMs: number): void {
@@ -4842,6 +4896,7 @@ export class Metrics {
     return {
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       startedAt: this.startedAt,
+      unknownDrainRequests: this.unknownDrainRequests,
       drains: [...this.drains.entries()].map(([id, counters]) => ({ id, ...counters })),
       sinkCounters: Object.fromEntries(this.sinkCounters),
       sinkHealth: Object.fromEntries(this.sinkHealth),
@@ -6844,7 +6899,8 @@ export function drainRoutes(deps: DrainDeps): Hono<AppEnv> {
     const drain = config.drains.find((entry) => entry.id === drainId);
 
     if (drain === undefined) {
-      deps.metrics.recordDrainRequest(drainId, 'notFound');
+      // Aggregate, not per-id: this id is attacker-supplied.
+      deps.metrics.recordUnknownDrainRequest();
       return c.json({ code: 'unknown_drain' }, 404);
     }
     if (!drain.enabled) {
@@ -7138,6 +7194,7 @@ export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
         uptimeSec: metrics.uptimeSec,
         version: deps.version,
         startedAt: metrics.startedAt,
+        unknownDrainRequests: metrics.unknownDrainRequests,
       },
       volumes: {
         config: await volumeStatus(deps.configDir),
@@ -7154,7 +7211,6 @@ export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
           requests: counters?.requests ?? {
             ok: 0,
             badSignature: 0,
-            notFound: 0,
             disabled: 0,
             malformedBody: 0,
           },
