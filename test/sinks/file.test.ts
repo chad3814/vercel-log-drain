@@ -172,20 +172,23 @@ describe('fileSinkType', () => {
     }
   });
 
-  it('recreates the directory if it is removed between deliveries', async () => {
+  it('recreates the directory if it is removed mid-life of the same sink', async () => {
+    // The failure this guards against is process-scoped: a cached
+    // "directory exists" flag on a LIVE instance. A test that builds a fresh
+    // sink after the removal cannot reproduce it, because a new instance has
+    // a fresh flag — it must be the same instance, and it must write to a NEW
+    // date so no cached handle masks the missing directory. Verified: against
+    // a cached-flag implementation this fails with ENOENT.
     const sink = fileSinkType.create('local', config(), { log: silentLog });
-    await sink.deliver([event('first', beforeMidnight)]);
-    await sink.close();
+    await sink.deliver([event('before', Date.UTC(2026, 2, 1))]);
 
-    // Simulate an operator cleanup or a volume remount.
     await rm(dir, { recursive: true, force: true });
 
-    const revived = fileSinkType.create('local', config(), { log: silentLog });
-    await revived.deliver([event('second', beforeMidnight)]);
-    await revived.close();
+    await sink.deliver([event('after', Date.UTC(2026, 2, 2))]);
+    await sink.close();
 
-    const contents = await readFile(join(dir, 'events-2019-11-15.jsonl'), 'utf8');
-    expect(JSON.parse(contents.trimEnd())).toMatchObject({ id: 'second' });
+    const contents = await readFile(join(dir, 'events-2026-03-02.jsonl'), 'utf8');
+    expect(JSON.parse(contents.trimEnd())).toMatchObject({ id: 'after' });
   });
 
   it('reports no warnings for a valid config', () => {
