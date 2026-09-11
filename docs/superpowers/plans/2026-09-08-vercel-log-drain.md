@@ -317,7 +317,7 @@ rules; its version tracks the TypeScript 7 native compiler.
 {
   "scripts": {
     "lint": "oxlint --type-aware",
-    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "npm run build:server && npm run build:web",
@@ -655,9 +655,13 @@ Expected: PASS, 4 tests.
 - [ ] **Step 8: Run all gates**
 
 Run: `npm run lint && npm run typecheck && npm test`
-Expected: all pass. `npm run typecheck` will fail on `web/tsconfig.json` until
-`web/src` exists — create `web/src/placeholder.ts` containing
-`export const placeholder = true;` to satisfy it, and delete it in Task 25.
+Expected: all pass.
+
+Note that `typecheck` deliberately covers the server project only. `web/src`
+has no files until Task 25, and `tsc` errors with "No inputs were found" on an
+empty project. Task 25 extends the script to add `web/tsconfig.json` at the
+point where there is web code to check. Do **not** create a placeholder file to
+work around this.
 
 - [ ] **Step 9: Commit**
 
@@ -1611,7 +1615,6 @@ class FileSink implements Sink {
   async deliver(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
     await this.ensureDirectory();
-    await this.preflight(events);
 
     for (const [dateKey, batch] of groupByUtcDate(events)) {
       const handle = await this.handleFor(dateKey);
@@ -1620,11 +1623,6 @@ class FileSink implements Sink {
       await handle.sync();
     }
     this.ctx.log.debug({ sink: this.name, count: events.length }, 'file sink wrote batch');
-  }
-
-  // Overridden in Task 7 to add the free-space guard.
-  protected async preflight(_events: LogEvent[]): Promise<void> {
-    return Promise.resolve();
   }
 
   async close(): Promise<void> {
@@ -1668,12 +1666,13 @@ resolving is what deletes the spool copy."
 ### Task 7: File sink — retention, free space, and containment
 
 **Files:**
+- Modify: `src/sinks/types.ts` (add `FreeSpaceProbe`, extend `SinkContext`)
 - Modify: `src/sinks/file.ts`
 - Test: `test/sinks/file-retention.test.ts`
 
 **Interfaces:**
 - Consumes: everything from Task 6.
-- Produces: `pruneRetention(dir: string, prefix: string, retentionDays: number, nowMs: number): Promise<string[]>` (returns the deleted filenames); `FileSinkConfig` gains no new fields; `fileSinkType.create` now enforces the free-space floor and starts an hourly pruner.
+- Produces: in `src/sinks/types.ts` — `type FreeSpaceProbe = (path: string) => Promise<number>` and `SinkContext.freeSpace?: FreeSpaceProbe`. In `src/sinks/file.ts` — `statfsFreeSpace: FreeSpaceProbe`, `pruneRetention(dir: string, prefix: string, retentionDays: number, nowMs: number): Promise<string[]>` (returns the deleted filenames); `FileSinkConfig` gains no new fields; `fileSinkType.create` now enforces the free-space floor and starts an hourly pruner.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1823,7 +1822,7 @@ export interface SinkContext {
 
 - [ ] **Step 4: Implement retention and the guard in `src/sinks/file.ts`**
 
-Add these imports and exports, and replace the `preflight` stub:
+Add these imports and exports:
 
 ```ts
 import { readdir, statfs, unlink } from 'node:fs/promises';
@@ -1871,8 +1870,8 @@ export async function pruneRetention(
 }
 ```
 
-In `FileSink`, replace the `preflight` stub with a real guard, add a pruner
-timer, and clear it on close:
+In `FileSink`, add the free-space guard, a pruner timer, and clear the timer on
+close:
 
 ```ts
   private pruneTimer: NodeJS.Timeout | null = null;
@@ -1907,7 +1906,7 @@ timer, and clear it on close:
     }
   }
 
-  protected async preflight(_events: LogEvent[]): Promise<void> {
+  private async assertSpaceAvailable(): Promise<void> {
     if (this.config.freeSpaceFloorBytes <= 0) return;
     const available = await this.freeSpace(this.config.directory);
     if (available < this.config.freeSpaceFloorBytes) {
@@ -1918,15 +1917,15 @@ timer, and clear it on close:
   }
 ```
 
-The guard runs *before* `ensureDirectory` creates anything, so a blocked
-delivery leaves no trace. Update `deliver()` to call `preflight` first:
+Then insert the guard at the top of `deliver()`, *before* `ensureDirectory`, so
+a blocked delivery leaves nothing behind:
 
 ```ts
   async deliver(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
-    await this.preflight(events);
+    await this.assertSpaceAvailable();
     await this.ensureDirectory();
-    // ...unchanged from Task 6
+    // ...remainder unchanged from Task 6
   }
 ```
 
@@ -7679,7 +7678,7 @@ arrives exactly once with nothing dead-lettered."
 - Create: `web/index.html`, `web/src/main.tsx`, `web/src/App.tsx`, `web/src/api.ts`, `web/src/styles.css`, `web/src/views/Status.tsx`
 - Create: `src/config/api-contract.ts`
 - Modify: `types/api.ts` (add the config DTOs the SPA consumes)
-- Delete: `web/src/placeholder.ts`
+- Modify: `package.json` (typecheck script now covers the web project)
 - Test: `test/config/api-contract.test.ts`
 
 **Interfaces:**
@@ -7958,19 +7957,16 @@ createRoot(container).render(
 
 `web/src/App.tsx`:
 
+Task 26 adds the Drains and Sinks tabs to this file. For now it carries the
+Status tab alone, so nothing references a component that does not exist.
+
 ```tsx
 import { useState } from 'react';
 import { Status } from './views/Status.tsx';
-import { Drains } from './views/Drains.tsx';
-import { Sinks } from './views/Sinks.tsx';
 
-type Tab = 'status' | 'drains' | 'sinks';
+type Tab = 'status';
 
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'status', label: 'Status' },
-  { id: 'drains', label: 'Drains' },
-  { id: 'sinks', label: 'Sinks' },
-];
+const TABS: { id: Tab; label: string }[] = [{ id: 'status', label: 'Status' }];
 
 export function App(): React.JSX.Element {
   const [tab, setTab] = useState<Tab>('status');
@@ -7991,8 +7987,6 @@ export function App(): React.JSX.Element {
         ))}
       </nav>
       {tab === 'status' ? <Status /> : null}
-      {tab === 'drains' ? <Drains /> : null}
-      {tab === 'sinks' ? <Sinks /> : null}
     </main>
   );
 }
@@ -8206,24 +8200,26 @@ export function Status(): React.JSX.Element {
 }
 ```
 
-- [ ] **Step 8: Delete the placeholder and verify the build**
+- [ ] **Step 8: Extend the typecheck script to cover the web project**
+
+`web/src` now has real files, so add it:
 
 ```bash
-rm web/src/placeholder.ts
+npm pkg set scripts.typecheck="tsc -p tsconfig.json && tsc -p web/tsconfig.json"
+```
+
+- [ ] **Step 9: Verify the build**
+
+```bash
 npm run lint && npm run typecheck && npm test && npm run build:web
 ```
 
-`npm run build:web` must produce `web/dist/index.html`. Note that `Drains.tsx`
-and `Sinks.tsx` do not exist yet, so create them as temporary stubs to make the
-build pass, and fill them in during Task 26:
+`npm run build:web` must produce `web/dist/index.html`.
 
-```tsx
-export function Drains(): React.JSX.Element {
-  return <p className="muted">Not implemented yet.</p>;
-}
-```
-
-(Do the same for `Sinks`.)
+`Drains.tsx` and `Sinks.tsx` do not exist yet and **must not be created as
+stubs** — this task's `App.tsx` wires only the Status tab, and Task 26 adds the
+other two tabs together with their views. Nothing is committed in a
+placeholder state.
 
 - [ ] **Step 9: Commit**
 
@@ -8241,14 +8237,42 @@ stay assignable from the zod-inferred server types."
 ### Task 26: Drains and Sinks views
 
 **Files:**
-- Create (replacing the stubs): `web/src/views/Drains.tsx`, `web/src/views/Sinks.tsx`
+- Create: `web/src/views/Drains.tsx`, `web/src/views/Sinks.tsx`
 - Create: `web/src/useConfig.ts`
+- Modify: `web/src/App.tsx` (add the Drains and Sinks tabs)
 
 **Interfaces:**
 - Consumes: `fetchConfig`, `saveConfig`, `createDrain`, `testSink`, `ApiError` from `web/src/api.ts`; the DTOs from `@shared/api`.
 - Produces: `useConfig()` hook returning `{ config, etag, warnings, error, notice, reload, save, mutate }`.
 
-- [ ] **Step 1: Implement `web/src/useConfig.ts`**
+- [ ] **Step 1: Add the two tabs to `web/src/App.tsx`**
+
+Task 25 left this file with a single Status tab. Widen it:
+
+```tsx
+import { useState } from 'react';
+import { Status } from './views/Status.tsx';
+import { Drains } from './views/Drains.tsx';
+import { Sinks } from './views/Sinks.tsx';
+
+type Tab = 'status' | 'drains' | 'sinks';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'status', label: 'Status' },
+  { id: 'drains', label: 'Drains' },
+  { id: 'sinks', label: 'Sinks' },
+];
+```
+
+and render them alongside Status:
+
+```tsx
+      {tab === 'status' ? <Status /> : null}
+      {tab === 'drains' ? <Drains /> : null}
+      {tab === 'sinks' ? <Sinks /> : null}
+```
+
+- [ ] **Step 2: Implement `web/src/useConfig.ts`**
 
 ```tsx
 import { useCallback, useEffect, useState } from 'react';
@@ -8311,7 +8335,7 @@ export function useConfig(): UseConfig {
 }
 ```
 
-- [ ] **Step 2: Implement `web/src/views/Drains.tsx`**
+- [ ] **Step 5: Implement `web/src/views/Drains.tsx`**
 
 The created secret is shown once, in a dismissible panel, because the API will
 never return it again.
@@ -8858,7 +8882,7 @@ export function Sinks(): React.JSX.Element {
 }
 ```
 
-- [ ] **Step 4: Verify and commit**
+- [ ] **Step 5: Verify and commit**
 
 ```bash
 npm run lint && npm run typecheck && npm test && npm run build:web
