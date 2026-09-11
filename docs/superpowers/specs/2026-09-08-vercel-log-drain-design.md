@@ -652,6 +652,13 @@ the documented exceptions.
 
 Implementation is test-driven.
 
+**Negative assertions pin a single reason.** A test named for a specific
+rejection uses an otherwise-valid fixture and asserts the issue count and
+path, rather than only that validation failed. Three tests written during
+implementation used doubly-invalid fixtures and so would have passed with the
+very rule they named deleted; they were found by counting validator issues per
+fixture rather than by reading the tests.
+
 **Deliberate omission:** no component tests for the SPA in v1. It is forms over
 a typed API, and the risk concentrates in the API and the queue. This is a
 choice, not an oversight.

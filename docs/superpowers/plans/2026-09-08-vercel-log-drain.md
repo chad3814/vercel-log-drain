@@ -29,6 +29,7 @@ Every task's requirements implicitly include this section.
 - **Sink name pattern:** `^[a-z0-9][a-z0-9-]{0,63}$`. A sink name is also a directory name; nothing else is acceptable.
 - **Spool file naming:** `String(seq).padStart(12, '0') + '.jsonl'`. Twelve digits, so lexicographic order equals numeric order (verified).
 - **Durable write protocol:** write `<name>.tmp` → `FileHandle.sync()` → `close()` → `rename()` → open the containing directory and `sync()` it. All four steps, in that order (verified on darwin and required on Linux).
+- **A negative test must pin ONE reason.** A test named for a specific rejection uses a fixture that is otherwise valid, and asserts the issue count and path — not merely `success === false`. Three tests in this plan originally used doubly-invalid fixtures (a short drain id alongside the defect under test), so each would have passed with the property it named removed entirely. Verified by counting zod issues per fixture; every other negative case here already fails for exactly one reason.
 - **Every task ends green:** `npm run lint && npm run typecheck && npm test` must pass before the task's commit.
 - **Commit per task**, using Conventional Commit prefixes (`feat:`, `test:`, `chore:`, `docs:`, `fix:`).
 
@@ -3387,11 +3388,17 @@ describe('appConfigSchema', () => {
     expect(result.error.issues[0]?.message).toMatch(/drain ids must be unique/);
   });
 
-  it('rejects a drain secret that is too short to be meaningful', () => {
-    const drain = { id: 'd1', name: 'a', secret: 'short', enabled: true, createdAt: 1 };
-    expect(appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] }).success).toBe(
-      false,
-    );
+  it('rejects a drain secret that is too short, and for that reason alone', () => {
+    // Valid id, so the secret length is the only thing wrong. With a short id
+    // as well, the parse fails twice and the assertion stops pinning the
+    // property this test is named after.
+    const drain = { id: 'drain001', name: 'a', secret: 'short', enabled: true, createdAt: 1 };
+
+    const result = appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.path.join('.')).toBe('drains.0.secret');
   });
 });
 
