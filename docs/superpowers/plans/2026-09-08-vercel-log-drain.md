@@ -283,7 +283,7 @@ Establishes the gates every later task must pass, plus the `JsonValue` type and
 the redacting logger that everything depends on.
 
 **Files:**
-- Create: `package.json`, `tsconfig.json`, `tsconfig.build.json`, `web/tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `.oxlintrc.json`, `.prettierrc.json`, `.gitignore`, `.dockerignore`
+- Create: `package.json`, `.npmrc`, `tsconfig.json`, `tsconfig.build.json`, `web/tsconfig.json`, `vite.config.ts`, `vitest.config.ts`, `.oxlintrc.json`, `.prettierrc.json`, `.gitignore`, `.dockerignore`
 - Create: `types/json.ts`, `src/log.ts`
 - Test: `test/log.test.ts`
 
@@ -295,9 +295,15 @@ the redacting logger that everything depends on.
 
 ```bash
 npm init -y
-npm pkg set name=vercel-log-drain version=0.1.0 private=true type=module
+npm pkg set name=vercel-log-drain version=0.1.0 type=module
+npm pkg set --json private=true
 npm pkg set engines.node=">=24"
 npm pkg delete main
+
+# Pin exactly. npm writes caret ranges by default, which would let a future
+# plain `npm install` drift the TypeScript 7 / oxlint / oxlint-tsgolint triad
+# into an incompatible combination — the exact failure this pinning prevents.
+printf 'save-exact=true\n' > .npmrc
 
 npm install hono@4.13.7 @hono/node-server@2.1.1 zod@4.5.4 pino@10.3.1
 npm install react@19.2.8 react-dom@19.2.8
@@ -308,6 +314,10 @@ npm install -D typescript@7.0.2 @types/node@24 vitest@5.0.0 vite@8.2.2 \
 
 Do not substitute ESLint. `oxlint-tsgolint` is what provides the type-aware
 rules; its version tracks the TypeScript 7 native compiler.
+
+Afterwards, confirm `package.json` contains no `^` or `~` in any version spec.
+If it does, the `.npmrc` was written too late; fix the specs and re-run
+`npm install` so the lockfile agrees.
 
 - [ ] **Step 2: Write the config files**
 
