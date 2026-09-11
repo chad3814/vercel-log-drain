@@ -59,7 +59,9 @@ describe('ConfigStore', () => {
       second.etag,
     );
 
-    const backup = JSON.parse(await readFile(join(dir, 'config.json.bak'), 'utf8'));
+    const backup: { server: { maxBodyBytes: number } } = JSON.parse(
+      await readFile(join(dir, 'config.json.bak'), 'utf8'),
+    );
     expect(backup.server.maxBodyBytes).toBe(8192);
   });
 
@@ -79,7 +81,55 @@ describe('ConfigStore', () => {
   it('allows a save with a null etag, for boot-time writes', async () => {
     const store = new ConfigStore(dir);
     await store.load();
-    await expect(store.save(defaultAppConfig(), null)).resolves.toBeDefined();
+    const saved = await store.save(
+      { ...defaultAppConfig(), server: { ...defaultAppConfig().server, maxBodyBytes: 5555 } },
+      null,
+    );
+    expect(saved.config.server.maxBodyBytes).toBe(5555);
+    expect(saved.etag).toBe(etagOf(saved.config));
+    const reloaded = await new ConfigStore(dir).load();
+    expect(reloaded.config.server.maxBodyBytes).toBe(5555);
+  });
+
+  it('serializes concurrent saves: the second sees a stale etag', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+
+    const results = await Promise.allSettled([
+      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 1111 } }, initial.etag),
+      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2222 } }, initial.etag),
+    ]);
+
+    // Exactly one wins; the loser gets a meaningful conflict, never a raw
+    // ENOENT from two saves sharing one temp path.
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((r) => r.status === 'rejected');
+    expect(rejected?.status === 'rejected' && rejected.reason).toBeInstanceOf(EtagMismatchError);
+
+    const reloaded = await new ConfigStore(dir).load();
+    expect([1111, 2222]).toContain(reloaded.config.server.maxBodyBytes);
+  });
+
+  it('survives many concurrent null-etag saves with a valid file and no temp litter', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, (_unused, index) =>
+        store
+          .save(
+            { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2048 + index } },
+            null,
+          )
+          .then(() => 'ok')
+          .catch(() => 'failed'),
+      ),
+    );
+
+    expect(outcomes.every((outcome) => outcome === 'ok')).toBe(true);
+    const reloaded = await new ConfigStore(dir).load();
+    expect(reloaded.config.server.maxBodyBytes).toBeGreaterThanOrEqual(2048);
+    expect((await readdir(dir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
   });
 
   it('refuses to start on malformed JSON rather than resetting', async () => {

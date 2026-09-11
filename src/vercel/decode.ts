@@ -35,14 +35,11 @@ class CorruptBodyError extends Error {
 }
 
 function errorCode(error: Error): string | undefined {
-  // zlib errors have a .code property for error classification.
-  const candidate: unknown = error;
-  if (candidate && typeof candidate === 'object' && 'code' in candidate) {
-    const code: unknown = (candidate as Record<string, unknown>).code;
-    if (typeof code === 'string') {
-      return code;
-    }
-  }
+  // `in` narrowing, deliberately. Two tempting alternatives both fail:
+  //   const candidate: { code?: string } = error;  -> TS2559, weak-type check
+  //   error as { code?: string }                   -> oxlint no-unsafe-type-assertion
+  // This form needs neither an assertion nor `unknown`.
+  if ('code' in error && typeof error.code === 'string') return error.code;
   return undefined;
 }
 
