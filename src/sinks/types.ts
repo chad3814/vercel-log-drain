@@ -16,6 +16,13 @@ export class PermanentDeliveryError extends Error {
   }
 }
 
+export class AuthDeliveryError extends RetryableDeliveryError {
+  constructor(message: string, cause?: Error) {
+    super(message, cause);
+    this.name = 'AuthDeliveryError';
+  }
+}
+
 export type FreeSpaceProbe = (path: string) => Promise<number>;
 
 export interface SinkContext {
