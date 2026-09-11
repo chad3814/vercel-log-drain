@@ -44,4 +44,21 @@ describe('verifySignature', () => {
     const emptySig = createHmac('sha1', secret).update(empty).digest('hex');
     expect(verifySignature(empty, emptySig, secret)).toBe(true);
   });
+
+  it('rejects a header whose string length matches but byte length does not', () => {
+    // Node's HTTP parser decodes header bytes as latin1, so 40 raw bytes in
+    // 0x80-0xFF arrive as a 40-character string that is 80 UTF-8 bytes. A
+    // string-length guard would pass this to timingSafeEqual, which throws.
+    const multiByte = 'é'.repeat(40);
+    expect(multiByte.length).toBe(40);
+    expect(Buffer.byteLength(multiByte, 'utf8')).toBe(80);
+    expect(() => verifySignature(body, multiByte, secret)).not.toThrow();
+    expect(verifySignature(body, multiByte, secret)).toBe(false);
+  });
+
+  it('rejects a multi-byte header of differing string length without throwing', () => {
+    const wide = '€'.repeat(13); // 13 chars, 39 bytes
+    expect(() => verifySignature(body, wide, secret)).not.toThrow();
+    expect(verifySignature(body, wide, secret)).toBe(false);
+  });
 });

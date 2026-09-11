@@ -191,7 +191,10 @@ pointing a sink at `/config` or `/spool` and corrupting them.
    `403`. IDs are randomly generated, so enumeration is not a concern.
 3. **Verify the signature before interpreting the body.** Compute
    `HMAC-SHA1(rawBytes, drain.secret)` as hex and compare with
-   `crypto.timingSafeEqual` after an explicit length check. Missing header →
+   `crypto.timingSafeEqual` after an explicit **byte**-length check — a JS
+   string's `.length` counts UTF-16 code units, and a header of non-ASCII
+   bytes can match on code units while differing in bytes, which makes
+   `timingSafeEqual` throw instead of returning false. Missing header →
    `401`. Mismatch → `403 {"code":"invalid_signature"}`. Verifying before
    decompression means an unauthenticated caller can never make the service
    spend CPU on gzip expansion.

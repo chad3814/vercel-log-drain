@@ -921,6 +921,23 @@ describe('verifySignature', () => {
     expect(verifySignature(body, signature.toUpperCase(), secret)).toBe(false);
   });
 
+  it('rejects a header whose string length matches but byte length does not', () => {
+    // Node's HTTP parser decodes header bytes as latin1, so 40 raw bytes in
+    // 0x80-0xFF arrive as a 40-character string that is 80 UTF-8 bytes. A
+    // string-length guard would pass this to timingSafeEqual, which throws.
+    const multiByte = '\u00e9'.repeat(40);
+    expect(multiByte.length).toBe(40);
+    expect(Buffer.byteLength(multiByte, 'utf8')).toBe(80);
+    expect(() => verifySignature(body, multiByte, secret)).not.toThrow();
+    expect(verifySignature(body, multiByte, secret)).toBe(false);
+  });
+
+  it('rejects a multi-byte header of differing string length without throwing', () => {
+    const wide = '\u20ac'.repeat(13); // 13 chars, 39 bytes
+    expect(() => verifySignature(body, wide, secret)).not.toThrow();
+    expect(verifySignature(body, wide, secret)).toBe(false);
+  });
+
   it('verifies an empty body correctly', () => {
     const empty = Buffer.alloc(0);
     const emptySig = createHmac('sha1', secret).update(empty).digest('hex');
@@ -938,7 +955,18 @@ Expected: FAIL — module not found.
 
 The explicit length check before `timingSafeEqual` is mandatory:
 `timingSafeEqual` throws when its arguments differ in length, so without the
-guard a short header would crash the request instead of failing closed.
+guard a malformed header would crash the request instead of failing closed.
+
+**The guard must compare BYTE lengths, not string lengths.** A JS string's
+`.length` is a count of UTF-16 code units, while `timingSafeEqual` compares
+`Buffer` byte lengths, and the two diverge for any non-ASCII character. Node's
+HTTP parser decodes header bytes as latin1, so a header of 40 raw bytes in
+`0x80`-`0xFF` yields a 40-**character** string that is 80 **bytes** in UTF-8:
+a string-length guard passes it through and `timingSafeEqual` throws
+`RangeError: Input buffers must have the same byte length`. This is
+attacker-controlled and reachable over the network — verified 2026-09-11
+against Node 24 by sending 40 `0xE9` bytes through `node:http`. Build both
+buffers first and compare *their* lengths:
 
 ```ts
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -950,8 +978,11 @@ export function verifySignature(
 ): boolean {
   if (header === undefined || header.length === 0) return false;
   const expected = createHmac('sha1', secret).update(raw).digest('hex');
-  if (header.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(header, 'utf8'), Buffer.from(expected, 'utf8'));
+  const headerBuffer = Buffer.from(header, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  // Byte lengths, because that is what timingSafeEqual compares.
+  if (headerBuffer.length !== expectedBuffer.length) return false;
+  return timingSafeEqual(headerBuffer, expectedBuffer);
 }
 ```
 

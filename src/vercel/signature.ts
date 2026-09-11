@@ -7,6 +7,9 @@ export function verifySignature(
 ): boolean {
   if (header === undefined || header.length === 0) return false;
   const expected = createHmac('sha1', secret).update(raw).digest('hex');
-  if (header.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(header, 'utf8'), Buffer.from(expected, 'utf8'));
+  const headerBuffer = Buffer.from(header, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  // Byte lengths, because that is what timingSafeEqual compares.
+  if (headerBuffer.length !== expectedBuffer.length) return false;
+  return timingSafeEqual(headerBuffer, expectedBuffer);
 }
