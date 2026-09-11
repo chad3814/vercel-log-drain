@@ -132,6 +132,33 @@ describe('ConfigStore', () => {
     expect((await readdir(dir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
   });
 
+  it('a load or save never deletes a temp file belonging to another writer', async () => {
+    const store = new ConfigStore(dir);
+    const initial = await store.load();
+
+    // Shaped exactly like an in-flight temp from a different writer.
+    const foreign = `config.json.${String(process.pid + 1)}.1.tmp`;
+    await writeFile(join(dir, foreign), '{"in":"flight"}');
+
+    await new ConfigStore(dir).load();
+    await store.save(
+      { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 4096 } },
+      initial.etag,
+    );
+
+    expect(await readdir(dir)).toContain(foreign);
+  });
+
+  it('the explicit boot sweep does reap stranded temps', async () => {
+    const store = new ConfigStore(dir);
+    await store.load();
+    await writeFile(join(dir, `config.json.${String(process.pid + 1)}.1.tmp`), 'stranded');
+
+    await store.sweepStaleTemps();
+
+    expect((await readdir(dir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+  });
+
   it('refuses to start on malformed JSON rather than resetting', async () => {
     await writeFile(join(dir, 'config.json'), '{ not json');
     await expect(new ConfigStore(dir).load()).rejects.toBeInstanceOf(ConfigInvalidError);
