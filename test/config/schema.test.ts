@@ -141,11 +141,17 @@ describe('appConfigSchema', () => {
     expect(result.error.issues[0]?.message).toMatch(/drain ids must be unique/);
   });
 
-  it('rejects a drain secret that is too short to be meaningful', () => {
-    const drain = { id: 'd1', name: 'a', secret: 'short', enabled: true, createdAt: 1 };
-    expect(appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] }).success).toBe(
-      false,
-    );
+  it('rejects a drain secret that is too short, and for that reason alone', () => {
+    // Valid id, so the secret length is the only thing wrong. With a short id
+    // as well, the parse fails twice and the assertion stops pinning the
+    // property this test is named after.
+    const drain = { id: 'drain001', name: 'a', secret: 'short', enabled: true, createdAt: 1 };
+
+    const result = appConfigSchema.safeParse({ ...defaultAppConfig(), drains: [drain] });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.path.join('.')).toBe('drains.0.secret');
   });
 });
 
