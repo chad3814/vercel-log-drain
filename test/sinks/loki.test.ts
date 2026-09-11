@@ -177,6 +177,34 @@ describe('loki sink delivery', () => {
     await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
   });
 
+  it('does not hang when the server stalls the response body', async () => {
+    // Headers arrive at once; the body never completes. The abort must still
+    // bound the exchange, or a sink's sequential worker stops forever.
+    const stalling = createServer((req, res) => {
+      req.on('data', () => undefined);
+      req.on('end', () => {
+        res.writeHead(500, { 'content-type': 'text/plain', 'content-length': '100' });
+        res.write('partial');
+        // deliberately never res.end()
+      });
+    });
+    server = stalling;
+    await new Promise<void>((resolve) => stalling.listen(0, '127.0.0.1', resolve));
+    const address = stalling.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    const sink = lokiSinkType.create(
+      'loki',
+      config(`http://127.0.0.1:${String(port)}`, { timeoutMs: 200 }),
+      { log: silentLog },
+    );
+
+    const started = Date.now();
+    await expect(sink.deliver([event])).rejects.toBeInstanceOf(RetryableDeliveryError);
+    // Generous bound: the point is that it returns at all, not the exact timing.
+    expect(Date.now() - started).toBeLessThan(3000);
+  }, 10_000);
+
   it('does not call the server for an empty batch', async () => {
     const captured: Captured[] = [];
     const url = await startServer(204, '', captured);
