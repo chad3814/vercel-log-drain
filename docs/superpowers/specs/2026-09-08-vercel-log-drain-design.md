@@ -294,8 +294,20 @@ timestamps, so the file it lands in looks expired the moment it is written.
 Deleting on the filename alone would discard data the service has already
 reported as delivered — and because a POSIX `unlink` beneath an open handle
 neither fails nor stops subsequent writes, that loss would be completely
-silent. Requiring the file itself to be stale, not merely its name, closes
-that hole; the open-handle check closes the remaining race window.
+silent. Requiring the file itself to be stale, not merely its name, is what
+closes that hole.
+
+The open-handle check narrows the residual race but does not eliminate it.
+`protectedDates` is snapshotted once when a prune pass begins, so a delivery
+that opens a *new* handle for a stale-looking date mid-pass is invisible to
+it; the live `mtime` check is the backstop, and that is a stat-then-act
+sequence. A delivery landing in the gap between one file's `stat` and its
+`unlink` can still lose data. Reaching it requires a replay delayed longer
+than the entire retention window arriving inside that sub-millisecond gap,
+against a previously certain loss for any such replay during the hour between
+prune passes. That residual is accepted rather than solved: eliminating it
+would need locking between the pruner and the writer, which is not worth the
+complexity at this scale.
 
 Before appending, `statfs` on `directory`; below `freeSpaceFloorBytes`, throw a
 retryable error so the batch stays spooled.
