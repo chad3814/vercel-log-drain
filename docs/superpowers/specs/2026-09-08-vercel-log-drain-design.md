@@ -281,9 +281,21 @@ File handles are cached in a small LRU. Each batch write is `fsync`ed before
 only durable copy. The cost is acceptable because the worker already coalesced
 the batch.
 
-Retention runs at boot and hourly, deleting only files matching
-`<prefix>-YYYY-MM-DD.jsonl` whose parsed date is older than `retentionDays`.
-Files not matching the pattern are never touched.
+Retention runs at boot and hourly. A file is deleted only when **all** of
+these hold: its name matches `<prefix>-YYYY-MM-DD.jsonl` (with the prefix
+regex-escaped, since the schema permits `.`); the date in the name is a real
+calendar date older than `retentionDays`; that date is not currently held open
+by the handle cache; and the file's own `mtime` is also older than
+`retentionDays`.
+
+The `mtime` condition is what makes retention safe under replay. A batch
+delayed past the retention window still carries its original event
+timestamps, so the file it lands in looks expired the moment it is written.
+Deleting on the filename alone would discard data the service has already
+reported as delivered — and because a POSIX `unlink` beneath an open handle
+neither fails nor stops subsequent writes, that loss would be completely
+silent. Requiring the file itself to be stale, not merely its name, closes
+that hole; the open-handle check closes the remaining race window.
 
 Before appending, `statfs` on `directory`; below `freeSpaceFloorBytes`, throw a
 retryable error so the batch stays spooled.

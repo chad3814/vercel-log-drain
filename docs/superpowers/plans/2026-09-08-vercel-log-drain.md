@@ -1890,7 +1890,7 @@ resolving is what deletes the spool copy."
 
 ```ts
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -1913,11 +1913,21 @@ describe('pruneRetention', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  // Retention requires BOTH an expired filename date AND a stale mtime, so a
+  // test file must be aged explicitly — a freshly written one is treated as
+  // replayed data and deliberately spared.
+  async function agedFile(name: string, ageDays: number): Promise<void> {
+    const path = join(dir, name);
+    await writeFile(path, '');
+    const when = new Date(now - ageDays * 86_400_000);
+    await utimes(path, when, when);
+  }
+
   it('deletes files older than the retention window and keeps newer ones', async () => {
-    await writeFile(join(dir, 'events-2026-09-08.jsonl'), '');
-    await writeFile(join(dir, 'events-2026-09-06.jsonl'), '');
-    await writeFile(join(dir, 'events-2026-09-01.jsonl'), '');
-    await writeFile(join(dir, 'events-2026-08-20.jsonl'), '');
+    await agedFile('events-2026-09-08.jsonl', 0);
+    await agedFile('events-2026-09-06.jsonl', 2);
+    await agedFile('events-2026-09-01.jsonl', 7);
+    await agedFile('events-2026-08-20.jsonl', 19);
 
     const deleted = await pruneRetention(dir, 'events', 3, now);
 
@@ -1929,10 +1939,10 @@ describe('pruneRetention', () => {
   });
 
   it('never touches files that do not match the pattern', async () => {
-    await writeFile(join(dir, 'events-2020-01-01.jsonl'), '');
-    await writeFile(join(dir, 'important-notes.txt'), '');
-    await writeFile(join(dir, 'events-not-a-date.jsonl'), '');
-    await writeFile(join(dir, 'other-2020-01-01.jsonl'), '');
+    await agedFile('events-2020-01-01.jsonl', 2000);
+    await agedFile('important-notes.txt', 2000);
+    await agedFile('events-not-a-date.jsonl', 2000);
+    await agedFile('other-2020-01-01.jsonl', 2000);
 
     const deleted = await pruneRetention(dir, 'events', 1, now);
 
@@ -1942,6 +1952,52 @@ describe('pruneRetention', () => {
       'important-notes.txt',
       'other-2020-01-01.jsonl',
     ]);
+  });
+
+  it('escapes regex metacharacters in the prefix', async () => {
+    // The config schema permits '.' in a prefix. Unescaped it is a regex
+    // wildcard, so `events.log` would also match `eventsXlog-…` and delete a
+    // file belonging to someone else.
+    await agedFile('events.log-2020-01-01.jsonl', 2000);
+    await agedFile('eventsXlog-2020-01-01.jsonl', 2000);
+
+    const deleted = await pruneRetention(dir, 'events.log', 1, now);
+
+    expect(deleted).toEqual(['events.log-2020-01-01.jsonl']);
+    expect(await readdir(dir)).toEqual(['eventsXlog-2020-01-01.jsonl']);
+  });
+
+  it('spares a file whose name is expired but whose contents just arrived', async () => {
+    // The replay case: a batch delayed past the retention window still carries
+    // its original event dates, so the file it lands in looks expired the
+    // instant it is written. Deleting it would discard data we reported as
+    // delivered — and on POSIX an unlink beneath an open handle does not even
+    // error, so the loss would be silent.
+    await agedFile('events-2020-01-01.jsonl', 0); // expired name, fresh mtime
+
+    const deleted = await pruneRetention(dir, 'events', 1, now);
+
+    expect(deleted).toEqual([]);
+    expect(await readdir(dir)).toEqual(['events-2020-01-01.jsonl']);
+  });
+
+  it('spares a date that is currently held open', async () => {
+    await agedFile('events-2020-01-01.jsonl', 2000);
+
+    const deleted = await pruneRetention(dir, 'events', 1, now, new Set(['2020-01-01']));
+
+    expect(deleted).toEqual([]);
+    expect(await readdir(dir)).toEqual(['events-2020-01-01.jsonl']);
+  });
+
+  it('skips a shape-valid but impossible calendar date', async () => {
+    // Date.parse rolls 2026-02-30 over to 2026-03-02 instead of failing, so a
+    // NaN check alone would compare the wrong effective date.
+    await agedFile('events-2026-02-30.jsonl', 2000);
+
+    const deleted = await pruneRetention(dir, 'events', 1, now);
+
+    expect(deleted).toEqual([]);
   });
 
   it('deletes nothing when retentionDays is 0, meaning keep forever', async () => {
@@ -2035,7 +2091,7 @@ export interface SinkContext {
 Add these imports and exports:
 
 ```ts
-import { readdir, statfs, unlink } from 'node:fs/promises';
+import { readdir, stat, statfs, unlink } from 'node:fs/promises';
 import { RetryableDeliveryError } from './types.js';
 import type { FreeSpaceProbe } from './types.js';
 
@@ -2047,11 +2103,16 @@ export const statfsFreeSpace: FreeSpaceProbe = async (path) => {
   return stats.bavail * stats.bsize;
 };
 
+function escapeForRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export async function pruneRetention(
   dir: string,
   prefix: string,
   retentionDays: number,
   nowMs: number,
+  protectedDates: ReadonlySet<string> = new Set(),
 ): Promise<string[]> {
   if (retentionDays <= 0) return [];
 
@@ -2062,7 +2123,10 @@ export async function pruneRetention(
     return [];
   }
 
-  const pattern = new RegExp(`^${prefix}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
+  // The prefix is operator-supplied and the schema permits '.', a regex
+  // metacharacter. Unescaped, a prefix of `events.log` would also match
+  // `eventsXlog-2020-01-01.jsonl` and delete an unrelated file.
+  const pattern = new RegExp(`^${escapeForRegExp(prefix)}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
   const cutoff = nowMs - retentionDays * DAY_MS;
   const deleted: string[] = [];
 
@@ -2071,8 +2135,27 @@ export async function pruneRetention(
     if (match === null) continue;
     const dateKey = match[1];
     if (dateKey === undefined) continue;
+
     const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
-    if (Number.isNaN(fileMs) || fileMs >= cutoff) continue;
+    if (Number.isNaN(fileMs)) continue;
+    // Date.parse rolls an impossible date over rather than failing:
+    // 2026-02-30 becomes 2026-03-02. Round-trip it so only a real calendar
+    // date is ever compared against the cutoff.
+    if (new Date(fileMs).toISOString().slice(0, 10) !== dateKey) continue;
+    if (fileMs >= cutoff) continue;
+
+    // A date we hold a handle for is being written to right now.
+    if (protectedDates.has(dateKey)) continue;
+
+    // A recently-written file holds REPLAYED data: a batch delayed past the
+    // retention window still carries its original event dates, so its name
+    // looks expired while its contents only just arrived. Deleting it would
+    // silently discard data the caller was told we accepted — and on POSIX an
+    // unlink beneath an open handle does not even error, the writes simply
+    // vanish. Require the file itself to be stale, not merely its name.
+    const stats = await stat(join(dir, entry)).catch(() => null);
+    if (stats === null || stats.mtimeMs >= cutoff) continue;
+
     await unlink(join(dir, entry));
     deleted.push(entry);
   }
@@ -2106,6 +2189,7 @@ close:
         this.config.filePrefix,
         this.config.retentionDays,
         Date.now(),
+        new Set(this.handles.keys()),
       );
       if (deleted.length > 0) {
         this.ctx.log.info({ sink: this.name, deleted: deleted.length }, 'pruned old log files');
