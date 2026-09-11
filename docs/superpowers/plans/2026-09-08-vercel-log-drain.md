@@ -3290,6 +3290,35 @@ describe('sinkEntrySchema', () => {
     expect(sinkEntrySchema.safeParse({ ...validSink, name: '../etc' }).success).toBe(false);
   });
 
+  it('keeps an absent predicate distinct from an empty one', () => {
+    // Task 12's filter compiler reads absent as "match everything" and an empty
+    // array as "match nothing", so parsing must not collapse the two.
+    const absent = sinkEntrySchema.safeParse(validSink);
+    const empty = sinkEntrySchema.safeParse({ ...validSink, filter: { sources: [] } });
+    expect(absent.success && empty.success).toBe(true);
+    if (!absent.success || !empty.success) return;
+    expect(absent.data.filter.sources).toBeUndefined();
+    expect(empty.data.filter.sources).toEqual([]);
+  });
+
+  it('rejects a batch bound larger than the whole spool budget', () => {
+    const result = sinkEntrySchema.safeParse({
+      ...validSink,
+      maxSpoolBytes: 1_048_576,
+      maxBatchBytes: 100_000_000,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts a batch bound equal to the spool budget', () => {
+    const result = sinkEntrySchema.safeParse({
+      ...validSink,
+      maxSpoolBytes: 4_194_304,
+      maxBatchBytes: 4_194_304,
+    });
+    expect(result.success).toBe(true);
+  });
+
   it('accepts a filter with all predicates', () => {
     const result = sinkEntrySchema.safeParse({
       ...validSink,
@@ -3409,15 +3438,27 @@ export const drainEntrySchema = z.object({
 
 export type DrainEntry = z.infer<typeof drainEntrySchema>;
 
-export const sinkEntrySchema = z.object({
-  name: z.string().regex(SINK_NAME_PATTERN, 'sink name must match ^[a-z0-9][a-z0-9-]{0,63}$'),
-  enabled: z.boolean(),
-  filter: sinkFilterSchema,
-  maxSpoolBytes: z.number().int().min(1_048_576),
-  maxBatchEvents: z.number().int().min(1).max(100_000),
-  maxBatchBytes: z.number().int().min(1024),
-  config: sinkConfigSchema,
-});
+export const sinkEntrySchema = z
+  .object({
+    name: z.string().regex(SINK_NAME_PATTERN, 'sink name must match ^[a-z0-9][a-z0-9-]{0,63}$'),
+    enabled: z.boolean(),
+    filter: sinkFilterSchema,
+    maxSpoolBytes: z.number().int().min(1_048_576),
+    maxBatchEvents: z.number().int().min(1).max(100_000),
+    maxBatchBytes: z.number().int().min(1024),
+    config: sinkConfigSchema,
+  })
+  // An operator-sanity guard, NOT a correctness fix. `maxBatchBytes` bounds how
+  // much the worker coalesces per delivery, and the queue tolerates the
+  // mismatch either way: enqueue writes an over-budget batch regardless after
+  // draining to make room, and nextBatch always returns at least its first
+  // file. So this cannot deadlock. But a coalescing bound larger than the whole
+  // spool budget can never actually be reached, which is almost always a typo
+  // worth catching at save time rather than leaving to puzzle over later.
+  .refine((entry) => entry.maxBatchBytes <= entry.maxSpoolBytes, {
+    message: 'maxBatchBytes must not exceed maxSpoolBytes',
+    path: ['maxBatchBytes'],
+  });
 
 export type SinkEntry = z.infer<typeof sinkEntrySchema>;
 
