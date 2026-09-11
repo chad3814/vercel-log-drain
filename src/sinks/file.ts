@@ -1,11 +1,14 @@
-import { mkdir, open } from 'node:fs/promises';
+import { mkdir, open, readdir, statfs, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { LogEvent } from '../vercel/event.js';
-import type { Sink, SinkContext, SinkType } from './types.js';
+import { RetryableDeliveryError } from './types.js';
+import type { FreeSpaceProbe, Sink, SinkContext, SinkType } from './types.js';
 
 const HANDLE_CACHE_LIMIT = 3;
+const DAY_MS = 86_400_000;
+const PRUNE_INTERVAL_MS = 3_600_000;
 
 export const fileSinkConfigSchema = z.object({
   type: z.literal('file'),
@@ -53,15 +56,93 @@ export function resolveLogsDirectory(candidate: string, logsRoot: string): strin
   return target;
 }
 
+export const statfsFreeSpace: FreeSpaceProbe = async (path) => {
+  const stats = await statfs(path);
+  return stats.bavail * stats.bsize;
+};
+
+export async function pruneRetention(
+  dir: string,
+  prefix: string,
+  retentionDays: number,
+  nowMs: number,
+): Promise<string[]> {
+  if (retentionDays <= 0) return [];
+
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return [];
+  }
+
+  const pattern = new RegExp(`^${prefix}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
+  const cutoff = nowMs - retentionDays * DAY_MS;
+  const deleted: string[] = [];
+
+  for (const entry of entries) {
+    const match = pattern.exec(entry);
+    if (match === null) continue;
+    const dateKey = match[1];
+    if (dateKey === undefined) continue;
+    const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
+    if (Number.isNaN(fileMs) || fileMs >= cutoff) continue;
+    await unlink(join(dir, entry));
+    deleted.push(entry);
+  }
+  return deleted;
+}
+
 class FileSink implements Sink {
   readonly type = 'file';
   private readonly handles = new Map<string, FileHandle>();
+  private pruneTimer: NodeJS.Timeout | null = null;
 
   constructor(
     readonly name: string,
     private readonly config: FileSinkConfig,
     private readonly ctx: SinkContext,
   ) {}
+
+  private get freeSpace(): FreeSpaceProbe {
+    return this.ctx.freeSpace ?? statfsFreeSpace;
+  }
+
+  startPruner(): void {
+    if (this.config.retentionDays <= 0) return;
+    void this.prune();
+    this.pruneTimer = setInterval(() => {
+      void this.prune();
+    }, PRUNE_INTERVAL_MS);
+    this.pruneTimer.unref();
+  }
+
+  private async prune(): Promise<void> {
+    try {
+      const deleted = await pruneRetention(
+        this.config.directory,
+        this.config.filePrefix,
+        this.config.retentionDays,
+        Date.now(),
+      );
+      if (deleted.length > 0) {
+        this.ctx.log.info({ sink: this.name, deleted: deleted.length }, 'pruned old log files');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.ctx.log.warn({ sink: this.name, err: message }, 'retention prune failed');
+    }
+  }
+
+  private async assertSpaceAvailable(): Promise<void> {
+    if (this.config.freeSpaceFloorBytes <= 0) return;
+    const available = await this.freeSpace(this.config.directory);
+    if (available < this.config.freeSpaceFloorBytes) {
+      throw new RetryableDeliveryError(
+        `only ${available} bytes free in ${this.config.directory}, floor is ${this.config.freeSpaceFloorBytes}`,
+      );
+    }
+  }
 
   /**
    * Called on every deliver, deliberately uncached. `mkdir` with `recursive`
@@ -115,6 +196,7 @@ class FileSink implements Sink {
 
   async deliver(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
+    await this.assertSpaceAvailable();
     await this.ensureDirectory();
 
     for (const [dateKey, batch] of groupByUtcDate(events)) {
@@ -127,6 +209,10 @@ class FileSink implements Sink {
   }
 
   async close(): Promise<void> {
+    if (this.pruneTimer !== null) {
+      clearInterval(this.pruneTimer);
+      this.pruneTimer = null;
+    }
     const handles = [...this.handles.values()];
     this.handles.clear();
     await Promise.all(handles.map((handle) => handle.close()));
@@ -137,7 +223,9 @@ export const fileSinkType: SinkType<FileSinkConfig> = {
   type: 'file',
   configSchema: fileSinkConfigSchema,
   create(name, config, ctx) {
-    return new FileSink(name, config, ctx);
+    const sink = new FileSink(name, config, ctx);
+    sink.startPruner();
+    return sink;
   },
   warnings() {
     return [];

@@ -16,8 +16,11 @@ export class PermanentDeliveryError extends Error {
   }
 }
 
+export type FreeSpaceProbe = (path: string) => Promise<number>;
+
 export interface SinkContext {
   readonly log: Logger;
+  readonly freeSpace?: FreeSpaceProbe;
 }
 
 export interface Sink {
