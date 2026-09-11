@@ -72,4 +72,9 @@ describe('compileFilter', () => {
     // way to express "any source".
     expect(compileFilter({ sources: [] })(event())).toBe(false);
   });
+
+  it('applies the empty-means-nothing rule to every array predicate', () => {
+    expect(compileFilter({ environments: [] })(event())).toBe(false);
+    expect(compileFilter({ projectIds: [] })(event())).toBe(false);
+  });
 });
