@@ -436,7 +436,17 @@ states this before confirming.
 ### 8.4 Secrets are write-only
 
 `GET` returns `secret: null` with `hasSecret: true`. `PUT` treats an absent or
-null secret as "keep existing" and a string as "replace". A drain secret is
+null secret as "keep existing" and a string as "replace".
+
+**What is and is not treated as a secret.** Exactly three fields are scrubbed:
+a drain's `secret`, and a Loki sink's `auth.password` and `auth.token`. Nothing
+else is. In particular a Loki sink's `labels.static` values are free-form
+strings that are never scrubbed, so a credential pasted there would be returned
+on every `GET` *and* shipped to Loki as a label value. That is a real residual
+exposure, accepted rather than solved: static labels exist to be read, and
+guessing at which of them might be a secret would be both unreliable and
+surprising. The admin UI should not encourage putting anything sensitive
+there, and the README says so. A drain secret is
 displayed exactly once, at creation, with a copy button; afterwards it can be
 regenerated but never revealed. Loki passwords and bearer tokens follow the
 same rule. This keeps the admin API from becoming a credential-exfiltration

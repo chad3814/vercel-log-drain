@@ -7209,6 +7209,7 @@ degraded; healthz answers whenever the process is listening."
 
 **Interfaces:**
 - Consumes: `ConfigStore`, `EtagMismatchError`, `redactConfig`, `restoreSecrets`, `SecretRestoreError`, `Dispatcher`, `warningsFor`, `newDrainId`, `newDrainSecret`.
+- **Reviewer must verify in code, not in prose:** every response that carries a config passes it through `redactConfig` first. `restoreSecrets` returns real secrets by design — it has to, so they can be persisted — so a handler that responds with its raw output would leak every credential it just restored. There are exactly two such responses (`GET /config` and `PUT /config`), plus `POST /drains`, which returns a freshly generated secret ONCE and is the single sanctioned exception.
 - Produces: `type AdminDeps = { store: ConfigStore; dispatcher: Dispatcher; getConfig: () => AppConfig; setConfig: (config: AppConfig, etag: string) => void; getEtag: () => string; log: Logger }`, `adminRoutes(deps): Hono<AppEnv>`.
 
 Routes: `GET /config`, `PUT /config`, `POST /drains`, `POST /sinks/:name/test`,
@@ -9982,7 +9983,12 @@ implementation actually has:
    free-space floor) and the Loki sink (push URL, auth modes, tenant, label
    allowlist). Include the cardinality warning and the recommended default
    label set.
-7. **Delivery semantics** — at-least-once, stated plainly: a spool write
+7. **Secrets** — which three fields are scrubbed from API reads (a drain's
+   `secret`, a Loki sink's `auth.password` and `auth.token`) and, explicitly,
+   that a Loki sink's `labels.static` values are NOT scrubbed: anything pasted
+   there is returned on every `GET` and shipped to Loki as a label. Tell the
+   reader not to put credentials in static labels.
+12. **Delivery semantics** — at-least-once, stated plainly: a spool write
    failure returns 500 so Vercel redelivers, which can duplicate events into
    sinks that already succeeded. Loki collapses identical entries; the file
    sink does not.
