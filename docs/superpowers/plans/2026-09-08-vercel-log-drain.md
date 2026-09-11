@@ -5003,7 +5003,7 @@ describe('SpoolQueue', () => {
     expect(remaining?.events.map((e) => e['id'])).toEqual(['c']);
   });
 
-  it('delivers in FIFO order across a padding boundary', async () => {
+  it('delivers in FIFO order', async () => {
     const queue = await SpoolQueue.open(dir, options());
     for (let index = 0; index < 12; index += 1) {
       await queue.enqueue([event(`e${String(index)}`)]);
@@ -5012,6 +5012,58 @@ describe('SpoolQueue', () => {
     expect(batch?.events.map((e) => e['id'])).toEqual(
       Array.from({ length: 12 }, (_unused, index) => `e${String(index)}`),
     );
+  });
+
+  // The three tests below are what actually justify the 12-digit padding. The
+  // FIFO test above cannot: twelve files are all the same width, so ordering
+  // there would hold at any padding, including none. Crossing a decimal
+  // boundary is where insufficient padding breaks, and seeding the names
+  // directly exercises it through the real recovery path without writing a
+  // thousand files.
+  it('orders correctly across decimal digit boundaries', async () => {
+    for (const seq of [998, 999, 1000, 1001, 9999, 10_000]) {
+      await writeFile(
+        join(dir, `${String(seq).padStart(12, '0')}.jsonl`),
+        `${JSON.stringify(event(`e${String(seq)}`))}\n`,
+      );
+    }
+
+    const queue = await SpoolQueue.open(dir, options());
+    const batch = await queue.nextBatch(1000, BIG);
+
+    expect(batch?.events.map((e) => e['id'])).toEqual([
+      'e998',
+      'e999',
+      'e1000',
+      'e1001',
+      'e9999',
+      'e10000',
+    ]);
+  });
+
+  it('recovers the sequence counter past a boundary', async () => {
+    await writeFile(
+      join(dir, `${String(1000).padStart(12, '0')}.jsonl`),
+      `${JSON.stringify(event('old'))}\n`,
+    );
+
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('new')]);
+
+    // The new batch must take seq 1001 and therefore sort AFTER the old one.
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['old', 'new']);
+  });
+
+  it('would mis-order without the padding, which is why it is there', () => {
+    // Pure demonstration of the failure mode: unpadded, '1000' sorts before
+    // '999'. If this assertion ever flips, the padding has stopped mattering
+    // and the ordering guarantee rests on nothing.
+    const unpadded = [998, 999, 1000, 1001].map((n) => `${String(n)}.jsonl`);
+    const padded = [998, 999, 1000, 1001].map((n) => `${String(n).padStart(12, '0')}.jsonl`);
+
+    expect(unpadded.toSorted()).not.toEqual(unpadded);
+    expect(padded.toSorted()).toEqual(padded);
   });
 
   it('coalesces up to maxEvents but always returns at least one file', async () => {
