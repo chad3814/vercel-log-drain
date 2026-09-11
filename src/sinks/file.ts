@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, statfs, unlink } from 'node:fs/promises';
+import { mkdir, open, readdir, stat, statfs, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
@@ -61,11 +61,16 @@ export const statfsFreeSpace: FreeSpaceProbe = async (path) => {
   return stats.bavail * stats.bsize;
 };
 
+function escapeForRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export async function pruneRetention(
   dir: string,
   prefix: string,
   retentionDays: number,
   nowMs: number,
+  protectedDates: ReadonlySet<string> = new Set(),
 ): Promise<string[]> {
   if (retentionDays <= 0) return [];
 
@@ -76,7 +81,10 @@ export async function pruneRetention(
     return [];
   }
 
-  const pattern = new RegExp(`^${prefix}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
+  // The prefix is operator-supplied and the schema permits '.', a regex
+  // metacharacter. Unescaped, a prefix of `events.log` would also match
+  // `eventsXlog-2020-01-01.jsonl` and delete an unrelated file.
+  const pattern = new RegExp(`^${escapeForRegExp(prefix)}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
   const cutoff = nowMs - retentionDays * DAY_MS;
   const deleted: string[] = [];
 
@@ -85,8 +93,27 @@ export async function pruneRetention(
     if (match === null) continue;
     const dateKey = match[1];
     if (dateKey === undefined) continue;
+
     const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
-    if (Number.isNaN(fileMs) || fileMs >= cutoff) continue;
+    if (Number.isNaN(fileMs)) continue;
+    // Date.parse rolls an impossible date over rather than failing:
+    // 2026-02-30 becomes 2026-03-02. Round-trip it so only a real calendar
+    // date is ever compared against the cutoff.
+    if (new Date(fileMs).toISOString().slice(0, 10) !== dateKey) continue;
+    if (fileMs >= cutoff) continue;
+
+    // A date we hold a handle for is being written to right now.
+    if (protectedDates.has(dateKey)) continue;
+
+    // A recently-written file holds REPLAYED data: a batch delayed past the
+    // retention window still carries its original event dates, so its name
+    // looks expired while its contents only just arrived. Deleting it would
+    // silently discard data the caller was told we accepted — and on POSIX an
+    // unlink beneath an open handle does not even error, the writes simply
+    // vanish. Require the file itself to be stale, not merely its name.
+    const stats = await stat(join(dir, entry)).catch(() => null);
+    if (stats === null || stats.mtimeMs >= cutoff) continue;
+
     await unlink(join(dir, entry));
     deleted.push(entry);
   }
@@ -124,6 +151,7 @@ class FileSink implements Sink {
         this.config.filePrefix,
         this.config.retentionDays,
         Date.now(),
+        new Set(this.handles.keys()),
       );
       if (deleted.length > 0) {
         this.ctx.log.info({ sink: this.name, deleted: deleted.length }, 'pruned old log files');
