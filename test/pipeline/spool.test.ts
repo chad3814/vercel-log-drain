@@ -295,6 +295,24 @@ describe('SpoolQueue', () => {
     expect(batch?.events.map((e) => e['id'])).toEqual(['keep-me']);
   });
 
+  it('evicts nothing when the new batch cannot be renamed into place', async () => {
+    // Distinct from the test above: that one fails at the write, so it never
+    // reaches the eviction at all. This one lets the write succeed and fails
+    // the rename, which is the window where eviction used to have already run.
+    const queue = await SpoolQueue.open(dir, options());
+    const first = await queue.enqueue([event('keep-me')]);
+
+    const tight = await SpoolQueue.open(dir, options({ maxSpoolBytes: first.writtenBytes }));
+    // Block the next sequence number's FINAL path with a directory: renaming a
+    // file onto a directory fails with EISDIR, after a clean write and fsync.
+    await mkdir(join(dir, '000000000001.jsonl'));
+
+    await expect(tight.enqueue([event('doomed')])).rejects.toThrow();
+
+    const batch = await tight.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['keep-me']);
+  });
+
   it('stops tracking a batch it can no longer read', async () => {
     const queue = await SpoolQueue.open(dir, options());
     await queue.enqueue([event('unreadable')]);
