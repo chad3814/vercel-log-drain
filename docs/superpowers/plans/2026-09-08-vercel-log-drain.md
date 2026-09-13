@@ -6209,7 +6209,7 @@ as failed on the first attempt while remaining retryable."
 - Test: `test/pipeline/dispatcher-reconcile.test.ts`
 
 **Interfaces:**
-- Consumes: `SinkWorker` from Task 17; `createSink`, `warningsFor` from `src/sinks/registry.ts`; `compileFilter` from `src/pipeline/filter.ts`; `AppConfig`, `SinkEntry` from `src/config/schema.ts`; `resolveLogsDirectory` from `src/sinks/file.ts`.
+- Consumes: `SinkWorker` from Task 17; `createSink` from `src/sinks/registry.ts`; `compileFilter` from `src/pipeline/filter.ts`; `AppConfig`, `SinkEntry` from `src/config/schema.ts`; `resolveLogsDirectory` from `src/sinks/file.ts`.
 - Produces: `type DispatcherOptions`, `type TestSinkResult`, `class Dispatcher` with `applyConfig`, `enqueue`, `start`, `stop`, `listOrphanedSpools`, `discardOrphan`, `testSink`, `snapshotSinks`, `isDegraded`.
 
 - [ ] **Step 1: Write the failing test**
@@ -6219,6 +6219,7 @@ as failed on the first attempt while remaining retryable."
 ```ts
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -6399,6 +6400,120 @@ describe('Dispatcher', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('keeps previously spooled data when an enabled sink is reconfigured', async () => {
+    // Unlike the toggle test above, this sink is enabled throughout and
+    // already has undelivered data on disk before its settings (not its
+    // enabled flag) change. applyConfig must reopen the SAME spool
+    // directory rather than one whose prior contents are lost.
+    await dispatcher.applyConfig(configWith([fileSink('reconfigured')]));
+    await dispatcher.enqueue([event('a')]);
+    let statuses = await dispatcher.snapshotSinks();
+    expect(statuses.find((s) => s.name === 'reconfigured')?.queue.files).toBe(1);
+
+    await dispatcher.applyConfig(
+      configWith([fileSink('reconfigured', { maxBatchEvents: 42 })]),
+    );
+
+    statuses = await dispatcher.snapshotSinks();
+    expect(statuses.find((s) => s.name === 'reconfigured')?.queue.files).toBe(1);
+  });
+
+  it('ignores a non-directory entry in the spool root when listing orphans', async () => {
+    await writeFile(join(spoolRoot, 'stray-file'), 'x');
+    await mkdir(join(spoolRoot, 'orphan-dir'), { recursive: true });
+    const orphans = await dispatcher.listOrphanedSpools();
+    expect(orphans.map((o) => o.name)).toEqual(['orphan-dir']);
+  });
+
+  it('honors the free-space floor from the config being applied, even on the first call', async () => {
+    // A regression here looks like: applyConfig uses a stale/absent
+    // `this.config` to source the free-space floor while starting new
+    // sinks, because the field is only assigned at the very end of
+    // applyConfig. On the very first call there is no previous config at
+    // all, so the floor silently falls back to 0 and this probe would
+    // wrongly report full acceptance.
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: noFreeSpace,
+    });
+    const config = configWith([fileSink('floor-test')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    await floored.applyConfig(config);
+    await floored.enqueue([event('a')]);
+
+    const statuses = await floored.snapshotSinks();
+    expect(statuses.find((s) => s.name === 'floor-test')?.queue.files).toBe(0);
+
+    await floored.stop(500);
+  });
+
+  it('waits for an in-flight delivery to finish before removing a sink', async () => {
+    // The other reconciliation tests never call dispatcher.start(), so their
+    // workers never run a loop iteration — stop() succeeds trivially whether
+    // or not applyConfig actually awaits it. This test drives a real worker
+    // through a real (slow) delivery and removes the sink while that
+    // delivery is in flight, so a regression that stops awaiting
+    // worker.stop() shows up as applyConfig returning almost instantly
+    // instead of after the delivery completes.
+    let received = 0;
+    const DELIVERY_DELAY_MS = 300;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        setTimeout(() => {
+          received += 1;
+          res.writeHead(204);
+          res.end();
+        }, DELIVERY_DELAY_MS);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address === null || typeof address === 'string') {
+      throw new Error('expected the test server to bind a TCP port');
+    }
+    const port = address.port;
+
+    const slowLoki: SinkEntry = {
+      name: 'slow-loki',
+      enabled: true,
+      filter: {},
+      maxSpoolBytes: 1_048_576,
+      maxBatchEvents: 1000,
+      maxBatchBytes: 1_048_576,
+      config: {
+        type: 'loki',
+        url: `http://127.0.0.1:${String(port)}`,
+        auth: { kind: 'none' },
+        tenantId: null,
+        labels: { static: {}, fromFields: [] },
+        timeoutMs: 5000,
+      },
+    };
+
+    try {
+      await dispatcher.applyConfig(configWith([slowLoki]));
+      await dispatcher.enqueue([event('a')]);
+      dispatcher.start();
+
+      // Give the worker time to claim the batch and start the slow request.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const before = Date.now();
+      await dispatcher.applyConfig(configWith([]));
+      const elapsed = Date.now() - before;
+
+      expect(elapsed).toBeGreaterThanOrEqual(DELIVERY_DELAY_MS - 100);
+      expect(received).toBe(1);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
@@ -6490,6 +6605,14 @@ export class Dispatcher {
     const normalized = config.sinks.map((entry) => this.normalize(entry));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
+    // Committed to applying from here on: `normalize()` is the only step that
+    // can reject the whole config and it has already run. Assigning
+    // `this.config` BEFORE starting anything means `startSink()` reads the
+    // free-space floor from the config being applied rather than from the
+    // previous one -- or, on the very first call, from nothing at all, which
+    // silently floored it at 0 and disabled the check the spec requires.
+    this.config = { ...config, sinks: normalized };
+
     for (const [name, current] of [...this.active]) {
       const next = desired.get(name);
       const unchanged =
@@ -6508,8 +6631,6 @@ export class Dispatcher {
       if (!entry.enabled) continue;
       await this.startSink(entry);
     }
-
-    this.config = { ...config, sinks: normalized };
   }
 
   private async startSink(entry: SinkEntry): Promise<void> {
@@ -6519,6 +6640,9 @@ export class Dispatcher {
     const queue = await SpoolQueue.open(dir, {
       maxSpoolBytes: entry.maxSpoolBytes,
       freeSpaceFloorBytes: this.config?.server.spoolFreeSpaceFloorBytes ?? 0,
+      // Without this the spool swallows its own filesystem errors silently,
+      // which is how a dead-letter overwrite went undetected in Task 16.
+      log: this.options.log,
       ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
     });
 
@@ -7458,7 +7582,7 @@ describe('status routes', () => {
     const response = await app().request('/api/status');
     expect(response.status).toBe(200);
 
-    const snapshot = (await response.json()) as StatusSnapshot;
+    const snapshot: StatusSnapshot = await response.json();
     expect(snapshot.service.state).toBe('ok');
     expect(snapshot.service.version).toBe('9.9.9');
     expect(snapshot.volumes.spool.totalBytes).toBeGreaterThan(0);
@@ -7481,7 +7605,7 @@ describe('status routes', () => {
       lastSuccessAt: null,
       nextRetryAt: 2,
     });
-    const snapshot = (await (await app().request('/api/status')).json()) as StatusSnapshot;
+    const snapshot: StatusSnapshot = await (await app().request('/api/status')).json();
     expect(snapshot.service.state).toBe('degraded');
   });
 
@@ -7742,7 +7866,7 @@ describe('admin routes', () => {
   it('returns the redacted config with its etag', async () => {
     const response = await app().request('/api/admin/config');
     expect(response.status).toBe(200);
-    const body = (await response.json()) as { etag: string; config: { drains: unknown[] } };
+    const body: { etag: string; config: { drains: unknown[] } } = await response.json();
     expect(body.etag).toBe(etag);
     expect(body.config.drains).toEqual([]);
   });
@@ -7755,12 +7879,12 @@ describe('admin routes', () => {
     });
     expect(response.status).toBe(201);
 
-    const created = (await response.json()) as { id: string; secret: string };
+    const created: { id: string; secret: string } = await response.json();
     expect(created.secret.length).toBeGreaterThanOrEqual(16);
 
-    const after = (await (await app().request('/api/admin/config')).json()) as {
+    const after: {
       config: { drains: { id: string; secret: null; hasSecret: boolean }[] };
-    };
+    } = await (await app().request('/api/admin/config')).json();
     expect(after.config.drains[0]?.id).toBe(created.id);
     expect(after.config.drains[0]?.secret).toBeNull();
     expect(after.config.drains[0]?.hasSecret).toBe(true);
@@ -7786,7 +7910,7 @@ describe('admin routes', () => {
       },
     };
     const response = await put({ config: { ...current, sinks: [lokiSink] }, etag });
-    const body = (await response.json()) as { warnings: string[] };
+    const body: { warnings: string[] } = await response.json();
     expect(body.warnings.join(' ')).toContain('requestId');
   });
 
@@ -8141,7 +8265,7 @@ describe('boot', () => {
     try {
       const response = await booted.app.request('/api/admin/config');
       expect(response.status).toBe(200);
-      const body = (await response.json()) as { config: { drains: unknown[] } };
+      const body: { config: { drains: unknown[] } } = await response.json();
       expect(body.config.drains).toEqual([]);
     } finally {
       await booted.shutdown();
@@ -8718,10 +8842,10 @@ describe('end-to-end durability', () => {
       await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
 
       const status = await booted.app.request('/api/status');
-      const snapshot = (await status.json()) as {
+      const snapshot: {
         service: { state: string };
         sinks: { name: string; health: { state: string }; queue: { files: number } }[];
-      };
+      } = await status.json();
       expect(snapshot.service.state).toBe('degraded');
       const loki = snapshot.sinks.find((sink) => sink.name === 'loki');
       expect(loki?.health.state).toBe('failed');
@@ -8985,7 +9109,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body: { error?: string } = await response.json().catch(() => ({}));
     throw new ApiError(response.status, body.error ?? `request failed (${response.status})`);
   }
-  return (await response.json()) as T;
+  // Annotated assignment, not `as T`: oxlint's no-unsafe-type-assertion
+  // rejects narrowing the `any` that .json() returns.
+  const body: T = await response.json();
+  return body;
 }
 
 export function fetchStatus(): Promise<StatusSnapshot> {
