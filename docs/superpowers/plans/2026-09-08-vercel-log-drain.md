@@ -5715,7 +5715,9 @@ class FakeSink implements Sink {
     this.received.push(events);
     return Promise.resolve();
   }
+  closeCount = 0;
   close(): Promise<void> {
+    this.closeCount += 1;
     return Promise.resolve();
   }
 }
@@ -5910,6 +5912,30 @@ describe('SinkWorker', () => {
     expect(attempts).toBe(attemptsAtStop);
     expect(queue.fileCount()).toBe(1);
   });
+
+  it('closes the sink exactly once however often stop() is called', async () => {
+    const sink = new FakeSink('once');
+    const { worker } = await makeWorker(sink);
+
+    worker.start();
+    await Promise.all([worker.stop(1000), worker.stop(1000)]);
+    await worker.stop(1000);
+
+    // Task 18 stops a worker when its sink leaves the config and Task 23 stops
+    // every worker from a signal handler, so concurrent and repeated stops are
+    // expected rather than hypothetical. Nothing here documents Sink.close() as
+    // safe to call twice, so the worker must not rely on that.
+    expect(sink.closeCount).toBe(1);
+  });
+
+  it('closes the sink even if it was never started', async () => {
+    const sink = new FakeSink('unstarted');
+    const { worker } = await makeWorker(sink);
+
+    await worker.stop(1000);
+
+    expect(sink.closeCount).toBe(1);
+  });
 });
 ```
 
@@ -5942,6 +5968,11 @@ export function backoffDelayMs(
   const exponent = Math.max(0, consecutiveFailures - 1);
   const raw = baseMs * 2 ** exponent;
   const capped = Math.min(raw, capMs);
+  // Jitter is added AFTER the cap, so `capMs` bounds the exponential term
+  // rather than the delay actually slept: the true ceiling is
+  // capMs * (1 + JITTER_FRACTION). Jittering a capped value is what keeps
+  // several sinks from retrying in lockstep, so this is deliberate -- but do
+  // not read maxBackoffMs as a hard ceiling on observed delay.
   const jitter = capped * JITTER_FRACTION * random();
   return Math.min(Math.round(capped + jitter), Math.round(capMs * (1 + JITTER_FRACTION)));
 }
@@ -5962,6 +5993,14 @@ export class SinkWorker {
   private state: SinkHealth = initialSinkHealth();
   private running = false;
   private loop: Promise<void> | null = null;
+  /**
+   * Memoised so `stop()` is idempotent. Task 18 stops a worker when its sink
+   * leaves the config and Task 23 stops every worker from a signal handler, so
+   * a reload racing a SIGTERM calls this twice. A plain boolean guard would let
+   * the second caller return while shutdown was still in flight; holding the
+   * promise makes it await the same completion.
+   */
+  private stopping: Promise<void> | null = null;
   private readonly baseBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly random: () => number;
@@ -6086,14 +6125,33 @@ export class SinkWorker {
   }
 
   async stop(deadlineMs: number): Promise<void> {
+    this.stopping ??= this.stopOnce(deadlineMs);
+    await this.stopping;
+  }
+
+  private async stopOnce(deadlineMs: number): Promise<void> {
     this.running = false;
+    // Cut the backoff sleep short rather than waiting it out; a worker in a
+    // 40s backoff would otherwise hold up shutdown for 40s.
+    this.wake?.();
     const pending = this.loop;
     this.loop = null;
-    if (pending === null) return;
-    await Promise.race([
-      pending,
-      new Promise((resolve) => setTimeout(resolve, deadlineMs)),
-    ]);
+    if (pending !== null) {
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      const timeout = new Promise<void>((resolve) => {
+        timeoutHandle = setTimeout(resolve, deadlineMs);
+      });
+      try {
+        await Promise.race([pending, timeout]);
+      } finally {
+        // Without this the deadline timer keeps the process alive for its full
+        // duration after a shutdown that already finished.
+        if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+      }
+    }
+    // Outside the `pending === null` check on purpose: a worker that was
+    // constructed but never started still owns an open sink, and an earlier
+    // draft returned before this line and leaked it.
     await this.options.sink.close();
   }
 }
