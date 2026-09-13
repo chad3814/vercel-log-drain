@@ -20,7 +20,6 @@ function event(id: string) {
 class FakeSink implements Sink {
   readonly type = 'fake';
   readonly received: LogEvent[][] = [];
-  closeCount = 0;
   constructor(
     readonly name: string,
     private readonly behavior: (attempt: number) => Error | null = () => null,
@@ -33,9 +32,15 @@ class FakeSink implements Sink {
     this.received.push(events);
     return Promise.resolve();
   }
-  close(): Promise<void> {
+  closeCount = 0;
+  closeDelayMs = 0;
+  closedAt: number | null = null;
+  async close(): Promise<void> {
     this.closeCount += 1;
-    return Promise.resolve();
+    if (this.closeDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.closeDelayMs));
+    }
+    this.closedAt = Date.now();
   }
 }
 
@@ -242,6 +247,27 @@ describe('SinkWorker', () => {
     await Promise.all([worker.stop(1000), worker.stop(1000)]);
     await worker.stop(1000);
 
+    expect(sink.closeCount).toBe(1);
+  });
+
+  it('makes a second stop() wait for shutdown rather than returning early', async () => {
+    // This pins the property that chose a memoised promise over a boolean
+    // guard. A boolean guard with an early return also closes the sink
+    // exactly once, so the test above cannot tell the two apart -- it would
+    // report a clean stop while close() was still running. Without this
+    // test the design note is an assertion with nothing behind it.
+    const sink = new FakeSink('slow');
+    sink.closeDelayMs = 50;
+    const { worker } = await makeWorker(sink);
+
+    worker.start();
+    const first = worker.stop(1000);
+    const second = worker.stop(1000);
+
+    await second;
+    expect(sink.closedAt).not.toBeNull();
+
+    await first;
     expect(sink.closeCount).toBe(1);
   });
 
