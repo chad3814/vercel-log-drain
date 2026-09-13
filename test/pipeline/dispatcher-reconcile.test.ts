@@ -104,13 +104,46 @@ describe('Dispatcher', () => {
     expect(orphans[0]?.bytes).toBeGreaterThan(0);
   });
 
-  it('resumes the same spool when a sink setting changes', async () => {
-    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: false })]));
-    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: true })]));
+  it('keeps a disabled sink out of the orphan list and preserves its spool', async () => {
+    // This test previously toggled enabled with an EMPTY spool and asserted
+    // only that nothing was orphaned, so it passed even when the queue was
+    // wiped on every applyConfig. Enqueue first, so the disable/enable cycle
+    // has something to lose. A disabled sink is still configured and so is
+    // never an orphan -- classifying it as one would offer an operator's
+    // undelivered data to discardOrphan.
+    await dispatcher.applyConfig(configWith([fileSink('keeper')]));
     await dispatcher.enqueue([event('a')]);
+    const filesFor = async (name: string): Promise<number | undefined> =>
+      (await dispatcher.snapshotSinks()).find((sink) => sink.name === name)?.queue.files;
+    expect(await filesFor('keeper')).toBe(1);
 
-    // Same name means same queue identity, so nothing is orphaned.
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: false })]));
     expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: true })]));
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+    expect(await filesFor('keeper')).toBe(1);
+  });
+
+  it('serialises overlapping applyConfig calls', async () => {
+    // Without the reconcile chain, both calls pass the active.has() check for
+    // 'shared', both open a SpoolQueue on the same directory, and the second
+    // active.set() orphans the first worker -- which keeps running, untracked,
+    // against that same directory.
+    await Promise.all([
+      dispatcher.applyConfig(configWith([fileSink('shared')])),
+      dispatcher.applyConfig(configWith([fileSink('shared')])),
+    ]);
+
+    const statuses = await dispatcher.snapshotSinks();
+    expect(statuses.filter((sink) => sink.name === 'shared')).toHaveLength(1);
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+
+    // The surviving worker must be the tracked one: data enqueued now has to
+    // land in the spool the dispatcher still knows about.
+    await dispatcher.enqueue([event('a')]);
+    const after = await dispatcher.snapshotSinks();
+    expect(after.find((sink) => sink.name === 'shared')?.queue.files).toBe(1);
   });
 
   it('keeps previously spooled data when an enabled sink is reconfigured', async () => {
@@ -289,10 +322,20 @@ describe('Dispatcher', () => {
     // worker.stop() shows up as applyConfig returning almost instantly
     // instead of after the delivery completes.
     let received = 0;
+    let notifyRequestArrived: (() => void) | null = null;
+    const requestArrived = new Promise<void>((resolve) => {
+      notifyRequestArrived = resolve;
+    });
     const DELIVERY_DELAY_MS = 300;
     const server = createServer((req, res) => {
       req.resume();
       req.on('end', () => {
+        // Resolved as soon as the request body is in, before the artificial
+        // delay below — awaited so the test removes the sink exactly once
+        // delivery is genuinely in flight, instead of guessing with a fixed
+        // sleep that could in principle fire before the worker has even
+        // claimed the batch under scheduler pressure.
+        notifyRequestArrived?.();
         setTimeout(() => {
           received += 1;
           res.writeHead(204);
@@ -329,8 +372,18 @@ describe('Dispatcher', () => {
       await dispatcher.enqueue([event('a')]);
       dispatcher.start();
 
-      // Give the worker time to claim the batch and start the slow request.
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait until the worker has actually claimed the batch and its
+      // request has arrived at the server, rather than guessing with a
+      // fixed sleep. Bounded so a genuine failure to deliver times out
+      // instead of hanging the test.
+      const timedOut = Symbol('timed out waiting for the worker to start its delivery');
+      const outcome = await Promise.race([
+        requestArrived,
+        new Promise<typeof timedOut>((resolve) => setTimeout(() => resolve(timedOut), 2000)),
+      ]);
+      if (outcome === timedOut) {
+        throw new Error('timed out waiting for the worker to start its delivery');
+      }
 
       const before = Date.now();
       await dispatcher.applyConfig(configWith([]));

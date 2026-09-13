@@ -268,6 +268,18 @@ export class Dispatcher {
   private active = new Map<string, ActiveSink>();
   private config: AppConfig | null = null;
   private started = false;
+  /**
+   * Reconciliation runs one at a time. `applyConfig` awaits worker shutdown
+   * and spool opening, so two concurrent calls can interleave across those
+   * awaits: both pass the `active.has()` check for the same new sink, both
+   * open a SpoolQueue on the same directory, and the second `active.set()`
+   * orphans the first worker, which keeps running untracked against that
+   * directory. Task 22 calls this straight from an HTTP handler, so two
+   * overlapping PUTs are an ordinary occurrence rather than a rare race.
+   * The guarantee belongs here, in the component that owns the state, not in
+   * every caller. Same chain pattern as ConfigStore.save.
+   */
+  private reconcileChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: DispatcherOptions) {}
 
@@ -289,6 +301,20 @@ export class Dispatcher {
   }
 
   async applyConfig(config: AppConfig): Promise<void> {
+    // `.then(work, work)` so a rejected reconciliation does not wedge every
+    // later one; the chain is kept alive below whatever the outcome.
+    const run = this.reconcileChain.then(
+      () => this.reconcileNow(config),
+      () => this.reconcileNow(config),
+    );
+    this.reconcileChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async reconcileNow(config: AppConfig): Promise<void> {
     const normalized = config.sinks.map((entry) => this.normalize(entry));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
