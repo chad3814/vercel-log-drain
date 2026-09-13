@@ -532,6 +532,13 @@ orphanedSpools[] { name, files, bytes }
 recent   { events: […200], errors: […], rejects: […] }
 ```
 
+All three of `counters.delivered`, `counters.dropped` and `counters.deadLettered`
+count **events**, never batches and never spool files. They appear together in
+one object and operators compare them against each other and against a drain's
+`eventsReceived`, so a file count among them would mix units in a number that
+looks directly comparable. File counts belong in `queue.files`, which reports
+them separately and for a different purpose.
+
 `queue.oldestAgeSec` is derived from the `mtime` of the oldest spool file — the
 age of the batch at the head of the queue, not of the events inside it. It is
 the single most informative number: a steadily climbing

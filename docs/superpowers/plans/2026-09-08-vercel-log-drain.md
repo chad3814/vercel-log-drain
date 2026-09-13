@@ -5755,14 +5755,17 @@ describe('SinkWorker', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  async function makeWorker(sink: Sink): Promise<{ worker: SinkWorker; queue: SpoolQueue }> {
+  async function makeWorker(
+    sink: Sink,
+    maxBatchEvents = 1000,
+  ): Promise<{ worker: SinkWorker; queue: SpoolQueue }> {
     const queue = await SpoolQueue.open(dir, { maxSpoolBytes: 1_048_576, freeSpaceFloorBytes: 0 });
     const worker = new SinkWorker({
       sink,
       queue,
       metrics,
       log: silentLog,
-      maxBatchEvents: 1000,
+      maxBatchEvents,
       maxBatchBytes: 1_048_576,
       baseBackoffMs: 10,
       maxBackoffMs: 40,
@@ -5822,7 +5825,12 @@ describe('SinkWorker', () => {
     const sink = new FakeSink('poison', (attempt) =>
       attempt === 1 ? new PermanentDeliveryError('400 malformed') : null,
     );
-    const { worker, queue } = await makeWorker(sink);
+    // maxBatchEvents is pinned to 1 so 'bad' and 'good' are drained as two
+    // separate batches. With the generous limits used elsewhere in this file,
+    // SpoolQueue.nextBatch() coalesces both enqueued files into one batch, and
+    // the permanent failure would then dead-letter 'good' along with 'bad' --
+    // which is the opposite of what this test exists to demonstrate.
+    const { worker, queue } = await makeWorker(sink, 1);
     await queue.enqueue([event('bad')]);
     await queue.enqueue([event('good')]);
 
@@ -5873,6 +5881,34 @@ describe('SinkWorker', () => {
 
     expect(queue.fileCount()).toBe(0);
     expect(sink.received.flat().map((e) => e['id']).toSorted()).toEqual(['a', 'b']);
+  });
+
+  it('stop() halts the loop and leaves no timer armed to do more work later', async () => {
+    // The test above stops a worker with an empty queue, so it passes whether
+    // or not stop() actually stopped anything. This one keeps the sink failing
+    // so the loop always has work, which is the only way to tell a working
+    // stop() from a broken one.
+    let attempts = 0;
+    const sink = new FakeSink('halt', () => {
+      attempts += 1;
+      return new Error('down');
+    });
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    worker.start();
+    // Let a couple of failure/backoff cycles happen (base 10ms, cap 40ms).
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await worker.stop(1000);
+
+    const attemptsAtStop = attempts;
+    expect(attemptsAtStop).toBeGreaterThan(0);
+
+    // A timer left armed, or a loop still running behind stop(), shows up as
+    // further delivery attempts after stop() has already resolved.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(attempts).toBe(attemptsAtStop);
+    expect(queue.fileCount()).toBe(1);
   });
 });
 ```
@@ -5999,7 +6035,10 @@ export class SinkWorker {
       const failure = error instanceof Error ? error : new Error(String(error));
       if (failure instanceof PermanentDeliveryError) {
         await this.options.queue.deadLetter(batch);
-        this.options.metrics.recordDeadLettered(this.options.sink.name, batch.files.length);
+        // Event count, not file count: `dropped` is event-counted, and all three
+        // counters surface together in one `counters` object, so a file count here
+        // would silently mix units in a number operators compare.
+        this.options.metrics.recordDeadLettered(this.options.sink.name, batch.events.length);
         this.options.log.error(
           { sink: this.options.sink.name, files: batch.files.length, err: failure.message },
           'batch dead-lettered',
@@ -6013,7 +6052,7 @@ export class SinkWorker {
     }
 
     await this.options.queue.ack(batch);
-    this.onSuccess(batch.files.length);
+    this.onSuccess(batch.events.length);
     return true;
   }
 
