@@ -125,27 +125,6 @@ describe('Dispatcher', () => {
     expect(await filesFor('keeper')).toBe(1);
   });
 
-  it('serialises overlapping applyConfig calls', async () => {
-    // Without the reconcile chain, both calls pass the active.has() check for
-    // 'shared', both open a SpoolQueue on the same directory, and the second
-    // active.set() orphans the first worker -- which keeps running, untracked,
-    // against that same directory.
-    await Promise.all([
-      dispatcher.applyConfig(configWith([fileSink('shared')])),
-      dispatcher.applyConfig(configWith([fileSink('shared')])),
-    ]);
-
-    const statuses = await dispatcher.snapshotSinks();
-    expect(statuses.filter((sink) => sink.name === 'shared')).toHaveLength(1);
-    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
-
-    // The surviving worker must be the tracked one: data enqueued now has to
-    // land in the spool the dispatcher still knows about.
-    await dispatcher.enqueue([event('a')]);
-    const after = await dispatcher.snapshotSinks();
-    expect(after.find((sink) => sink.name === 'shared')?.queue.files).toBe(1);
-  });
-
   it('keeps previously spooled data when an enabled sink is reconfigured', async () => {
     // Unlike the toggle test above, this sink is enabled throughout and
     // already has undelivered data on disk before its settings (not its

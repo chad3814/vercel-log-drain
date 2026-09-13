@@ -278,6 +278,15 @@ export class Dispatcher {
    * overlapping PUTs are an ordinary occurrence rather than a rare race.
    * The guarantee belongs here, in the component that owns the state, not in
    * every caller. Same chain pattern as ConfigStore.save.
+   *
+   * Deliberately NOT unit-tested at this level, and do not add one that looks
+   * like it is. An attempt was made and measured: with both calls settled
+   * before any assertion runs, and `active` keyed by sink name, there is
+   * exactly one entry either way, so nothing distinguishes a clean run from
+   * an orphaned-worker race -- it passed 20/20 with the chain removed. The
+   * harm (two workers draining one spool, so one batch delivered twice) only
+   * becomes observable once a loop is running and a real caller overlaps,
+   * which is Task 22's concurrent-PUT test and Task 24's end-to-end run.
    */
   private reconcileChain: Promise<void> = Promise.resolve();
 
