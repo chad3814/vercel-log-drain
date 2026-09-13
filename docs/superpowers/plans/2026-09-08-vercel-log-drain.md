@@ -6340,27 +6340,6 @@ describe('Dispatcher', () => {
     expect(await filesFor('keeper')).toBe(1);
   });
 
-  it('serialises overlapping applyConfig calls', async () => {
-    // Without the reconcile chain, both calls pass the active.has() check for
-    // 'shared', both open a SpoolQueue on the same directory, and the second
-    // active.set() orphans the first worker -- which keeps running, untracked,
-    // against that same directory.
-    await Promise.all([
-      dispatcher.applyConfig(configWith([fileSink('shared')])),
-      dispatcher.applyConfig(configWith([fileSink('shared')])),
-    ]);
-
-    const statuses = await dispatcher.snapshotSinks();
-    expect(statuses.filter((sink) => sink.name === 'shared')).toHaveLength(1);
-    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
-
-    // The surviving worker must be the tracked one: data enqueued now has to
-    // land in the spool the dispatcher still knows about.
-    await dispatcher.enqueue([event('a')]);
-    const after = await dispatcher.snapshotSinks();
-    expect(after.find((sink) => sink.name === 'shared')?.queue.files).toBe(1);
-  });
-
   it('discards an orphaned spool on request', async () => {
     await dispatcher.applyConfig(configWith([fileSink('gone')]));
     await dispatcher.enqueue([event('a')]);
@@ -6624,6 +6603,15 @@ export class Dispatcher {
    * overlapping PUTs are an ordinary occurrence rather than a rare race.
    * The guarantee belongs here, in the component that owns the state, not in
    * every caller. Same chain pattern as ConfigStore.save.
+   *
+   * Deliberately NOT unit-tested at this level, and do not add one that looks
+   * like it is. An attempt was made and measured: with both calls settled
+   * before any assertion runs, and `active` keyed by sink name, there is
+   * exactly one entry either way, so nothing distinguishes a clean run from
+   * an orphaned-worker race -- it passed 20/20 with the chain removed. The
+   * harm (two workers draining one spool, so one batch delivered twice) only
+   * becomes observable once a loop is running and a real caller overlaps,
+   * which is Task 22's concurrent-PUT test and Task 24's end-to-end run.
    */
   private reconcileChain: Promise<void> = Promise.resolve();
 
@@ -7971,6 +7959,29 @@ describe('admin routes', () => {
     const response = await put({ config: { ...current, sinks: [lokiSink] }, etag });
     const body: { warnings: string[] } = await response.json();
     expect(body.warnings.join(' ')).toContain('requestId');
+  });
+
+  it('does not start two workers for one sink under overlapping PUTs', async () => {
+    // Task 18 serialises reconciliation on a promise chain, but that guarantee
+    // is not observable from a unit test of the Dispatcher: with both calls
+    // settled and `active` keyed by name there is one entry either way. Here
+    // it is observable, because the route is a real concurrent caller.
+    // Without serialisation both requests pass the active.has() check for the
+    // same new sink, both open a SpoolQueue on one directory, and the second
+    // orphans the first worker, which keeps draining that spool untracked.
+    const next = { ...current, sinks: [fileSink('racer')] };
+    const [first, second] = await Promise.all([
+      put({ config: next, etag }),
+      put({ config: next, etag }),
+    ]);
+
+    // One wins on the etag; the loser must not have half-applied anything.
+    const codes = [first.status, second.status].toSorted();
+    expect(codes).toEqual([200, 409]);
+
+    const status = await app().request('/api/status');
+    const snapshot: { sinks: { name: string }[] } = await status.json();
+    expect(snapshot.sinks.filter((sink) => sink.name === 'racer')).toHaveLength(1);
   });
 
   it('returns 409 on a stale etag', async () => {
