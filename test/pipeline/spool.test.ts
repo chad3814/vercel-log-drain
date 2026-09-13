@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SpoolQueue } from '../../src/pipeline/spool.js';
@@ -54,7 +54,7 @@ describe('SpoolQueue', () => {
     expect(remaining?.events.map((e) => e['id'])).toEqual(['c']);
   });
 
-  it('delivers in FIFO order across a padding boundary', async () => {
+  it('delivers in FIFO order', async () => {
     const queue = await SpoolQueue.open(dir, options());
     for (let index = 0; index < 12; index += 1) {
       await queue.enqueue([event(`e${String(index)}`)]);
@@ -63,6 +63,58 @@ describe('SpoolQueue', () => {
     expect(batch?.events.map((e) => e['id'])).toEqual(
       Array.from({ length: 12 }, (_unused, index) => `e${String(index)}`),
     );
+  });
+
+  // The three tests below are what actually justify the 12-digit padding. The
+  // FIFO test above cannot: twelve files are all the same width, so ordering
+  // there would hold at any padding, including none. Crossing a decimal
+  // boundary is where insufficient padding breaks, and seeding the names
+  // directly exercises it through the real recovery path without writing a
+  // thousand files.
+  it('orders correctly across decimal digit boundaries', async () => {
+    for (const seq of [998, 999, 1000, 1001, 9999, 10_000]) {
+      await writeFile(
+        join(dir, `${String(seq).padStart(12, '0')}.jsonl`),
+        `${JSON.stringify(event(`e${String(seq)}`))}\n`,
+      );
+    }
+
+    const queue = await SpoolQueue.open(dir, options());
+    const batch = await queue.nextBatch(1000, BIG);
+
+    expect(batch?.events.map((e) => e['id'])).toEqual([
+      'e998',
+      'e999',
+      'e1000',
+      'e1001',
+      'e9999',
+      'e10000',
+    ]);
+  });
+
+  it('recovers the sequence counter past a boundary', async () => {
+    await writeFile(
+      join(dir, `${String(1000).padStart(12, '0')}.jsonl`),
+      `${JSON.stringify(event('old'))}\n`,
+    );
+
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('new')]);
+
+    // The new batch must take seq 1001 and therefore sort AFTER the old one.
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['old', 'new']);
+  });
+
+  it('would mis-order without the padding, which is why it is there', () => {
+    // Pure demonstration of the failure mode: unpadded, '1000' sorts before
+    // '999'. If this assertion ever flips, the padding has stopped mattering
+    // and the ordering guarantee rests on nothing.
+    const unpadded = [998, 999, 1000, 1001].map((n) => `${String(n)}.jsonl`);
+    const padded = [998, 999, 1000, 1001].map((n) => `${String(n).padStart(12, '0')}.jsonl`);
+
+    expect(unpadded.toSorted()).not.toEqual(unpadded);
+    expect(padded.toSorted()).toEqual(padded);
   });
 
   it('coalesces up to maxEvents but always returns at least one file', async () => {
@@ -198,5 +250,66 @@ describe('SpoolQueue', () => {
     expect(queue.fileCount()).toBe(0);
     expect(queue.bytes()).toBe(0);
     expect(await readdir(join(dir, 'dead'))).toEqual([]);
+  });
+
+  // Each of the three tests below fails against the pre-fix implementation.
+  // Write them so they do: a regression test that also passes before the fix
+  // documents nothing.
+
+  it('does not overwrite an existing dead letter after a restart', async () => {
+    // The live directory is empty after the first dead-letter, so a recovery
+    // that only scans the live directory restarts the counter at 0 and reissues
+    // a name `dead/` already holds -- and rename replaces the destination.
+    const first = await SpoolQueue.open(dir, options());
+    await first.enqueue([event('precious')]);
+    const firstBatch = await first.nextBatch(1000, BIG);
+    await first.deadLetter(firstBatch!);
+    expect(await readdir(dir).then((f) => f.filter((x) => x !== 'dead'))).toEqual([]);
+
+    const second = await SpoolQueue.open(dir, options());
+    await second.enqueue([event('newer')]);
+    const secondBatch = await second.nextBatch(1000, BIG);
+    await second.deadLetter(secondBatch!);
+
+    const dead = await readdir(join(dir, 'dead'));
+    expect(dead).toHaveLength(2);
+    const bodies = await Promise.all(dead.map((f) => readFile(join(dir, 'dead', f), 'utf8')));
+    expect(bodies.some((b) => b.includes('precious'))).toBe(true);
+    expect(bodies.some((b) => b.includes('newer'))).toBe(true);
+  });
+
+  it('evicts nothing when the new batch cannot be written', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    const first = await queue.enqueue([event('keep-me')]);
+
+    // Budget is now exactly full, so the next enqueue wants to evict `keep-me`.
+    const tight = await SpoolQueue.open(dir, options({ maxSpoolBytes: first.writtenBytes }));
+    // Block the next sequence number's temp path with a directory: `open(..., 'w')`
+    // on a directory fails with EISDIR, while the spool directory itself stays
+    // writable -- so an eviction, if one were attempted, would succeed.
+    await mkdir(join(dir, '000000000001.jsonl.tmp'));
+
+    await expect(tight.enqueue([event('doomed')])).rejects.toThrow();
+
+    const batch = await tight.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['keep-me']);
+  });
+
+  it('stops tracking a batch it can no longer read', async () => {
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('unreadable')]);
+    expect(queue.fileCount()).toBe(1);
+
+    // Make the batch unreadable without removing the name: readFile on a
+    // directory fails with EISDIR.
+    const name = (await readdir(dir)).find((f) => f.endsWith('.jsonl'));
+    await rm(join(dir, name!));
+    await mkdir(join(dir, name!));
+
+    expect(await queue.nextBatch(1000, BIG)).toBeNull();
+    // A retained entry would overcount bytes for the rest of the process's
+    // life and be re-read on every later call.
+    expect(queue.fileCount()).toBe(0);
+    expect(queue.bytes()).toBe(0);
   });
 });

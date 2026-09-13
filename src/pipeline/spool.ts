@@ -4,8 +4,16 @@ import { logEventSchema } from '../vercel/event.js';
 import { statfsFreeSpace } from '../sinks/file.js';
 import type { LogEvent } from '../vercel/event.js';
 import type { FreeSpaceProbe } from '../sinks/types.js';
+import type { Logger } from '../log.js';
 
 const BATCH_NAME = /^\d{12}\.jsonl$/;
+/**
+ * Sequence prefix of any file in `dead/`. Matches both the plain
+ * `000000000042.jsonl` and the collision-avoiding
+ * `000000000042.1763078400000.jsonl`, so recovery can read the sequence number
+ * off either form.
+ */
+const DEAD_SEQ = /^(\d{12})\./;
 const SEQ_WIDTH = 12;
 const DEAD_DIR = 'dead';
 
@@ -13,6 +21,13 @@ export type SpoolOptions = {
   maxSpoolBytes: number;
   freeSpaceFloorBytes: number;
   freeSpace?: FreeSpaceProbe;
+  /**
+   * Optional, but supply it in production. Without it, a filesystem error
+   * during `ack`, `deadLetter` or overflow eviction is swallowed silently —
+   * which is how a dead-letter name collision went undetected long enough to
+   * destroy a batch during development.
+   */
+  log?: Logger;
 };
 
 export type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number };
@@ -90,6 +105,19 @@ export class SpoolQueue {
       maxSeq = Math.max(maxSeq, Number.parseInt(name.slice(0, SEQ_WIDTH), 10));
     }
 
+    // Sequence numbers must also clear anything already in `dead/`. Without
+    // this, a restart whose live directory is empty resets the counter to 0 and
+    // reissues a name a dead-lettered file already holds; `deadLetter`'s rename
+    // then replaces that file, because POSIX rename replaces its destination.
+    // Reproduced before this was added: a batch dead-lettered in one process
+    // life was silently destroyed by an unrelated batch dead-lettered after a
+    // restart, with no error and no log line.
+    for (const name of await readdir(join(this.dir, DEAD_DIR)).catch(() => [])) {
+      const match = DEAD_SEQ.exec(name);
+      if (match?.[1] === undefined) continue;
+      maxSeq = Math.max(maxSeq, Number.parseInt(match[1], 10));
+    }
+
     this.entries = entries;
     this.totalBytes = total;
     this.seq = maxSeq + 1;
@@ -114,20 +142,32 @@ export class SpoolQueue {
     }
 
     const payload = serialize(events);
-    const droppedEvents = await this.makeRoom(payload.byteLength);
-
     const name = `${String(this.seq).padStart(SEQ_WIDTH, '0')}.jsonl`;
     this.seq += 1;
     const tmpPath = join(this.dir, `${name}.tmp`);
 
-    const handle = await open(tmpPath, 'w');
+    let droppedEvents = 0;
     try {
-      await handle.writeFile(payload);
-      await handle.sync();
-    } finally {
-      await handle.close();
+      // Make the new batch durable BEFORE evicting anything. The eviction used
+      // to come first, so a write that then failed had already destroyed the
+      // older batches it made room for — losing both the old data and the new.
+      // The cost is a brief peak of maxSpoolBytes + this payload on disk.
+      const handle = await open(tmpPath, 'w');
+      try {
+        await handle.writeFile(payload);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+
+      droppedEvents = await this.makeRoom(payload.byteLength);
+      await rename(tmpPath, join(this.dir, name));
+    } catch (error) {
+      // Nothing was evicted if the write itself failed, and the temp file must
+      // not be left for boot recovery to find.
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+      throw error;
     }
-    await rename(tmpPath, join(this.dir, name));
 
     const dirHandle = await open(this.dir, 'r');
     try {
@@ -153,7 +193,9 @@ export class SpoolQueue {
         // Already gone; still account for its bytes below.
       }
       this.totalBytes -= oldest.bytes;
-      await unlink(path).catch(() => undefined);
+      await unlink(path).catch((error: unknown) => {
+        this.reportFsError('unlink during overflow eviction', oldest.name, error);
+      });
     }
     // If a single batch is larger than the whole budget the loop empties the
     // queue and we still write it: refusing the newest data would be worse.
@@ -165,13 +207,20 @@ export class SpoolQueue {
 
     const files: string[] = [];
     const events: LogEvent[] = [];
+    const unreadable: string[] = [];
     let bytes = 0;
 
     for (const entry of this.entries) {
       let text: string;
       try {
         text = await readFile(join(this.dir, entry.name), 'utf8');
-      } catch {
+      } catch (error) {
+        // Stop tracking it. Leaving the entry in place used to overcount
+        // totalBytes for the rest of the process's life, which could evict
+        // live batches to make room that was never occupied — and the entry
+        // was re-read and re-skipped on every later call.
+        this.reportFsError('read', entry.name, error);
+        unreadable.push(entry.name);
         continue;
       }
       const parsed = parseLines(text);
@@ -186,28 +235,60 @@ export class SpoolQueue {
       if (events.length >= maxEvents || bytes >= maxBytes) break;
     }
 
+    if (unreadable.length > 0) this.untrack(unreadable);
     if (files.length === 0) return null;
     return { files, events, bytes };
   }
 
   async ack(batch: SpoolBatch): Promise<void> {
-    await this.removeAll(batch.files, (name) => unlink(join(this.dir, name)));
+    await this.removeAll('ack', batch.files, (name) => unlink(join(this.dir, name)));
   }
 
   async deadLetter(batch: SpoolBatch): Promise<void> {
-    await this.removeAll(batch.files, (name) =>
-      rename(join(this.dir, name), join(this.dir, DEAD_DIR, name)),
+    await this.removeAll('dead-letter', batch.files, async (name) => {
+      await rename(join(this.dir, name), await this.deadPathFor(name));
+    });
+  }
+
+  /**
+   * Where a dead-lettered batch should land. Recovery now scans `dead/` when
+   * choosing sequence numbers, so a collision should be impossible — but this
+   * checks anyway, because POSIX rename REPLACES its destination and a
+   * collision here would silently destroy an already-failed batch, which is
+   * the single thing this directory exists to prevent.
+   */
+  private async deadPathFor(name: string): Promise<string> {
+    const preferred = join(this.dir, DEAD_DIR, name);
+    try {
+      await stat(preferred);
+    } catch {
+      return preferred;
+    }
+    const suffixed = join(
+      this.dir,
+      DEAD_DIR,
+      `${name.slice(0, SEQ_WIDTH)}.${String(Date.now())}.jsonl`,
+    );
+    this.options.log?.error(
+      { dir: this.dir, name, suffixed },
+      'dead-letter name already taken; preserving both rather than replacing',
+    );
+    return suffixed;
+  }
+
+  private reportFsError(operation: string, name: string, error: unknown): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    // An ENOENT means the file was already gone, which is the expected race and
+    // not worth a log line. Anything else is a real filesystem problem.
+    if ('code' in failure && failure.code === 'ENOENT') return;
+    this.options.log?.warn(
+      { dir: this.dir, name, operation, err: failure.message },
+      'spool filesystem operation failed',
     );
   }
 
-  private async removeAll(
-    names: string[],
-    action: (name: string) => Promise<void>,
-  ): Promise<void> {
+  private untrack(names: readonly string[]): void {
     const removing = new Set(names);
-    for (const name of names) {
-      await action(name).catch(() => undefined);
-    }
     const kept: Entry[] = [];
     for (const entry of this.entries) {
       if (removing.has(entry.name)) {
@@ -217,6 +298,23 @@ export class SpoolQueue {
       }
     }
     this.entries = kept;
+  }
+
+  private async removeAll(
+    operation: string,
+    names: string[],
+    action: (name: string) => Promise<void>,
+  ): Promise<void> {
+    for (const name of names) {
+      await action(name).catch((error: unknown) => {
+        this.reportFsError(operation, name, error);
+      });
+    }
+    // The entry is untracked whether or not the filesystem call succeeded. A
+    // file that genuinely cannot be removed would otherwise sit at the head of
+    // the queue and be redelivered forever, which is worse than the byte
+    // undercount — and the failure is now logged rather than swallowed.
+    this.untrack(names);
   }
 
   async oldestMtimeMs(): Promise<number | null> {
@@ -232,7 +330,9 @@ export class SpoolQueue {
 
   async discardAll(): Promise<void> {
     for (const entry of this.entries) {
-      await unlink(join(this.dir, entry.name)).catch(() => undefined);
+      await unlink(join(this.dir, entry.name)).catch((error: unknown) => {
+        this.reportFsError('unlink during discardAll', entry.name, error);
+      });
     }
     this.entries = [];
     this.totalBytes = 0;
