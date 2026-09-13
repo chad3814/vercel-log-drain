@@ -243,6 +243,13 @@ itself pure JSONL.
 
 **Write protocol.** `<name>.tmp` → `fsync` → `rename()` → fsync the directory.
 `rename` is atomic, so a crash mid-write can never expose a partial batch.
+Budget eviction runs only after all four steps have completed: eviction is an
+unlink, so any step still ahead of it can fail with the old batch already
+destroyed and the replacement not yet committed. Boot recovery deletes stray
+`.tmp` files, which leaves such a replacement nowhere to survive. The service
+therefore accepts a transient peak of the sink's byte budget plus one payload,
+and a transient over-budget spool if it crashes between the two — both
+self-heal on the next enqueue, whereas the lost batch does not.
 
 **Boot recovery.** Ensure directories exist; delete stray `.tmp` files; recover
 each sequence counter as `max(existing) + 1`; tally directory sizes. Any

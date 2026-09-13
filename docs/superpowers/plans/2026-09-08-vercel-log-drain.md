@@ -5244,6 +5244,24 @@ describe('SpoolQueue', () => {
     expect(batch?.events.map((e) => e['id'])).toEqual(['keep-me']);
   });
 
+  it('evicts nothing when the new batch cannot be renamed into place', async () => {
+    // Distinct from the test above: that one fails at the write, so it never
+    // reaches the eviction at all. This one lets the write succeed and fails
+    // the rename, which is the window where eviction used to have already run.
+    const queue = await SpoolQueue.open(dir, options());
+    const first = await queue.enqueue([event('keep-me')]);
+
+    const tight = await SpoolQueue.open(dir, options({ maxSpoolBytes: first.writtenBytes }));
+    // Block the next sequence number's FINAL path with a directory: renaming a
+    // file onto a directory fails with EISDIR, after a clean write and fsync.
+    await mkdir(join(dir, '000000000001.jsonl'));
+
+    await expect(tight.enqueue([event('doomed')])).rejects.toThrow();
+
+    const batch = await tight.nextBatch(1000, BIG);
+    expect(batch?.events.map((e) => e['id'])).toEqual(['keep-me']);
+  });
+
   it('stops tracking a batch it can no longer read', async () => {
     const queue = await SpoolQueue.open(dir, options());
     await queue.enqueue([event('unreadable')]);
@@ -5420,12 +5438,15 @@ export class SpoolQueue {
     this.seq += 1;
     const tmpPath = join(this.dir, `${name}.tmp`);
 
-    let droppedEvents = 0;
+    // Commit the new batch COMPLETELY before evicting anything: write, fsync,
+    // rename, and fsync the directory. Eviction is a real unlink, so any step
+    // still ahead of it is a step that can fail with the old batch already
+    // destroyed. An earlier version evicted between the fsync and the rename,
+    // which left a narrow window where a failing rename lost both the evicted
+    // batch and the replacement — boot recovery deletes stray `.tmp` files, so
+    // the replacement had nowhere to survive. Ordering is the whole fix here;
+    // do not move `makeRoom` back inside this block.
     try {
-      // Make the new batch durable BEFORE evicting anything. The eviction used
-      // to come first, so a write that then failed had already destroyed the
-      // older batches it made room for — losing both the old data and the new.
-      // The cost is a brief peak of maxSpoolBytes + this payload on disk.
       const handle = await open(tmpPath, 'w');
       try {
         await handle.writeFile(payload);
@@ -5433,22 +5454,27 @@ export class SpoolQueue {
       } finally {
         await handle.close();
       }
-
-      droppedEvents = await this.makeRoom(payload.byteLength);
       await rename(tmpPath, join(this.dir, name));
+
+      const dirHandle = await open(this.dir, 'r');
+      try {
+        await dirHandle.sync();
+      } finally {
+        await dirHandle.close();
+      }
     } catch (error) {
-      // Nothing was evicted if the write itself failed, and the temp file must
-      // not be left for boot recovery to find.
+      // Nothing has been evicted yet, so the only cleanup is the temp file,
+      // which must not be left for boot recovery to find. After a successful
+      // rename `tmpPath` is already gone and this is a no-op.
       await rm(tmpPath, { force: true }).catch(() => undefined);
       throw error;
     }
 
-    const dirHandle = await open(this.dir, 'r');
-    try {
-      await dirHandle.sync();
-    } finally {
-      await dirHandle.close();
-    }
+    // Safe now: the new batch is durable, so reclaiming space can at worst
+    // leave the spool briefly over budget. `makeRoom` swallows and logs its own
+    // filesystem errors, so a throw here means a programming error; the batch
+    // is on disk either way and boot recovery will pick it up.
+    const droppedEvents = await this.makeRoom(payload.byteLength);
 
     this.entries.push({ name, bytes: payload.byteLength });
     this.totalBytes += payload.byteLength;
