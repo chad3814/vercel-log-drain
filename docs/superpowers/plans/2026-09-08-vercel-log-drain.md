@@ -5716,9 +5716,14 @@ class FakeSink implements Sink {
     return Promise.resolve();
   }
   closeCount = 0;
-  close(): Promise<void> {
+  closeDelayMs = 0;
+  closedAt: number | null = null;
+  async close(): Promise<void> {
     this.closeCount += 1;
-    return Promise.resolve();
+    if (this.closeDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.closeDelayMs));
+    }
+    this.closedAt = Date.now();
   }
 }
 
@@ -5925,6 +5930,27 @@ describe('SinkWorker', () => {
     // every worker from a signal handler, so concurrent and repeated stops are
     // expected rather than hypothetical. Nothing here documents Sink.close() as
     // safe to call twice, so the worker must not rely on that.
+    expect(sink.closeCount).toBe(1);
+  });
+
+  it('makes a second stop() wait for shutdown rather than returning early', async () => {
+    // This pins the property that chose a memoised promise over a boolean
+    // guard. A boolean guard with an early return also closes the sink exactly
+    // once, so the test above cannot tell the two apart -- it would report a
+    // clean stop while close() was still running. Without this test the design
+    // note is an assertion with nothing behind it.
+    const sink = new FakeSink('slow');
+    sink.closeDelayMs = 50;
+    const { worker } = await makeWorker(sink);
+
+    worker.start();
+    const first = worker.stop(1000);
+    const second = worker.stop(1000);
+
+    await second;
+    expect(sink.closedAt).not.toBeNull();
+
+    await first;
     expect(sink.closeCount).toBe(1);
   });
 
