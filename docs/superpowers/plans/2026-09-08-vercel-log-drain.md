@@ -6319,13 +6319,46 @@ describe('Dispatcher', () => {
     expect(orphans[0]?.bytes).toBeGreaterThan(0);
   });
 
-  it('resumes the same spool when a sink setting changes', async () => {
-    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: false })]));
-    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: true })]));
+  it('keeps a disabled sink out of the orphan list and preserves its spool', async () => {
+    // This test previously toggled enabled with an EMPTY spool and asserted
+    // only that nothing was orphaned, so it passed even when the queue was
+    // wiped on every applyConfig. Enqueue first, so the disable/enable cycle
+    // has something to lose. A disabled sink is still configured and so is
+    // never an orphan -- classifying it as one would offer an operator's
+    // undelivered data to discardOrphan.
+    await dispatcher.applyConfig(configWith([fileSink('keeper')]));
     await dispatcher.enqueue([event('a')]);
+    const filesFor = async (name: string): Promise<number | undefined> =>
+      (await dispatcher.snapshotSinks()).find((sink) => sink.name === name)?.queue.files;
+    expect(await filesFor('keeper')).toBe(1);
 
-    // Same name means same queue identity, so nothing is orphaned.
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: false })]));
     expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+
+    await dispatcher.applyConfig(configWith([fileSink('keeper', { enabled: true })]));
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+    expect(await filesFor('keeper')).toBe(1);
+  });
+
+  it('serialises overlapping applyConfig calls', async () => {
+    // Without the reconcile chain, both calls pass the active.has() check for
+    // 'shared', both open a SpoolQueue on the same directory, and the second
+    // active.set() orphans the first worker -- which keeps running, untracked,
+    // against that same directory.
+    await Promise.all([
+      dispatcher.applyConfig(configWith([fileSink('shared')])),
+      dispatcher.applyConfig(configWith([fileSink('shared')])),
+    ]);
+
+    const statuses = await dispatcher.snapshotSinks();
+    expect(statuses.filter((sink) => sink.name === 'shared')).toHaveLength(1);
+    expect(await dispatcher.listOrphanedSpools()).toEqual([]);
+
+    // The surviving worker must be the tracked one: data enqueued now has to
+    // land in the spool the dispatcher still knows about.
+    await dispatcher.enqueue([event('a')]);
+    const after = await dispatcher.snapshotSinks();
+    expect(after.find((sink) => sink.name === 'shared')?.queue.files).toBe(1);
   });
 
   it('discards an orphaned spool on request', async () => {
@@ -6581,6 +6614,18 @@ export class Dispatcher {
   private active = new Map<string, ActiveSink>();
   private config: AppConfig | null = null;
   private started = false;
+  /**
+   * Reconciliation runs one at a time. `applyConfig` awaits worker shutdown
+   * and spool opening, so two concurrent calls can interleave across those
+   * awaits: both pass the `active.has()` check for the same new sink, both
+   * open a SpoolQueue on the same directory, and the second `active.set()`
+   * orphans the first worker, which keeps running untracked against that
+   * directory. Task 22 calls this straight from an HTTP handler, so two
+   * overlapping PUTs are an ordinary occurrence rather than a rare race.
+   * The guarantee belongs here, in the component that owns the state, not in
+   * every caller. Same chain pattern as ConfigStore.save.
+   */
+  private reconcileChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: DispatcherOptions) {}
 
@@ -6602,6 +6647,20 @@ export class Dispatcher {
   }
 
   async applyConfig(config: AppConfig): Promise<void> {
+    // `.then(work, work)` so a rejected reconciliation does not wedge every
+    // later one; the chain is kept alive below whatever the outcome.
+    const run = this.reconcileChain.then(
+      () => this.reconcileNow(config),
+      () => this.reconcileNow(config),
+    );
+    this.reconcileChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async reconcileNow(config: AppConfig): Promise<void> {
     const normalized = config.sinks.map((entry) => this.normalize(entry));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
