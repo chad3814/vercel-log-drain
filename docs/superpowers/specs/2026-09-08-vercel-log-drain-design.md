@@ -131,6 +131,17 @@ unfixable: it is moved to `spool/<sink>/dead/`, counted, and the queue advances.
 Without this distinction, one poison batch at the head of the queue blocks
 delivery forever.
 
+`dead/` is terminal storage, never a staging area: nothing the service does may
+remove or replace a file already in it. Two consequences bind the
+implementation. Batch sequence numbers must be monotonic across the contents of
+`dead/` as well as the live directory, because a restart that finds the live
+directory empty would otherwise reissue a name a dead-lettered file already
+holds — and POSIX `rename` replaces its destination silently. And the move into
+`dead/` must not overwrite an existing name even if one somehow appears. This
+guarantee is what makes the retryable classification of `401`/`403`/`404` worth
+anything: preserving a batch on disk is only a preservation if the next failure
+cannot erase it.
+
 `SinkContext` provides the logger and the metrics recorder, so sinks never
 import them directly.
 
