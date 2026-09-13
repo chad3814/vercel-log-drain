@@ -20,6 +20,7 @@ function event(id: string) {
 class FakeSink implements Sink {
   readonly type = 'fake';
   readonly received: LogEvent[][] = [];
+  closeCount = 0;
   constructor(
     readonly name: string,
     private readonly behavior: (attempt: number) => Error | null = () => null,
@@ -33,6 +34,7 @@ class FakeSink implements Sink {
     return Promise.resolve();
   }
   close(): Promise<void> {
+    this.closeCount += 1;
     return Promise.resolve();
   }
 }
@@ -229,5 +231,26 @@ describe('SinkWorker', () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(attempts).toBe(attemptsAtStop);
     expect(queue.fileCount()).toBe(1);
+  });
+
+  it('closes the sink exactly once however often stop() is called', async () => {
+    const sink = new FakeSink('closer');
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    worker.start();
+    await Promise.all([worker.stop(1000), worker.stop(1000)]);
+    await worker.stop(1000);
+
+    expect(sink.closeCount).toBe(1);
+  });
+
+  it('closes the sink even if it was never started', async () => {
+    const sink = new FakeSink('unstarted');
+    const { worker } = await makeWorker(sink);
+
+    await worker.stop(1000);
+
+    expect(sink.closeCount).toBe(1);
   });
 });

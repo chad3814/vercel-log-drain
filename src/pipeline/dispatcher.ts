@@ -44,6 +44,13 @@ export class SinkWorker {
   // of the delay, so shutdown never leaves a timer armed past the point
   // stop() resolves.
   private wake: (() => void) | null = null;
+  // Memoises the in-flight (or completed) shutdown. A boolean guard would let
+  // a second concurrent stop() caller return immediately while the first
+  // call's shutdown — including sink.close() — was still running, reporting
+  // a clean stop that had not actually happened yet. Sharing the same
+  // promise means every caller, however many, waits for and observes the
+  // same single close().
+  private stopping: Promise<void> | null = null;
   private readonly baseBackoffMs: number;
   private readonly maxBackoffMs: number;
   private readonly random: () => number;
@@ -188,13 +195,30 @@ export class SinkWorker {
   }
 
   /**
+   * Idempotent, concurrency-safe entry point. However many times, and
+   * however many callers, invoke stop() — a signal handler racing a
+   * config-reload path, say — the underlying shutdown in stopOnce() runs
+   * exactly once, and every caller awaits that same run to completion
+   * before returning.
+   */
+  async stop(deadlineMs: number): Promise<void> {
+    this.stopping ??= this.stopOnce(deadlineMs);
+    await this.stopping;
+  }
+
+  /**
    * Signals the loop to stop, wakes it immediately if it is parked in a
    * sleep, and waits up to `deadlineMs` for the current iteration to finish
    * before giving up. Either way, no timer from this worker remains armed
-   * once stop() resolves: the wake-up clears the sleep's own timer, and the
+   * once this resolves: the wake-up clears the sleep's own timer, and the
    * deadline's timer is cleared in the `finally` below.
+   *
+   * sink.close() is called unconditionally, even when `pending` is null
+   * (the worker was constructed but never started, or has already fully
+   * stopped) — a worker that never started still owns a sink that must be
+   * released, and returning early here would leak it.
    */
-  async stop(deadlineMs: number): Promise<void> {
+  private async stopOnce(deadlineMs: number): Promise<void> {
     this.running = false;
     this.wake?.();
     const pending = this.loop;
