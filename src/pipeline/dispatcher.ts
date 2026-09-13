@@ -1,10 +1,19 @@
+import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import { compileFilter } from './filter.js';
+import { SpoolQueue } from './spool.js';
+import { createSink } from '../sinks/registry.js';
+import { resolveLogsDirectory } from '../sinks/file.js';
+import { SINK_NAME_PATTERN } from '../config/schema.js';
 import { AuthDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
 import { initialSinkHealth } from '../status/metrics.js';
+import type { AppConfig, SinkEntry } from '../config/schema.js';
+import type { EventPredicate } from './filter.js';
 import type { Logger } from '../log.js';
 import type { Metrics } from '../status/metrics.js';
-import type { Sink } from '../sinks/types.js';
-import type { SpoolQueue } from './spool.js';
-import type { SinkHealth } from '../../types/api.js';
+import type { FreeSpaceProbe, Sink } from '../sinks/types.js';
+import type { LogEvent } from '../vercel/event.js';
+import type { OrphanedSpool, SinkHealth, SinkStatus } from '../../types/api.js';
 
 const FAILURE_THRESHOLD = 5;
 const IDLE_POLL_MS = 500;
@@ -235,5 +244,239 @@ export class SinkWorker {
       }
     }
     await this.options.sink.close();
+  }
+}
+
+export type TestSinkResult = { ok: boolean; detail: string };
+
+export type DispatcherOptions = {
+  spoolRoot: string;
+  logsRoot: string;
+  metrics: Metrics;
+  log: Logger;
+  freeSpace?: FreeSpaceProbe;
+};
+
+type ActiveSink = {
+  entry: SinkEntry;
+  predicate: EventPredicate;
+  queue: SpoolQueue;
+  worker: SinkWorker;
+};
+
+export class Dispatcher {
+  private active = new Map<string, ActiveSink>();
+  private config: AppConfig | null = null;
+  private started = false;
+
+  constructor(private readonly options: DispatcherOptions) {}
+
+  private spoolDirFor(name: string): string {
+    if (!SINK_NAME_PATTERN.test(name)) {
+      throw new Error(`invalid sink name "${name}"`);
+    }
+    return join(this.options.spoolRoot, name);
+  }
+
+  /**
+   * Normalizes a sink entry, resolving and containing a file sink's directory.
+   * Throws before anything is created so an invalid config cannot half-apply.
+   */
+  private normalize(entry: SinkEntry): SinkEntry {
+    if (entry.config.type !== 'file') return entry;
+    const directory = resolveLogsDirectory(entry.config.directory, this.options.logsRoot);
+    return { ...entry, config: { ...entry.config, directory } };
+  }
+
+  async applyConfig(config: AppConfig): Promise<void> {
+    const normalized = config.sinks.map((entry) => this.normalize(entry));
+    const desired = new Map(normalized.map((entry) => [entry.name, entry]));
+
+    // Committed to applying from here on: `normalize()` above is the only
+    // step that can reject the whole config, and it already has. Setting
+    // `this.config` now — before any worker is stopped or started — means
+    // `startSink()` below sources the free-space floor and any other
+    // server-wide setting from the config actually being applied, not from
+    // whatever was left over from the previous call (or nothing, on the
+    // very first call, where there would be no previous config at all).
+    this.config = { ...config, sinks: normalized };
+
+    for (const [name, current] of this.active) {
+      const next = desired.get(name);
+      const unchanged =
+        next !== undefined && JSON.stringify(next) === JSON.stringify(current.entry);
+      if (unchanged) continue;
+      await current.worker.stop(5000);
+      this.active.delete(name);
+      if (next === undefined) {
+        // Deliberately leaves the spool directory on disk.
+        this.options.metrics.forgetSink(name);
+      }
+    }
+
+    for (const entry of normalized) {
+      if (this.active.has(entry.name)) continue;
+      if (!entry.enabled) continue;
+      await this.startSink(entry);
+    }
+  }
+
+  private async startSink(entry: SinkEntry): Promise<void> {
+    const dir = this.spoolDirFor(entry.name);
+    await mkdir(dir, { recursive: true });
+
+    const queue = await SpoolQueue.open(dir, {
+      maxSpoolBytes: entry.maxSpoolBytes,
+      freeSpaceFloorBytes: this.config?.server.spoolFreeSpaceFloorBytes ?? 0,
+      log: this.options.log,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+
+    const sink = createSink(entry.name, entry.config, {
+      log: this.options.log,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+
+    const worker = new SinkWorker({
+      sink,
+      queue,
+      metrics: this.options.metrics,
+      log: this.options.log,
+      maxBatchEvents: entry.maxBatchEvents,
+      maxBatchBytes: entry.maxBatchBytes,
+    });
+
+    this.active.set(entry.name, {
+      entry,
+      predicate: compileFilter(entry.filter),
+      queue,
+      worker,
+    });
+    if (this.started) worker.start();
+  }
+
+  async enqueue(events: LogEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    for (const active of this.active.values()) {
+      if (!active.entry.enabled) continue;
+      const matching = events.filter((event) => active.predicate(event));
+      if (matching.length === 0) continue;
+      const result = await active.queue.enqueue(matching);
+      if (result.droppedEvents > 0) {
+        this.options.metrics.recordDropped(active.entry.name, result.droppedEvents);
+        this.options.log.warn(
+          { sink: active.entry.name, dropped: result.droppedEvents },
+          'spool overflow dropped oldest batches',
+        );
+      }
+    }
+  }
+
+  start(): void {
+    this.started = true;
+    for (const active of this.active.values()) active.worker.start();
+  }
+
+  async stop(deadlineMs: number): Promise<void> {
+    this.started = false;
+    await Promise.all([...this.active.values()].map((active) => active.worker.stop(deadlineMs)));
+    this.active.clear();
+  }
+
+  async listOrphanedSpools(): Promise<OrphanedSpool[]> {
+    let names: string[];
+    try {
+      names = await readdir(this.options.spoolRoot);
+    } catch {
+      return [];
+    }
+
+    const configured = new Set((this.config?.sinks ?? []).map((entry) => entry.name));
+    const orphans: OrphanedSpool[] = [];
+
+    for (const name of names) {
+      if (configured.has(name)) continue;
+      const dir = join(this.options.spoolRoot, name);
+      const stats = await stat(dir).catch(() => null);
+      if (stats === null || !stats.isDirectory()) continue;
+
+      let files = 0;
+      let bytes = 0;
+      for (const entry of await readdir(dir).catch(() => [])) {
+        if (!entry.endsWith('.jsonl')) continue;
+        const fileStats = await stat(join(dir, entry)).catch(() => null);
+        if (fileStats === null) continue;
+        files += 1;
+        bytes += fileStats.size;
+      }
+      orphans.push({ name, files, bytes });
+    }
+    return orphans;
+  }
+
+  async discardOrphan(name: string): Promise<void> {
+    const orphans = await this.listOrphanedSpools();
+    if (!orphans.some((orphan) => orphan.name === name)) {
+      throw new Error(`"${name}" is not an orphaned spool directory`);
+    }
+    await rm(this.spoolDirFor(name), { recursive: true, force: true });
+  }
+
+  async testSink(name: string): Promise<TestSinkResult> {
+    const active = this.active.get(name);
+    if (active === undefined) {
+      return { ok: false, detail: `sink "${name}" is not running; enable and save it first` };
+    }
+    const probe: LogEvent = {
+      id: `test-${String(Date.now())}`,
+      timestamp: Date.now(),
+      source: 'external',
+      projectId: 'vercel-log-drain',
+      level: 'info',
+      message: `test event from vercel-log-drain for sink ${name}`,
+    };
+    const sink = createSink(active.entry.name, active.entry.config, {
+      log: this.options.log,
+      ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
+    });
+    try {
+      await sink.deliver([probe]);
+      return { ok: true, detail: 'test event accepted' };
+    } catch (error) {
+      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+    } finally {
+      await sink.close();
+    }
+  }
+
+  async snapshotSinks(): Promise<SinkStatus[]> {
+    const counters = this.options.metrics.snapshot().sinkCounters;
+    const statuses: SinkStatus[] = [];
+
+    for (const entry of this.config?.sinks ?? []) {
+      const active = this.active.get(entry.name);
+      const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+      statuses.push({
+        name: entry.name,
+        type: entry.config.type,
+        enabled: entry.enabled,
+        health: this.options.metrics.getSinkHealth(entry.name),
+        queue: {
+          files: active?.queue.fileCount() ?? 0,
+          bytes: active?.queue.bytes() ?? 0,
+          oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+        },
+        counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+      });
+    }
+    return statuses;
+  }
+
+  isDegraded(): boolean {
+    for (const entry of this.config?.sinks ?? []) {
+      if (!entry.enabled) continue;
+      if (this.options.metrics.getSinkHealth(entry.name).state === 'failed') return true;
+    }
+    return false;
   }
 }
