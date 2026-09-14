@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { SpoolQueue } from '../../src/pipeline/spool.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
 import { Metrics } from '../../src/status/metrics.js';
 import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
@@ -102,6 +103,26 @@ describe('Dispatcher', () => {
     expect(orphans.map((o) => o.name)).toEqual(['temporary']);
     expect(orphans[0]?.files).toBe(1);
     expect(orphans[0]?.bytes).toBeGreaterThan(0);
+  });
+
+  it('opens one spool per sink under overlapping applyConfig calls', async () => {
+    // Counting opens rather than inspecting settled state: `active` is keyed
+    // by sink name, so it holds one entry whichever call won, and a test that
+    // asserts on it passes with the reconcile chain removed. Without the
+    // chain both calls clear the active.has() check for the same new sink and
+    // each opens its own SpoolQueue on the same directory, the second
+    // orphaning the first worker, which keeps draining that spool untracked.
+    const openSpy = vi.spyOn(SpoolQueue, 'open');
+    try {
+      await Promise.all([
+        dispatcher.applyConfig(configWith([fileSink('shared')])),
+        dispatcher.applyConfig(configWith([fileSink('shared')])),
+      ]);
+
+      expect(openSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 
   it('keeps a disabled sink out of the orphan list and preserves its spool', async () => {
