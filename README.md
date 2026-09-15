@@ -278,10 +278,8 @@ not history.
   failures), and `failed` (five or more consecutive failures, or a single
   authentication failure — a `401`/`403`/`404` from Loki escalates straight
   to `failed` rather than waiting out several backoff rounds to say so).
-  `/readyz` answers `503` while any _enabled_ sink is `failed`, while the
-  spool volume is below its free-space floor (events are being dropped), or
-  while **no** sink is enabled at all — a service with nowhere to put a
-  delivery is not ready, even though ingest still answers `200`. Retry backoff
+  A failed sink makes `service.state` `degraded` but does **not** make
+  `/readyz` answer `503` — see Readiness below. Retry backoff
   doubles from `RETRY_BASE_MS` (default `1000`) up to `RETRY_MAX_MS` (default
   `60000`), plus up to 30% jitter — so the real ceiling on any single wait is
   about 1.3× `RETRY_MAX_MS`, not `RETRY_MAX_MS` itself.
@@ -295,6 +293,30 @@ not history.
   would be the wrong answer to a wrong setting — health goes straight to
   `failed` so you are told at once. Nothing deletes a dead letter
   automatically; find and clear them by hand.
+
+### Readiness vs. degraded
+
+`/healthz` (liveness) answers `200` whenever the process is listening.
+
+`service.state` on `/api/status` is `degraded` in three cases: an enabled sink
+is `failed`, the spool volume is below its free-space floor, or **no** sink is
+enabled at all (a service with nowhere to put a delivery is not healthy, even
+though ingest still answers `200`).
+
+`/readyz` is deliberately narrower and answers `503` for **only** the middle
+one — the spool volume below its floor. The reason is that an orchestrator
+acting on a failing readiness probe removes this pod from rotation along with
+the admin UI and API, which the same process serves. A failed sink's URL or
+credential is fixed _through that UI_, and so is adding the first sink; the
+default config ships with none, so gating readiness on `degraded` would leave
+a fresh deployment permanently not-ready with no way for anyone to reach the
+page that would fix it. The free-space floor is exempt because it is not fixed
+in the browser — you free or resize the volume — and refusing traffic there is
+honest, since the service genuinely cannot store what it would be handed.
+
+So: watch `service.state` for "something needs attention", and `/readyz` for
+"do not send this instance traffic".
+
 - An **orphaned spool** is a directory under `/spool` for a sink name that no
   longer appears in the current config — typically left behind after
   renaming or deleting a sink. It is never removed automatically, since it

@@ -114,18 +114,27 @@ export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
  * transient problem into an outage.
  *
  * GET /readyz -- readiness. Unlike liveness, readiness is ALLOWED to
- * report not-ready: it answers whether the service can actually accept and
- * durably persist a delivery right now, not merely whether the process
- * exists. It reports 503 while `dispatcher.isDegraded()`, which is true in
- * three cases: some enabled sink has hit its consecutive-failure threshold;
- * the spool volume is below its free-space floor, so acknowledged
- * deliveries are being discarded (spec §4 and §10, which names "a full
- * spool volume" explicitly); or no sink is enabled at all, so a delivery
- * would be answered 200 and stored nowhere. The first is a sink stuck
- * retrying -- an operator should look at it, and a load balancer is
- * entitled to take this instance out of rotation, even though the drain
- * route would still accept and spool new events. The other two are active
- * data loss, which is the strongest reason this endpoint has to say no.
+ * report not-ready: it answers whether the service can durably persist a
+ * delivery right now, not merely whether the process exists. It reports 503
+ * for exactly one condition -- `dispatcher.spoolBelowFloor()`, the spool
+ * volume below its free-space floor, where acknowledged deliveries are
+ * being discarded (spec §4).
+ *
+ * Deliberately NARROWER than `isDegraded()`, which also covers a failed
+ * sink and a config with no sinks. Spec §10: "readiness must not gate the
+ * surface that fixes it." An orchestrator that pulls a pod out of rotation
+ * on a failing readiness probe also pulls the admin UI and API, which this
+ * same process serves, and both of those conditions are fixed THROUGH that
+ * UI -- a Loki URL typo, or adding the first sink. Gating on them
+ * deadlocks: `defaultAppConfig()` ships no sinks, so a fresh deployment
+ * would be permanently not-ready and an operator could never reach the page
+ * that would make it ready. Both still show on `/api/status` as
+ * `service.state: degraded`, which is where an operator reads them.
+ *
+ * The free-space floor is exempt from that reasoning because it is not
+ * fixed through the browser -- an operator frees or resizes the volume --
+ * and refusing traffic there is honest: the service genuinely cannot store
+ * what it would be handed.
  *
  * Readiness still does not probe the filesystem itself (that is
  * `/api/status`'s job, and duplicating it here would make readyz slow and
@@ -136,7 +145,7 @@ export function healthRoutes(deps: StatusDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
   app.get('/healthz', (c) => c.text('ok'));
   app.get('/readyz', (c) =>
-    deps.dispatcher.isDegraded() ? c.text('degraded', 503) : c.text('ready'),
+    deps.dispatcher.spoolBelowFloor() ? c.text('degraded', 503) : c.text('ready'),
   );
   return app;
 }

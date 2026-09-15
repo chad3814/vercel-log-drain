@@ -405,7 +405,13 @@ describe('end-to-end durability', () => {
       expect(loki?.health.state).toBe('failed');
       expect(loki?.queue.files).toBeGreaterThan(0);
 
-      expect((await booted.app.request('/readyz')).status).toBe(503);
+      // Readiness stays 200 for a wedged sink (spec §10): a 503 here has an
+      // orchestrator pull the pod from rotation together with the admin UI
+      // this process serves, and the wrong Loki URL is fixed through that
+      // UI. The signal an operator acts on is `service.state` above, which
+      // is asserted degraded; readiness is reserved for the spool floor,
+      // covered by the test above this one.
+      expect((await booted.app.request('/readyz')).status).toBe(200);
       expect((await booted.app.request('/healthz')).status).toBe(200);
     } finally {
       await booted.shutdown();

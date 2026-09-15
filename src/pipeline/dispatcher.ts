@@ -708,16 +708,36 @@ export class Dispatcher {
     return statuses;
   }
 
+  /**
+   * Whether the spool volume is refusing writes for at least one sink, so
+   * acknowledged deliveries are being discarded (spec §4).
+   *
+   * Exposed separately from `isDegraded()` because this is the ONLY condition
+   * `/readyz` may report: spec §10, "readiness must not gate the surface that
+   * fixes it". An orchestrator acting on a failing readiness probe also
+   * removes the admin UI and API, which this same process serves — and a
+   * failed sink's URL, or a config with no sinks at all, are both fixed
+   * through that UI. Gating readiness on those deadlocks a fresh deployment:
+   * the default config has no sinks, so it would never become ready and an
+   * operator could never reach the page that would make it ready. A full
+   * spool volume is different: an operator frees or resizes the volume, not
+   * the browser, and refusing traffic is honest because the service really
+   * cannot store what it would be handed.
+   */
+  spoolBelowFloor(): boolean {
+    return this.belowFloor.size > 0;
+  }
+
   isDegraded(): boolean {
     // A service with nowhere to put a delivery is not healthy, whatever the
     // per-sink health says: the drain route answers 200 and the events are
     // stored nowhere. This also covers the never-configured dispatcher, and
     // the first-boot window where a drain exists before any sink does.
+    //
+    // Reported on the status page, NOT by /readyz -- see spoolBelowFloor().
     if (this.enabledSinkCount() === 0) return true;
 
-    // The spool volume is refusing writes for at least one sink, so
-    // acknowledged deliveries are being discarded (spec §4, §10).
-    if (this.belowFloor.size > 0) return true;
+    if (this.spoolBelowFloor()) return true;
 
     for (const entry of this.config?.sinks ?? []) {
       if (!entry.enabled) continue;

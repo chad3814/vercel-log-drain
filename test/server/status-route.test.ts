@@ -199,13 +199,19 @@ describe('status routes', () => {
     });
     expect(dispatcher.isDegraded()).toBe(true);
 
-    // Readiness is allowed to say no here; liveness is not.
-    expect((await app().request('/readyz')).status).toBe(503);
     expect((await app().request('/healthz')).status).toBe(200);
   });
 
-  it('answers readyz with 200 when healthy and 503 when degraded', async () => {
+  it('answers readyz 200 for a failed sink, whose fix is reachable only here', async () => {
+    // Readiness is narrower than `degraded` on purpose (spec §10). An
+    // orchestrator acting on a 503 here pulls the pod out of rotation along
+    // with the admin UI this same process serves -- and a failed sink's URL
+    // or credential is fixed THROUGH that UI, so a 503 would lock the
+    // operator out of the only fix. The condition is still reported, as
+    // `service.state`, which the assertion below pins so this cannot be
+    // mistaken for the service failing to notice.
     expect((await app().request('/readyz')).status).toBe(200);
+
     metrics.setSinkHealth('local', {
       state: 'failed',
       consecutiveFailures: 6,
@@ -214,6 +220,110 @@ describe('status routes', () => {
       lastSuccessAt: null,
       nextRetryAt: 2,
     });
-    expect((await app().request('/readyz')).status).toBe(503);
+
+    expect((await app().request('/readyz')).status).toBe(200);
+    expect(await (await app().request('/api/status')).json()).toMatchObject({
+      service: { state: 'degraded' },
+    });
+  });
+
+  it('answers readyz 200 with no sinks configured, while status reports degraded', async () => {
+    // The deadlock this narrowing exists for, pinned as two separate
+    // signals. defaultAppConfig() ships `sinks: []`, so a fresh deployment
+    // is degraded from its first second. With /readyz wired to isDegraded()
+    // an orchestrator removes the pod from its Service endpoints, the
+    // operator cannot reach the SPA to add a sink, and it can never become
+    // ready -- permanently, on first boot. So readiness must say yes here
+    // while the status page says degraded, and the two must be asserted
+    // apart or the regression comes straight back.
+    const empty: AppConfig = { ...defaultAppConfig(), drains: [], sinks: [] };
+    const bare = new Dispatcher({ spoolRoot, logsRoot, metrics: new Metrics(), log: silentLog });
+    try {
+      await bare.applyConfig(empty);
+      expect(bare.isDegraded()).toBe(true);
+
+      const deps = {
+        getConfig: () => empty,
+        dispatcher: bare,
+        metrics,
+        version: '9.9.9',
+        configDir: spoolRoot,
+        spoolDir: spoolRoot,
+      };
+      const instance = new Hono<AppEnv>();
+      instance.route('/api/status', statusRoutes(deps));
+      instance.route('/', healthRoutes(deps));
+
+      expect((await instance.request('/readyz')).status).toBe(200);
+      expect((await instance.request('/healthz')).status).toBe(200);
+      expect(await (await instance.request('/api/status')).json()).toMatchObject({
+        service: { state: 'degraded' },
+      });
+    } finally {
+      await bare.stop(500);
+    }
+  });
+
+  it('answers readyz 503 while the spool volume cannot accept a write', async () => {
+    // The one condition readiness keeps, because it is NOT fixed through the
+    // admin UI -- an operator frees or resizes the volume -- and refusing
+    // traffic is honest: acknowledged deliveries are being discarded right
+    // now. Driven through a real enqueue, so this reports what the spool
+    // actually observed rather than a hand-set flag.
+    const flooredConfig: AppConfig = {
+      ...defaultAppConfig(),
+      sinks: [
+        {
+          name: 'floored',
+          enabled: true,
+          filter: {},
+          maxSpoolBytes: 1_048_576,
+          maxBatchEvents: 1000,
+          maxBatchBytes: 1_048_576,
+          config: {
+            type: 'file',
+            directory: join(logsRoot, 'floored'),
+            filePrefix: 'events',
+            retentionDays: 0,
+            freeSpaceFloorBytes: 0,
+          },
+        },
+      ],
+    };
+    flooredConfig.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: () => Promise.resolve(0),
+    });
+    try {
+      await floored.applyConfig(flooredConfig);
+
+      const deps = {
+        getConfig: () => flooredConfig,
+        dispatcher: floored,
+        metrics,
+        version: '9.9.9',
+        configDir: spoolRoot,
+        spoolDir: spoolRoot,
+      };
+      const instance = new Hono<AppEnv>();
+      instance.route('/api/status', statusRoutes(deps));
+      instance.route('/', healthRoutes(deps));
+
+      // Nothing dropped yet, so the volume has not refused anything.
+      expect((await instance.request('/readyz')).status).toBe(200);
+
+      await floored.enqueue([{ id: 'a', timestamp: 1000, source: 'lambda', projectId: 'p1' }]);
+
+      expect((await instance.request('/readyz')).status).toBe(503);
+      // And liveness still says yes: killing the process does not free disk.
+      expect((await instance.request('/healthz')).status).toBe(200);
+    } finally {
+      await floored.stop(500);
+    }
   });
 });

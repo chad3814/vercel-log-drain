@@ -590,8 +590,11 @@ restart, which the page states plainly so they are not misread as historical
 totals. `recent.events` is a short tail to confirm arrival, not a log browser.
 
 `/healthz` returns 200 whenever the process is listening (liveness).
-`/readyz` returns 503 while the service is `degraded`, so an orchestrator can
-react to a wedged sink or a full spool volume.
+`/readyz` returns 503 while the spool volume is below its free-space floor, so
+an orchestrator can react to a spool that can no longer accept a write — and
+only for that, per the readiness note above. (This sentence previously said
+"while the service is `degraded` … a wedged sink or a full spool volume",
+which that note supersedes.)
 
 The SPA is React + Vite with three views — Status, Drains, Sinks — polling with
 `setInterval` and `fetch`. No websockets.
