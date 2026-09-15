@@ -1,0 +1,85 @@
+# Example stack: the drain service behind Caddy, shipping to Loki, viewed in
+# Grafana. Copy to docker-compose.yml and adjust before using.
+services:
+  drain:
+    build:
+      context: .
+      args:
+        APP_VERSION: '0.1.0'
+    init: true
+    # Boot fails fast (and loudly) on a malformed AUTH_MODE, AUTH_TRUSTED_PROXIES,
+    # AUTH_USER_HEADER, RETRY_BASE_MS, or RETRY_MAX_MS, or on an unwritable
+    # volume -- a misconfiguration turns into a crash loop rather than a
+    # service that limps along. `unless-stopped` is safe here without any
+    # extra backoff configuration: the Docker daemon's restart policy already
+    # applies an increasing delay between restarts (starting at ~100ms,
+    # doubling up to a 1-minute cap) for every policy including this one, so
+    # a bad config does not hammer the host in a tight loop.
+    restart: unless-stopped
+    environment:
+      AUTH_MODE: proxy
+      # The Docker bridge network. Narrow this to your proxy's actual address.
+      AUTH_TRUSTED_PROXIES: '172.16.0.0/12'
+      AUTH_USER_HEADER: X-Forwarded-User
+      # AUTH_ALLOWED_USERS: 'you@example.com'
+      LOG_LEVEL: info
+    # Named volumes, not bind mounts: on first use Docker populates a new
+    # named volume from the image's own /config, /spool, /logs directories,
+    # which the Dockerfile already chowns to uid/gid 10001 -- so these three
+    # volumes are writable by the non-root user this container runs as with
+    # no host-side setup.
+    #
+    # If you switch any of these to a bind mount of a pre-existing host
+    # directory instead (e.g. `/srv/drain/logs:/logs`), Docker does NOT copy
+    # ownership into a bind mount: you must `chown -R 10001:10001` that host
+    # directory yourself first, or every write fails and the container
+    # crash-loops on boot (see the restart-policy note above for why that
+    # loop is at least rate-limited, not why it's avoided).
+    volumes:
+      - drain-config:/config
+      - drain-spool:/spool
+      - drain-logs:/logs
+    # No published port: only Caddy should reach it.
+    expose:
+      - '8080'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '8080:80'
+    volumes:
+      - ./examples/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - drain
+
+  loki:
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    expose:
+      - '3100'
+    volumes:
+      - loki-data:/loki
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    depends_on:
+      - loki
+
+# Separate named volumes for config, spool, and logs are the point: a full
+# logs volume then becomes backpressure rather than a failure that also takes
+# the queue down. Do not collapse them into one mount to "simplify" this.
+volumes:
+  drain-config:
+  drain-spool:
+  drain-logs:
+  loki-data:
+  caddy-data:

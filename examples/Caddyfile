@@ -1,0 +1,23 @@
+# The split that matters: Vercel must reach /api/drain/* WITHOUT SSO, because
+# it authenticates by HMAC signature and cannot present an identity. Everything
+# else is the admin surface and must be authenticated.
+:80 {
+	# --- Unauthenticated: the drain endpoint and health probes. ---
+	@public path /api/drain/* /healthz /readyz
+	handle @public {
+		reverse_proxy drain:8080
+	}
+
+	# --- Authenticated: the admin API and the SPA. ---
+	handle {
+		# Replace with a real hash: `caddy hash-password`
+		basic_auth {
+			admin $2a$14$REPLACE_WITH_YOUR_OWN_BCRYPT_HASH
+		}
+		reverse_proxy drain:8080 {
+			# The service reads this header, but only for requests whose socket
+			# peer is inside AUTH_TRUSTED_PROXIES.
+			header_up X-Forwarded-User {http.auth.user.id}
+		}
+	}
+}

@@ -11,7 +11,8 @@
     "build:web": "vite build",
     "start": "node dist/src/index.js",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "smoke": "bash scripts/smoke.sh"
   },
   "type": "module",
   "private": true,
