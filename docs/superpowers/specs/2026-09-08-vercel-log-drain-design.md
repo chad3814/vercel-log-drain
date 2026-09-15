@@ -179,7 +179,7 @@ Three independent mounts, each checked against its own filesystem with
 | Mount | Default | Contents | Behavior on low free space |
 |---|---|---|---|
 | config | `/config` | `config.json`, `config.json.bak` | Writes are tiny. A full volume fails the admin save with `507` and a clear message; the running config is unaffected because it is held in memory. |
-| spool | `/spool` | `<sink>/*.jsonl`, `<sink>/dead/` | `statfs(SPOOL_DIR)` before enqueue. Below the floor: drop oldest within that sink's budget, increment `droppedEvents`, mark the service `degraded`. |
+| spool | `/spool` | `<sink>/*.jsonl`, `<sink>/dead/` | `statfs(SPOOL_DIR)` before enqueue. Below the floor: discard the incoming batch, increment `droppedEvents`, mark the service `degraded`, and record it in `recent.errors`. **See the open question below.** |
 | logs | `/logs` | `events-YYYY-MM-DD.jsonl` | `statfs` on the file sink's own directory before appending. Below the floor: `deliver()` throws a **retryable** error. |
 
 Because the logs volume is separate, a full logs volume loses nothing: the
@@ -240,6 +240,27 @@ not a deduplication cache.
 sequence, so lexicographic order is FIFO order. Content is one JSON event per
 line; batch metadata is carried by the filename and directory, keeping the file
 itself pure JSONL.
+
+**Open question — what the spool free-space floor should do.** An earlier draft
+of the table above said "drop oldest within that sink's budget". That is wrong
+for this condition and has been corrected to describe what the code does:
+dropping one sink's oldest batch cannot free a volume that some other sink, or
+something outside the service entirely, has filled. Two defensible behaviours
+remain, and the choice is an operational trade rather than a technical one:
+
+- **Shed (current).** Discard the incoming batch, count it, report `degraded`,
+  and record it in `recent.errors`. Ingest stays up for every sink, including
+  healthy ones, and a full volume costs the newest events.
+- **Backpressure.** Refuse the delivery so Vercel retries. This makes "no
+  acknowledged delivery is ever lost" true without qualification — the service
+  never acknowledges what it cannot store — at the cost of coupling ingest to
+  disk pressure: one stuck sink filling the volume would stop deliveries that a
+  healthy sink could have taken.
+
+The logs volume already uses backpressure (§4), so the two volumes are
+currently inconsistent, which is the strongest argument for changing this. It
+is deliberately unresolved pending the operator's judgement; the current
+behaviour is at least honest and visible, which the original was not.
 
 **Write protocol.** `<name>.tmp` → `fsync` → `rename()` → fsync the directory.
 `rename` is atomic, so a crash mid-write can never expose a partial batch.
@@ -557,8 +578,9 @@ sinks[]  { name, type, enabled,
            health: { state, consecutiveFailures, lastError, lastErrorAt,
                      lastSuccessAt, nextRetryAt },
            queue:  { files, bytes, oldestAgeSec },
+           dead:   { files, bytes },
            counters: { delivered, dropped, deadLettered } }
-orphanedSpools[] { name, files, bytes }
+orphanedSpools[] { name, files, bytes, dead: { files, bytes } }
 recent   { events: […200], errors: […], rejects: […] }
 ```
 
