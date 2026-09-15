@@ -6594,6 +6594,26 @@ describe('Dispatcher', () => {
     }
   });
 
+  it('does not let a config apply racing shutdown resurrect a worker', async () => {
+    // Without the `stopped` gate and the chain await in stop(), the queued
+    // reconcile repopulates `active` AFTER stop() clears it, leaving a worker
+    // that was never started and that enqueue() would still write to -- a
+    // spool nobody drains. `active` is private, so the observable is whether
+    // a batch lands on disk after shutdown.
+    const batchCount = async (): Promise<number> => {
+      const entries = await readdir(spoolRoot, { recursive: true });
+      return entries.filter((entry) => entry.endsWith('.jsonl')).length;
+    };
+
+    const pending = dispatcher.applyConfig(configWith([fileSink('late')]));
+    await dispatcher.stop(500);
+    await pending;
+
+    const before = await batchCount();
+    await dispatcher.enqueue([event('a')]);
+    expect(await batchCount()).toBe(before);
+  });
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
@@ -6688,6 +6708,8 @@ export class Dispatcher {
    * of spools opened for one directory is the thing that actually differs.
    */
   private reconcileChain: Promise<void> = Promise.resolve();
+  /** Set by `stop()`; makes any later or still-queued reconcile a no-op. */
+  private stopped = false;
 
   constructor(private readonly options: DispatcherOptions) {}
 
@@ -6723,6 +6745,10 @@ export class Dispatcher {
   }
 
   private async reconcileNow(config: AppConfig): Promise<void> {
+    if (this.stopped) {
+      this.options.log.warn('ignoring a config apply that arrived after shutdown');
+      return;
+    }
     const normalized = config.sinks.map((entry) => this.normalize(entry));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
@@ -6813,6 +6839,15 @@ export class Dispatcher {
   }
 
   async stop(deadlineMs: number): Promise<void> {
+    // Close the door before draining the room. Setting `stopped` first makes
+    // any reconcile still queued on the chain a no-op, and awaiting the chain
+    // lets one already in flight finish -- otherwise it repopulates `active`
+    // AFTER this method has cleared it, leaving an orphaned worker that was
+    // never started and that `enqueue` would still write to. A config reload
+    // racing a SIGTERM is ordinary, not a rare interleaving.
+    this.stopped = true;
+    await this.reconcileChain.catch(() => undefined);
+
     this.started = false;
     await Promise.all([...this.active.values()].map((active) => active.worker.stop(deadlineMs)));
     this.active.clear();
@@ -8807,6 +8842,37 @@ describe('boot', () => {
     }
   });
 
+  it('answers 404 for an unmatched API path instead of the SPA shell', async () => {
+    // The SPA catch-all is registered last so client-side routes load the
+    // shell, which means an /api path that matched no route would otherwise
+    // come back 200 with HTML. A mistyped or withdrawn endpoint then looks
+    // alive to a client and to monitoring.
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      const response = await booted.app.request('/api/unknown-endpoint');
+      expect(response.status).toBe(404);
+      // Assert on the body too: a 404 that still carried the shell would
+      // mean the catch-all ran and merely relabelled the status.
+      expect(await response.text()).not.toContain('<html');
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('answers 404 for a malformed percent-escape rather than 500', async () => {
+    // decodeURIComponent throws URIError on `/%ZZ`. Uncaught that is an
+    // unlogged 500, which also invites a caller to retry a request that can
+    // never succeed.
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      for (const bad of ['/%ZZ', '/%c0%ae%c0%ae%2fconfig']) {
+        expect((await booted.app.request(bad)).status).toBe(404);
+      }
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
   it('refuses to serve a path that escapes the web root', async () => {
     // PERCENT-ENCODED, not literal `../`. A literal `..` is removed by the
     // WHATWG URL parser before any app code runs, so asserting on
@@ -8934,7 +9000,16 @@ export function staticHandler(webRoot: string): MiddlewareHandler<AppEnv> {
   const root = resolve(webRoot);
 
   return async (c) => {
-    const requested = decodeURIComponent(new URL(c.req.url).pathname);
+    // decodeURIComponent throws URIError on a malformed escape (`/%ZZ`, or an
+    // overlong UTF-8 sequence). Uncaught, that surfaces as an unlogged 500
+    // from Hono's default handler -- a 500 is also a worse answer than 404,
+    // since it invites a caller to retry a request that can never succeed.
+    let requested: string;
+    try {
+      requested = decodeURIComponent(new URL(c.req.url).pathname);
+    } catch {
+      return c.text('not found', 404);
+    }
     const candidate = resolve(join(root, requested === '/' ? 'index.html' : requested));
 
     // Containment: never serve anything outside the web root.
@@ -9019,6 +9094,15 @@ export function buildApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/api/status', statusRoutes(deps.status));
 
   if (deps.webRoot !== null) {
+    // Registered before the SPA catch-all below, and after every real API
+    // route above: any /api path arriving here matched nothing, so it is a
+    // 404. Without this the catch-all serves the SPA shell with a 200, and a
+    // mistyped or withdrawn endpoint looks alive to a client and to
+    // monitoring. Deliberately outside the guard -- answering 404 to an
+    // unauthenticated prober discloses only that the path does not exist,
+    // whereas routing it through the guard would turn every typo into a 503.
+    app.all('/api/*', (c) => c.json({ code: 'not_found' }, 404));
+
     app.use('*', guard);
     app.get('*', staticHandler(deps.webRoot));
   }
