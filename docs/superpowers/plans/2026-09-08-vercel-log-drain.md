@@ -8785,6 +8785,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { serve } from '@hono/node-server';
 import { boot } from '../../src/index.js';
 
 describe('boot', () => {
@@ -8896,6 +8897,50 @@ describe('boot', () => {
       expect(deep.status).toBe(200);
       expect(await deep.text()).toContain('<title>drain</title>');
     } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('authenticates an admin request in proxy mode over a real socket', async () => {
+    // The ONLY test that exercises the auth feature in its production mode
+    // end to end, and it needs a real listener: under app.request() there is
+    // no socket, so nodePeerResolver returns undefined and the request is
+    // refused at the peer check before the identity header is ever read.
+    // That is why every other test in this file boots unset or disabled, and
+    // why a global identity strip that broke proxy mode completely survived
+    // two reviews.
+    const booted = await bootWith({
+      AUTH_MODE: 'proxy',
+      AUTH_TRUSTED_PROXIES: '127.0.0.1/32',
+      AUTH_USER_HEADER: 'x-forwarded-user',
+    });
+    const server = serve({ fetch: booted.app.fetch, hostname: '127.0.0.1', port: 0 });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        throw new Error('expected the test server to bind a TCP port');
+      }
+      const base = `http://127.0.0.1:${String(address.port)}`;
+
+      // A trusted peer presenting an identity reaches the admin API.
+      const allowed = await fetch(`${base}/api/admin/config`, {
+        headers: { 'x-forwarded-user': 'ada@example.com' },
+      });
+      expect(allowed.status).toBe(200);
+
+      // The same peer without one is refused, so the 200 above is not merely
+      // an unguarded route answering everybody.
+      const refused = await fetch(`${base}/api/admin/config`);
+      expect(refused.status).toBe(403);
+
+      // And the drain route stays reachable, since it sits outside the guard:
+      // the strip covering it must not have been dropped to fix the above.
+      const drain = await fetch(`${base}/api/drain/none`, { method: 'POST', body: '[]' });
+      expect(drain.status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
       await booted.shutdown();
     }
   });
@@ -9130,16 +9175,24 @@ export function buildApp(deps: AppDeps): Hono<AppEnv> {
   // Unauthenticated by design: liveness/readiness probes and the drain
   // endpoint, which authenticates by HMAC because Vercel cannot present an
   // SSO identity.
-  // Ahead of every route, including the auth-exempt ones, and in every auth
-  // mode. proxyAuth strips the identity header too, but only on the paths it
-  // is mounted on, and the drain route is deliberately registered outside the
-  // guard. Without this a client could put the configured header on a drain
-  // request and have it reach any handler or request logger that reads raw
-  // headers. This authenticates nothing -- it only removes a value no inbound
-  // request is ever allowed to assert -- so it must NOT be conditioned on
-  // authConfig.mode. See AppDeps.identityHeader.
+  // Stripped on exactly the routes the guard does NOT cover, and never
+  // globally. A global `app.use('*', strip)` ahead of the route table looks
+  // obviously safer and is in fact catastrophic: `proxyAuth` READS this
+  // header to establish identity, so a global strip runs first, deletes it,
+  // and every admin request under AUTH_MODE=proxy is rejected with
+  // "AUTH_USER_HEADER was not supplied by the proxy". Measured over a real
+  // socket from a trusted loopback peer: 403, the peer check passing and the
+  // header check failing on a header the client had in fact supplied.
+  //
+  // So: proxyAuth strips internally on the paths it guards (the SPA catch-all
+  // included), and the unguarded groups are listed explicitly here. A new
+  // route the guard does not cover MUST be added to this list -- that is the
+  // price of not being able to do it globally.
   if (deps.identityHeader !== null) {
-    app.use('*', stripIdentityHeader(deps.identityHeader));
+    const strip = stripIdentityHeader(deps.identityHeader);
+    app.use('/healthz', strip);
+    app.use('/readyz', strip);
+    app.use('/api/drain/*', strip);
   }
 
   app.route('/', healthRoutes(deps.status));
