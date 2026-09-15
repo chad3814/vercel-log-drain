@@ -105,6 +105,14 @@ describe('drain route', () => {
     return app().request(path, { method: 'POST', body, headers });
   }
 
+  // Every rejection path must leave the spool untouched. A status code alone
+  // does not show that: a 404 that spooled the batch anyway would still be a
+  // 404, and a rejection test passes when the request fails for any reason.
+  async function spooledFiles(): Promise<number | undefined> {
+    const statuses = await dispatcher.snapshotSinks();
+    return statuses.find((sink) => sink.name === 'local')?.queue.files;
+  }
+
   it('accepts a correctly signed JSON array and spools it', async () => {
     const body = JSON.stringify([event('a'), event('b')]);
     const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
@@ -145,12 +153,36 @@ describe('drain route', () => {
   it('rejects a missing signature with 401', async () => {
     const body = JSON.stringify([event('a')]);
     expect((await post('/api/drain/drain1', body)).status).toBe(401);
+    expect(await spooledFiles()).toBe(0);
+  });
+
+  it('returns 413 from the declared content-length, before reading the body', async () => {
+    // The other 413 test sends an oversized body, so it only ever exercises
+    // the raw.byteLength fallback -- which runs after the whole body has been
+    // buffered. The pre-check exists precisely to reject without buffering,
+    // and was untested. A small body here means the fallback cannot fire, so
+    // deleting the pre-check turns this into a 200.
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, {
+      'x-vercel-signature': sign(body),
+      'content-length': String(config.server.maxBodyBytes + 1),
+    });
+    expect(response.status).toBe(413);
+    // Not `const json: { code: string } = await response.json();` as in the
+    // brief: in this project's fetch typings, Response.json() returns
+    // Promise<unknown>, not Promise<any>, so that direct assignment does not
+    // typecheck -- and an assertion (`as { code: string }`) is banned by
+    // oxlint's no-unsafe-type-assertion. toMatchObject accepts `unknown`
+    // and asserts the same thing.
+    expect(await response.json()).toMatchObject({ code: 'payload_too_large' });
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 404 for an unknown drain', async () => {
     const body = JSON.stringify([event('a')]);
     const response = await post('/api/drain/nope', body, { 'x-vercel-signature': sign(body) });
     expect(response.status).toBe(404);
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 403 for a disabled drain', async () => {
@@ -161,6 +193,7 @@ describe('drain route', () => {
     const body = JSON.stringify([event('a')]);
     const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
     expect(response.status).toBe(403);
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 413 when the body exceeds maxBodyBytes', async () => {
