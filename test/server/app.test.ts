@@ -117,6 +117,37 @@ describe('boot', () => {
     }
   });
 
+  it('answers 404 for an unmatched API path instead of the SPA shell', async () => {
+    // The SPA catch-all is registered last so client-side routes load the
+    // shell, which means an /api path that matched no route would otherwise
+    // come back 200 with HTML. A mistyped or withdrawn endpoint then looks
+    // alive to a client and to monitoring.
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      const response = await booted.app.request('/api/unknown-endpoint');
+      expect(response.status).toBe(404);
+      // Assert on the body too: a 404 that still carried the shell would
+      // mean the catch-all ran and merely relabelled the status.
+      expect(await response.text()).not.toContain('<html');
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('answers 404 for a malformed percent-escape rather than 500', async () => {
+    // decodeURIComponent throws URIError on `/%ZZ`. Uncaught that is an
+    // unlogged 500, which also invites a caller to retry a request that can
+    // never succeed.
+    const booted = await bootWith({ AUTH_MODE: 'disabled' });
+    try {
+      for (const bad of ['/%ZZ', '/%c0%ae%c0%ae%2fconfig']) {
+        expect((await booted.app.request(bad)).status).toBe(404);
+      }
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
   it('refuses to serve a path that escapes the web root', async () => {
     // PERCENT-ENCODED, not literal `../`. A literal `..` is removed by the
     // WHATWG URL parser before any app code runs, so asserting on

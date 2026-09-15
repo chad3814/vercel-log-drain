@@ -46,6 +46,13 @@ export type AppDeps = {
  * 3. The guard DOES cover `/api/admin`, `/api/status`, and the static/SPA
  *    routes, so `app.use(..., guard)` is registered before each of those
  *    route tables.
+ * 4. The SPA catch-all must not shadow the API: an `/api/*` 404 is
+ *    registered after every real API route and before `staticHandler`'s
+ *    `app.get('*', ...)`, so an unmatched `/api/...` path answers 404
+ *    instead of falling through to the SPA shell with a 200. It sits
+ *    outside the guard for the same reason the drain and health routes do
+ *    -- a routing typo must read as "not found", not as a 503 from an
+ *    auth-configuration problem.
  */
 export function buildApp(deps: AppDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
@@ -72,6 +79,15 @@ export function buildApp(deps: AppDeps): Hono<AppEnv> {
   app.route('/api/status', statusRoutes(deps.status));
 
   if (deps.webRoot !== null) {
+    // (4) Registered before the SPA catch-all below, and after every real
+    // API route above: any /api path arriving here matched nothing, so it is
+    // a 404. Without this the catch-all serves the SPA shell with a 200, and
+    // a mistyped or withdrawn endpoint looks alive to a client and to
+    // monitoring. Deliberately outside the guard -- answering 404 to an
+    // unauthenticated prober discloses only that the path does not exist,
+    // whereas routing it through the guard would turn every typo into a 503.
+    app.all('/api/*', (c) => c.json({ code: 'not_found' }, 404));
+
     app.use('*', guard);
     app.get('*', staticHandler(deps.webRoot));
   }

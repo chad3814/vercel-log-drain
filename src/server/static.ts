@@ -36,7 +36,16 @@ export function staticHandler(webRoot: string): MiddlewareHandler<AppEnv> {
   const root = resolve(webRoot);
 
   return async (c) => {
-    const requested = decodeURIComponent(new URL(c.req.url).pathname);
+    // decodeURIComponent throws URIError on a malformed escape (`/%ZZ`, or an
+    // overlong UTF-8 sequence). Uncaught, that surfaces as an unlogged 500
+    // from Hono's default handler -- a 500 is also a worse answer than 404,
+    // since it invites a caller to retry a request that can never succeed.
+    let requested: string;
+    try {
+      requested = decodeURIComponent(new URL(c.req.url).pathname);
+    } catch {
+      return c.text('not found', 404);
+    }
     const candidate = resolve(join(root, requested === '/' ? 'index.html' : requested));
 
     // Containment: never serve anything outside the web root.

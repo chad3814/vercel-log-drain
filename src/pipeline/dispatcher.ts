@@ -301,6 +301,8 @@ export class Dispatcher {
    * of spools opened for one directory is the thing that actually differs.
    */
   private reconcileChain: Promise<void> = Promise.resolve();
+  /** Set by `stop()`; makes any later or still-queued reconcile a no-op. */
+  private stopped = false;
 
   constructor(private readonly options: DispatcherOptions) {}
 
@@ -336,6 +338,10 @@ export class Dispatcher {
   }
 
   private async reconcileNow(config: AppConfig): Promise<void> {
+    if (this.stopped) {
+      this.options.log.warn('ignoring a config apply that arrived after shutdown');
+      return;
+    }
     const normalized = config.sinks.map((entry) => this.normalize(entry));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
@@ -425,6 +431,15 @@ export class Dispatcher {
   }
 
   async stop(deadlineMs: number): Promise<void> {
+    // Close the door before draining the room. Setting `stopped` first makes
+    // any reconcile still queued on the chain a no-op, and awaiting the chain
+    // lets one already in flight finish -- otherwise it repopulates `active`
+    // AFTER this method has cleared it, leaving an orphaned worker that was
+    // never started and that `enqueue` would still write to. A config reload
+    // racing a SIGTERM is ordinary, not a rare interleaving.
+    this.stopped = true;
+    await this.reconcileChain.catch(() => undefined);
+
     this.started = false;
     await Promise.all([...this.active.values()].map((active) => active.worker.stop(deadlineMs)));
     this.active.clear();

@@ -295,6 +295,26 @@ describe('Dispatcher', () => {
     }
   });
 
+  it('does not let a config apply racing shutdown resurrect a worker', async () => {
+    // Without the `stopped` gate and the chain await in stop(), the queued
+    // reconcile repopulates `active` AFTER stop() clears it, leaving a worker
+    // that was never started and that enqueue() would still write to -- a
+    // spool nobody drains. `active` is private, so the observable is whether
+    // a batch lands on disk after shutdown.
+    const batchCount = async (): Promise<number> => {
+      const entries = await readdir(spoolRoot, { recursive: true });
+      return entries.filter((entry) => entry.endsWith('.jsonl')).length;
+    };
+
+    const pending = dispatcher.applyConfig(configWith([fileSink('late')]));
+    await dispatcher.stop(500);
+    await pending;
+
+    const before = await batchCount();
+    await dispatcher.enqueue([event('a')]);
+    expect(await batchCount()).toBe(before);
+  });
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
