@@ -13,7 +13,7 @@ import type { Logger } from '../log.js';
 import type { Metrics } from '../status/metrics.js';
 import type { FreeSpaceProbe, Sink } from '../sinks/types.js';
 import type { LogEvent } from '../vercel/event.js';
-import type { OrphanedSpool, SinkHealth, SinkStatus } from '../../types/api.js';
+import type { OrphanedSpool, SinkCounters, SinkHealth, SinkStatus } from '../../types/api.js';
 
 const FAILURE_THRESHOLD = 5;
 const IDLE_POLL_MS = 500;
@@ -486,22 +486,66 @@ export class Dispatcher {
     const statuses: SinkStatus[] = [];
 
     for (const entry of this.config?.sinks ?? []) {
-      const active = this.active.get(entry.name);
-      const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
-      statuses.push({
-        name: entry.name,
-        type: entry.config.type,
-        enabled: entry.enabled,
-        health: this.options.metrics.getSinkHealth(entry.name),
-        queue: {
-          files: active?.queue.fileCount() ?? 0,
-          bytes: active?.queue.bytes() ?? 0,
-          oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
-        },
-        counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
-      });
+      try {
+        statuses.push(await this.sinkStatusFor(entry, counters));
+      } catch (error) {
+        // One sink's stat call failing -- its spool directory removed, or a
+        // permission change underneath it -- must not blank out every other
+        // sink's status in the same response. This synthesized entry
+        // reports the failure for THIS response only; it is never written
+        // to `metrics`, because the status route this feeds is read-only
+        // and must not mutate shared state as a side effect of being
+        // polled.
+        const message = error instanceof Error ? error.message : String(error);
+        this.options.log.warn(
+          { sink: entry.name, err: message },
+          'sink status snapshot failed',
+        );
+        statuses.push({
+          name: entry.name,
+          type: entry.config.type,
+          enabled: entry.enabled,
+          health: {
+            state: 'failed',
+            consecutiveFailures: 0,
+            lastError: message,
+            lastErrorAt: Date.now(),
+            lastSuccessAt: null,
+            nextRetryAt: null,
+          },
+          queue: { files: 0, bytes: 0, oldestAgeSec: null },
+          counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+        });
+      }
     }
     return statuses;
+  }
+
+  /**
+   * Computes one sink's status. Split out from snapshotSinks() so a single
+   * sink's failure (caught there) cannot take the rest of the list down
+   * with it. Protected rather than private so tests can override it to
+   * simulate exactly that failure for one sink while the others resolve
+   * normally through the real implementation via `super`.
+   */
+  protected async sinkStatusFor(
+    entry: SinkEntry,
+    counters: Record<string, SinkCounters>,
+  ): Promise<SinkStatus> {
+    const active = this.active.get(entry.name);
+    const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+    return {
+      name: entry.name,
+      type: entry.config.type,
+      enabled: entry.enabled,
+      health: this.options.metrics.getSinkHealth(entry.name),
+      queue: {
+        files: active?.queue.fileCount() ?? 0,
+        bytes: active?.queue.bytes() ?? 0,
+        oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+      },
+      counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+    };
   }
 
   isDegraded(): boolean {
