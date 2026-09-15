@@ -17,15 +17,20 @@ const CONTENT_TYPES: Record<string, string> = {
 };
 
 /**
- * Serves the built SPA out of `webRoot`, falling back to `index.html` for
- * any path that is not a real file on disk -- required for client-side
- * routing, where e.g. `/sinks` is not a file but must still load the app
- * shell. The containment check below is defense in depth for a request path
- * that reaches this handler with an unresolved `..` segment (for example
- * from a listener that does not normalize the request line the way the
- * WHATWG URL parser does); it never fires on a request that Hono's own
- * `app.request()` and `@hono/node-server` construct, both of which resolve
- * `..` before this handler ever sees the path.
+ * Serves the built SPA out of `webRoot`, falling back to `index.html` for any
+ * path that is not a real file on disk -- required for client-side routing,
+ * where e.g. `/sinks` is not a file but must still load the app shell.
+ *
+ * The containment check below is LOAD-BEARING, not defense in depth. A
+ * literal `..` is resolved away by the WHATWG URL parser before this handler
+ * runs, but a percent-encoded one is not: `%2e%2e%2f` survives normalization
+ * and this handler's own `decodeURIComponent` turns it back into `../`.
+ * Measured with the check neutralised, `/%2e%2e%2fconfig%2f...` and
+ * `/..%2fconfig%2f...` both served files from outside the web root with a
+ * 200. `/config` is a mounted volume holding drain secrets, so removing this
+ * check is credential disclosure. Do not simplify it away on the grounds that
+ * the URL parser already handles `..` -- it handles only one of the two
+ * spellings.
  */
 export function staticHandler(webRoot: string): MiddlewareHandler<AppEnv> {
   const root = resolve(webRoot);

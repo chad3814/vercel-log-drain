@@ -118,10 +118,37 @@ describe('boot', () => {
   });
 
   it('refuses to serve a path that escapes the web root', async () => {
+    // PERCENT-ENCODED, not literal `../`. A literal `..` is removed by the
+    // WHATWG URL parser before any app code runs, so asserting on
+    // `/../config/config.json` tests the URL parser, not this service -- it
+    // cannot fail and cannot pass for the right reason. `%2e%2e%2f` survives
+    // normalization and is only turned back into `../` by the handler's own
+    // decodeURIComponent, which is what makes the containment check
+    // load-bearing rather than defensive.
+    //
+    // Measured with the containment check neutralised: the literal form did
+    // not leak, while both `%2e%2e%2f` and `..%2f` served the target file
+    // with a 200. The target here is config.json, which holds drain secrets,
+    // and /config is a mounted volume in the container -- so without
+    // containment this is credential disclosure, not just a file read.
     const booted = await bootWith({ AUTH_MODE: 'disabled' });
     try {
-      const response = await booted.app.request('/../config/config.json');
-      expect(response.status).not.toBe(200);
+      const secret = 'canary-secret-value';
+      await writeFile(join(dirs.config, 'canary.txt'), secret, 'utf8');
+
+      for (const attack of [
+        '/%2e%2e%2fconfig%2fcanary.txt',
+        '/..%2fconfig%2fcanary.txt',
+        '/%2e%2e%2f%2e%2e%2fetc%2fpasswd',
+      ]) {
+        const response = await booted.app.request(attack);
+        // The SPA fallback answering 200 with index.html is fine; serving
+        // the target's CONTENTS is not. Assert on the body, because the
+        // status alone cannot tell those two apart.
+        expect(await response.text()).not.toContain(secret);
+        const second = await booted.app.request(attack);
+        expect(await second.text()).not.toContain('root:');
+      }
     } finally {
       await booted.shutdown();
     }
