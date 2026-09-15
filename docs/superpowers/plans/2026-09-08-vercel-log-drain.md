@@ -11377,6 +11377,11 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      # Same four commands as the local gate, in the same order. Formatting
+      # was missing from the gate for 21 tasks and 18 source files drifted
+      # before a review noticed; leaving it out of CI would recreate exactly
+      # that hole on the one machine every change has to pass through.
+      - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
