@@ -27,13 +27,14 @@ Every task's requirements implicitly include this section.
   **Do not write `JSON.parse(await response.text())`.** I converted fifteen sites to that form and it was wrong: it launders the cast through `JSON.parse`'s `any` so the linter stops objecting, which is the invisible version of exactly what the rule forbids.
 - **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
+- **Formatting is a gate.** `npm run format:check` runs alongside lint, typecheck and test. The repo went 21 tasks with a `format` script and nothing checking it, and 18 source files drifted before a review noticed. `.prettierignore` excludes `docs/` and `.superpowers/` because Prettier rewrites fenced code blocks inside markdown, which would reformat every TypeScript sample in this plan.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
 - **Vercel signature scheme (verified against docs 2026-09-08):** `x-vercel-signature` is the hex `HMAC-SHA1` of the **raw** request body, keyed with the drain secret. 40 hex characters. Verify before decompressing or parsing.
 - **Sink name pattern:** `^[a-z0-9][a-z0-9-]{0,63}$`. A sink name is also a directory name; nothing else is acceptable.
 - **Spool file naming:** `String(seq).padStart(12, '0') + '.jsonl'`. Twelve digits, so lexicographic order equals numeric order (verified).
 - **Durable write protocol:** write `<name>.tmp` → `FileHandle.sync()` → `close()` → `rename()` → open the containing directory and `sync()` it. All four steps, in that order (verified on darwin and required on Linux).
 - **A negative test must pin ONE reason.** A test named for a specific rejection uses a fixture that is otherwise valid, and asserts the issue count and path — not merely `success === false`. Three tests in this plan originally used doubly-invalid fixtures (a short drain id alongside the defect under test), so each would have passed with the property it named removed entirely. Verified by counting zod issues per fixture; every other negative case here already fails for exactly one reason.
-- **Every task ends green:** `npm run lint && npm run typecheck && npm test` must pass before the task's commit.
+- **Every task ends green:** `npm run format:check && npm run lint && npm run typecheck && npm test` must pass before the task's commit.
 - **Commit per task**, using Conventional Commit prefixes (`feat:`, `test:`, `chore:`, `docs:`, `fix:`).
 
 ## File Structure
@@ -682,7 +683,7 @@ Expected: PASS, 4 tests.
 
 - [ ] **Step 8: Run all gates**
 
-Run: `npm run lint && npm run typecheck && npm test`
+Run: `npm run format:check && npm run lint && npm run typecheck && npm test`
 Expected: all pass.
 
 Note that `typecheck` deliberately covers the server project only. `web/src`
@@ -872,7 +873,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add lenient Vercel log event schema
 
@@ -1012,7 +1013,7 @@ Expected: PASS, 9 tests.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: verify Vercel drain signatures in constant time
 
@@ -1373,7 +1374,7 @@ Expected: PASS, 11 tests.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: decode Vercel drain bodies
 
@@ -1485,7 +1486,7 @@ Expected: PASS, 3 tests.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: define the sink contract and delivery error classes"
 ```
@@ -1882,7 +1883,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add file sink writer
 
@@ -2273,7 +2274,7 @@ Expected: PASS.
 - [ ] **Step 6: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add file sink retention and free-space guard
 
@@ -2627,7 +2628,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: build Loki push payloads
 
@@ -3069,7 +3070,7 @@ Expected: PASS.
 - [ ] **Step 6: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add Loki sink transport
 
@@ -3231,7 +3232,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add sink registry
 
@@ -3571,7 +3572,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add config schema
 
@@ -3750,7 +3751,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: compile sink filters into predicates
 
@@ -4211,7 +4212,7 @@ Expected: PASS, 10 tests.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add atomic config store
 
@@ -4506,7 +4507,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: make config secrets write-only
 
@@ -4921,7 +4922,7 @@ Expected: PASS.
 - [ ] **Step 6: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add in-memory metrics and shared status types
 
@@ -5653,7 +5654,7 @@ Expected: PASS, 14 tests.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add durable spool queue
 
@@ -6194,7 +6195,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add sink worker with backoff and health
 
@@ -6911,8 +6912,12 @@ export class Dispatcher {
           enabled: entry.enabled,
           health: {
             state: 'failed',
+            // Zero, because no delivery attempt failed -- the sink's status
+            // could not be READ. The prefix on lastError says so, since
+            // `failed` with no consecutive failures would otherwise read to
+            // an operator as "just started failing".
             consecutiveFailures: 0,
-            lastError: message,
+            lastError: `status unavailable: ${message}`,
             lastErrorAt: Date.now(),
             lastSuccessAt: null,
             nextRetryAt: null,
@@ -6943,7 +6948,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add dispatcher config reconciliation
 
@@ -7484,7 +7489,7 @@ Expected: PASS.
 - [ ] **Step 6: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add fail-closed proxy auth middleware
 
@@ -7860,7 +7865,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add drain ingest route
 
@@ -8009,7 +8014,28 @@ describe('status routes', () => {
     });
   });
 
-  it('always answers healthz with 200', async () => {
+  it('always answers healthz with 200, even when the service is degraded', async () => {
+    // Asserting 200 against a HEALTHY dispatcher cannot tell "unconditional"
+    // from "currently agrees with a healthy dispatcher": wiring /healthz to
+    // isDegraded() leaves that assertion green. Liveness must not depend on
+    // anything that can fail -- a 503 here makes the orchestrator kill a
+    // process that is still accepting and spooling deliveries, which is the
+    // outage liveness exists to prevent. So degrade the service first and
+    // assert it still answers 200.
+    expect((await app().request('/healthz')).status).toBe(200);
+
+    metrics.setSinkHealth('local', {
+      state: 'failed',
+      consecutiveFailures: 9,
+      lastError: 'loki unreachable',
+      lastErrorAt: Date.now(),
+      lastSuccessAt: null,
+      nextRetryAt: null,
+    });
+    expect(dispatcher.isDegraded()).toBe(true);
+
+    // Readiness is allowed to say no here; liveness is not.
+    expect((await app().request('/readyz')).status).toBe(503);
     expect((await app().request('/healthz')).status).toBe(200);
   });
 
@@ -8139,7 +8165,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add status, health, and readiness routes
 
@@ -8567,7 +8593,7 @@ Expected: PASS.
 - [ ] **Step 5: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: add admin config API
 
@@ -9086,7 +9112,7 @@ Expected: PASS.
 - [ ] **Step 8: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "feat: assemble app and entrypoint
 
@@ -9389,7 +9415,7 @@ spool queue, the worker, or the dispatcher. Use
 - [ ] **Step 3: Run all gates and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test
+npm run format:check && npm run lint && npm run typecheck && npm test
 git add -A
 git commit -m "test: prove durability across a sink outage and restart
 
@@ -9946,7 +9972,7 @@ npm pkg set scripts.typecheck="tsc -p tsconfig.json && tsc -p web/tsconfig.json"
 - [ ] **Step 9: Verify the build**
 
 ```bash
-npm run lint && npm run typecheck && npm test && npm run build:web
+npm run format:check && npm run lint && npm run typecheck && npm test && npm run build:web
 ```
 
 `npm run build:web` must produce `web/dist/index.html`.
@@ -10620,7 +10646,7 @@ export function Sinks(): React.JSX.Element {
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test && npm run build:web
+npm run format:check && npm run lint && npm run typecheck && npm test && npm run build:web
 git add -A
 git commit -m "feat: add drains and sinks admin views
 
@@ -11010,7 +11036,7 @@ was pruned by `--omit=dev` but is needed at runtime.
 - [ ] **Step 8: Commit**
 
 ```bash
-npm run lint && npm run typecheck && npm test && npm run build
+npm run format:check && npm run lint && npm run typecheck && npm test && npm run build
 git add -A
 git commit -m "feat: add container, compose example, proxy configs, and smoke test
 
