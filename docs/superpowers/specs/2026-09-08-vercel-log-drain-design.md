@@ -443,8 +443,15 @@ After a successful save the Dispatcher diffs old against new:
   worker.
 - **Removed or disabled** → stop the worker, `close()` the sink, stop
   enqueuing, and **leave the spool on disk**. A config edit must never silently
-  destroy queued logs. Such directories appear as `orphanedSpools` on the
-  status page with an explicit discard action.
+  destroy queued logs.
+  - A **removed** sink's directory appears as `orphanedSpools` on the status
+    page, with an explicit discard action.
+  - A **disabled** sink is still configured, so it is NOT an orphan: it keeps
+    its own row with its real queue figures. This is a correction to an
+    earlier draft of this section. Orphans are offered to `discardOrphan`,
+    and listing a sink an operator has merely paused among them would offer
+    its undelivered backlog for deletion — which is the one thing this bullet
+    exists to prevent.
 - **Settings changed** → stop, recreate, restart against the *same* spool
   directory, since `name` is the queue's identity. Correcting a wrong Loki URL
   therefore resumes delivery of everything that accumulated.
@@ -561,6 +568,19 @@ one object and operators compare them against each other and against a drain's
 `eventsReceived`, so a file count among them would mix units in a number that
 looks directly comparable. File counts belong in `queue.files`, which reports
 them separately and for a different purpose.
+
+**Readiness must not gate the surface that fixes it.** `/readyz` reports 503
+only when the spool cannot accept a write — the free-space floor. It
+deliberately does NOT report 503 for a failed sink or for a config with no
+sinks yet, even though both are `degraded` on the status page. An orchestrator
+that removes a pod from rotation on a failing readiness probe also removes the
+admin UI and API, which are served by the same process; and a failed sink's URL
+and a missing sink are both fixed *through that UI*. Gating on them deadlocks:
+a fresh deployment starts with no sinks, so it would never become ready, and
+an operator could never reach the page that would fix it. The free-space floor
+is exempt because it is not fixed through the UI — an operator frees or resizes
+the volume — and refusing traffic there is honest, since the service genuinely
+cannot store what it would be handed.
 
 `queue.oldestAgeSec` is derived from the `mtime` of the oldest spool file — the
 age of the batch at the head of the queue, not of the events inside it. It is
