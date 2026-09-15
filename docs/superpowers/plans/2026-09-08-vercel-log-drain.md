@@ -270,6 +270,7 @@ export class SinkWorker {
   start(): void;
   stop(deadlineMs: number): Promise<void>;
 }
+export class InvalidSinkNameError extends Error {}
 export class Dispatcher {
   constructor(options: DispatcherOptions);
   applyConfig(config: AppConfig): Promise<void>;
@@ -6656,6 +6657,15 @@ type ActiveSink = {
   worker: SinkWorker;
 };
 
+/**
+ * A sink name failed `SINK_NAME_PATTERN`. Distinct from "no such orphan" so an
+ * HTTP caller can answer 400 rather than 404: a name that could never have
+ * been valid is a different fact from a name that is simply not present, and
+ * an operator reading "invalid sink name" under a 404 has been told two
+ * contradictory things.
+ */
+export class InvalidSinkNameError extends Error {}
+
 export class Dispatcher {
   private active = new Map<string, ActiveSink>();
   private config: AppConfig | null = null;
@@ -6683,7 +6693,7 @@ export class Dispatcher {
 
   private spoolDirFor(name: string): string {
     if (!SINK_NAME_PATTERN.test(name)) {
-      throw new Error(`invalid sink name "${name}"`);
+      throw new InvalidSinkNameError(`invalid sink name "${name}"`);
     }
     return join(this.options.spoolRoot, name);
   }
@@ -8204,6 +8214,7 @@ import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
 import { adminRoutes } from '../../src/server/routes/admin.js';
 import { ConfigStore, etagOf } from '../../src/config/store.js';
+import type { LoadedConfig } from '../../src/config/store.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
 import { Metrics } from '../../src/status/metrics.js';
 import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
@@ -8426,6 +8437,48 @@ describe('admin routes', () => {
     expect(await dispatcher.listOrphanedSpools()).toEqual([]);
   });
 
+  it('returns 400 for a syntactically invalid orphan name', async () => {
+    // Separate from the 404 below on purpose. Both guards -- the orphan-list
+    // membership check and SINK_NAME_PATTERN in spoolDirFor -- reject a
+    // traversal name, so while both answered 404 no test could tell which
+    // one fired, and removing either left the other covering for it. Two
+    // distinct status codes pin them individually.
+    const response = await app().request('/api/admin/orphans/Not_A_Valid_Name', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
+  });
+
+  it('answers 507 only when the config volume is full, and 500 otherwise', async () => {
+    // The spec reserves 507 for one case, a full config volume. Sending it
+    // for every save failure sends an operator to free disk space that was
+    // never the problem, so the two are pinned apart here.
+    // `app()` reads `store` when it is called, so swapping the binding is
+    // enough to inject a failure -- no change to the route's dependencies.
+    class FailingStore extends ConfigStore {
+      constructor(private readonly failure: Error) {
+        super(configDir);
+      }
+      override save(): Promise<LoadedConfig> {
+        return Promise.reject(this.failure);
+      }
+    }
+
+    const real = store;
+    try {
+      store = new FailingStore(
+        Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }),
+      );
+      expect((await put({ config: current, etag })).status).toBe(507);
+
+      store = new FailingStore(new Error('permission denied'));
+      expect((await put({ config: current, etag })).status).toBe(500);
+    } finally {
+      store = real;
+    }
+  });
+
   it('returns 404 when discarding a name that is not an orphan', async () => {
     const response = await app().request('/api/admin/orphans/nope', { method: 'DELETE' });
     expect(response.status).toBe(404);
@@ -8525,7 +8578,12 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
       const failure = error instanceof Error ? error : new Error(String(error));
       deps.log.error({ err: failure.message }, 'failed to persist config');
       await deps.dispatcher.applyConfig(deps.getConfig());
-      return c.json({ code: 'save_failed', error: failure.message }, 507);
+      // The spec reserves 507 for one case: a full config volume. Everything
+      // else -- a permission change, a failed rename, an unexpected throw --
+      // is a plain 500. Answering 507 for those sends an operator to go free
+      // disk space that was never the problem.
+      const status: 500 | 507 = 'code' in failure && failure.code === 'ENOSPC' ? 507 : 500;
+      return c.json({ code: 'save_failed', error: failure.message }, status);
     }
 
     deps.setConfig(saved.config, saved.etag);
@@ -8570,6 +8628,13 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
       await deps.dispatcher.discardOrphan(c.req.param('name'));
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
+      // Two distinct rejections, kept distinct. A name that could never be
+      // valid is a bad request; a well-formed name that is not an orphan is a
+      // miss. Collapsing both into 404 also collapsed the two guards into one
+      // observable outcome, so no test could pin either individually.
+      if (failure instanceof InvalidSinkNameError) {
+        return c.json({ code: 'bad_request', error: failure.message }, 400);
+      }
       return c.json({ code: 'not_found', error: failure.message }, 404);
     }
     return c.json({ ok: true });
