@@ -6890,7 +6890,7 @@ created, so an invalid config cannot half-apply."
 
 **Interfaces:**
 - Consumes: nothing beyond Hono.
-- Produces: in `src/server/types.ts` the type `AppEnv`; in the middleware `type AuthConfig`, `type PeerResolver`, `nodePeerResolver`, `parseAuthConfig(env)`, `proxyAuth(config, resolvePeer)`.
+- Produces: in `src/server/types.ts` the type `AppEnv`; in the middleware `type AuthConfig`, `type PeerResolver`, `nodePeerResolver`, `parseAuthConfig(env)`, `proxyAuth(config, resolvePeer)`, `stripIdentityHeader(headerName)`.
 
 **Verified behavior you must not design around differently:**
 `@hono/node-server` populates `c.env.incoming` only for requests over a real
@@ -6909,6 +6909,7 @@ import {
   nodePeerResolver,
   parseAuthConfig,
   proxyAuth,
+  stripIdentityHeader,
 } from '../../src/server/middleware/proxy-auth.js';
 import type { AuthConfig } from '../../src/server/middleware/proxy-auth.js';
 import type { AppEnv } from '../../src/server/types.js';
@@ -6990,6 +6991,19 @@ describe('parseAuthConfig', () => {
         AUTH_ALLOWED_USERS: '   ,  ',
       }),
     ).toThrow('AUTH_ALLOWED_USERS was set but lists no users');
+  });
+
+  it('rejects a user header that names a header the service depends on', () => {
+    // AUTH_USER_HEADER=x-vercel-signature would strip the signature from
+    // every inbound delivery, failing HMAC on all of them: total, silent log
+    // loss from one plausible-looking misconfiguration.
+    expect(() =>
+      parseAuthConfig({
+        AUTH_MODE: 'proxy',
+        AUTH_TRUSTED_PROXIES: '10.0.0.0/8',
+        AUTH_USER_HEADER: 'X-Vercel-Signature',
+      }),
+    ).toThrow('AUTH_USER_HEADER must not name a reserved header');
   });
 
   it('rejects a user header that is not a valid header name', () => {
@@ -7137,6 +7151,34 @@ describe('proxyAuth', () => {
     }
   });
 
+  it('stripIdentityHeader removes the header before any handler runs', async () => {
+    // Mounted app-wide by buildApp, so it has to work on routes that no auth
+    // middleware covers -- the drain route above all. Tested here with a
+    // handler that reports what it was given, which is the only way to
+    // observe the strip at all: nothing in the real app echoes its headers.
+    const app = new Hono<AppEnv>();
+    app.use('*', stripIdentityHeader('X-Forwarded-User'));
+    app.get('/anything', (c) => c.json({ seen: c.req.header('x-forwarded-user') ?? null }));
+
+    const response = await app.request('/anything', {
+      headers: { 'x-forwarded-user': 'attacker@example.com' },
+    });
+    const body: { seen: string | null } = await response.json();
+    expect(body.seen).toBeNull();
+  });
+
+  it('stripIdentityHeader leaves every other header alone', async () => {
+    const app = new Hono<AppEnv>();
+    app.use('*', stripIdentityHeader('x-forwarded-user'));
+    app.get('/anything', (c) => c.json({ sig: c.req.header('x-vercel-signature') ?? null }));
+
+    const response = await app.request('/anything', {
+      headers: { 'x-vercel-signature': 'abc123', 'x-forwarded-user': 'a@b.c' },
+    });
+    const body: { sig: string | null } = await response.json();
+    expect(body.sig).toBe('abc123');
+  });
+
   it('does not apply to unguarded routes', async () => {
     const response = await appWith({ mode: 'unset' }, undefined).request('/open');
     expect(response.status).toBe(200);
@@ -7198,6 +7240,23 @@ function splitList(value: string | undefined): string[] | null {
 // says nothing about the misconfigured variable.
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
+// The identity header is stripped from every inbound request app-wide, so
+// naming a header the service itself depends on would quietly break that
+// mechanism. `x-vercel-signature` is the dangerous one: stripping it fails
+// HMAC verification on every delivery, which is total and silent log loss.
+// The others are either request-critical or would strip a credential the
+// service is not meant to touch.
+const RESERVED_HEADERS = new Set([
+  'authorization',
+  'connection',
+  'content-length',
+  'content-type',
+  'cookie',
+  'host',
+  'transfer-encoding',
+  'x-vercel-signature',
+]);
+
 export function parseAuthConfig(env: Record<string, string | undefined>): AuthConfig {
   const mode = env['AUTH_MODE']?.trim();
   if (mode === undefined || mode.length === 0) return { mode: 'unset' };
@@ -7216,6 +7275,9 @@ export function parseAuthConfig(env: Record<string, string | undefined>): AuthCo
   }
   if (!HEADER_NAME.test(userHeader)) {
     throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${userHeader}"`);
+  }
+  if (RESERVED_HEADERS.has(userHeader.toLowerCase())) {
+    throw new Error(`AUTH_USER_HEADER must not name a reserved header: "${userHeader}"`);
   }
 
   // Present-but-empty is a configuration mistake, not "no allowlist".
@@ -7247,6 +7309,21 @@ function buildBlockList(cidrs: string[]): BlockList {
     list.addSubnet(address, bits, family);
   }
   return list;
+}
+
+/**
+ * Removes an inbound identity header from every request it sees, whatever the
+ * auth mode. Mounted ahead of the route table by `buildApp`, because
+ * `proxyAuth` only strips on the routes it guards and the drain route is
+ * deliberately outside the guard. This authenticates nothing; it only removes
+ * a value no inbound request is ever allowed to assert.
+ */
+export function stripIdentityHeader(headerName: string): MiddlewareHandler<AppEnv> {
+  const name = headerName.toLowerCase();
+  return async (c, next) => {
+    c.req.raw.headers.delete(name);
+    return next();
+  };
 }
 
 export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
@@ -8437,6 +8514,34 @@ describe('boot', () => {
     }
   });
 
+  it('does not let the identity strip interfere with ingest', async () => {
+    // Boots in proxy mode, which is the only mode where a header name is
+    // configured, and drives the auth-exempt drain route with that header
+    // present. This does NOT observe the strip -- no handler in the app
+    // reports its request headers, so removing the strip block leaves this
+    // green. What it does pin is that mounting the strip ahead of the route
+    // table cannot break ingest, which is the risk of putting anything at
+    // that position. The strip itself is covered by its own unit test in
+    // Task 19; that the wiring is still present is a code-reading check.
+    const booted = await bootWith({
+      AUTH_MODE: 'proxy',
+      AUTH_TRUSTED_PROXIES: '127.0.0.1/32',
+      AUTH_USER_HEADER: 'x-forwarded-user',
+    });
+    try {
+      const response = await booted.app.request('/api/drain/none', {
+        method: 'POST',
+        body: '[]',
+        headers: { 'x-forwarded-user': 'attacker@example.com' },
+      });
+      // 404 for the unknown id, not 403 or 503: the guard does not cover this
+      // route and the strip did not disturb it.
+      expect(response.status).toBe(404);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
   it('closes the admin surface with 503 when AUTH_MODE is unset', async () => {
     const booted = await bootWith({});
     try {
@@ -8607,6 +8712,14 @@ import type { AppEnv } from './types.js';
 
 export type AppDeps = {
   authConfig: AuthConfig;
+  /**
+   * The identity header to strip from every inbound request, independent of
+   * `authConfig.mode`. Deriving it from the 'proxy' variant would mean no
+   * strip at all under `AUTH_MODE=disabled` or unset -- precisely the modes a
+   * staging box runs in, and where a caller could put the header on a drain
+   * request and have a request logger record it as the actor.
+   */
+  identityHeader: string | null;
   peerResolver: PeerResolver;
   drain: DrainDeps;
   status: StatusDeps;
@@ -8620,19 +8733,16 @@ export function buildApp(deps: AppDeps): Hono<AppEnv> {
   // Unauthenticated by design: liveness/readiness probes and the drain
   // endpoint, which authenticates by HMAC because Vercel cannot present an
   // SSO identity.
-  // Ahead of every route, including the auth-exempt ones. proxyAuth strips
-  // the identity header too, but only on the paths it is mounted on, and the
-  // drain route is deliberately registered outside the guard. Without this a
-  // client could put the configured header on a drain request and have it
-  // reach any future handler or request logger that reads raw headers. It
-  // authenticates nothing -- it only removes a value no inbound request is
-  // ever allowed to assert.
-  const identityHeader = deps.authConfig.mode === 'proxy' ? deps.authConfig.userHeader : null;
-  if (identityHeader !== null) {
-    app.use('*', async (c, next) => {
-      c.req.raw.headers.delete(identityHeader);
-      return next();
-    });
+  // Ahead of every route, including the auth-exempt ones, and in every auth
+  // mode. proxyAuth strips the identity header too, but only on the paths it
+  // is mounted on, and the drain route is deliberately registered outside the
+  // guard. Without this a client could put the configured header on a drain
+  // request and have it reach any handler or request logger that reads raw
+  // headers. This authenticates nothing -- it only removes a value no inbound
+  // request is ever allowed to assert -- so it must NOT be conditioned on
+  // authConfig.mode. See AppDeps.identityHeader.
+  if (deps.identityHeader !== null) {
+    app.use('*', stripIdentityHeader(deps.identityHeader));
   }
 
   app.route('/', healthRoutes(deps.status));
@@ -8660,6 +8770,13 @@ drain routes. The Task 23 tests pin exactly that: `/api/drain/none` must return
 `404`, not `503`, with `AUTH_MODE` unset. If those tests show the guard
 swallowing the drain route, do not reorder blindly — replace the wildcard with
 an explicit non-API scope:
+
+Note that the identity-header strip depends on the same Hono property in the
+**opposite** direction: registered before the routes, it must cover
+`/api/drain`, while `guard` must not. Any reordering has to preserve both, and
+only one of them is pinned by the `404` test — so a reorder that satisfies that
+test can silently drop the strip. The proxy-mode drain test below is what
+catches it.
 
 ```ts
     app.use('*', async (c, next) => {
@@ -8723,6 +8840,12 @@ export async function boot(options: BootOptions): Promise<Booted> {
 
   // Parse auth before touching disk: a bad AUTH_MODE must fail fast.
   const authConfig = parseAuthConfig(env);
+  // Read straight from the environment, not from authConfig: the strip has to
+  // happen whenever an operator has named an identity header, whatever
+  // AUTH_MODE says. parseAuthConfig has already rejected an invalid or
+  // reserved name in proxy mode; in the other modes a bad value here can only
+  // ever remove a header nobody should be sending.
+  const identityHeader = env['AUTH_USER_HEADER']?.trim().toLowerCase() ?? null;
 
   await assertWritable('CONFIG_DIR', configDir);
   await assertWritable('SPOOL_DIR', spoolDir);
@@ -8756,6 +8879,7 @@ export async function boot(options: BootOptions): Promise<Booted> {
 
   const app = buildApp({
     authConfig,
+    identityHeader,
     peerResolver: nodePeerResolver,
     webRoot: options.webRoot,
     drain: { getConfig: () => config, dispatcher, metrics, log },

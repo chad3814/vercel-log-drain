@@ -498,11 +498,21 @@ In `proxy` mode a request to an admin route passes only if both hold:
    is set.
 
 Any inbound copy of `AUTH_USER_HEADER` is stripped before routing, on every
-route, so a direct caller cannot self-assert an identity. Two layers do this:
-the auth middleware strips it on the routes it guards, and the app mounts an
-unconditional strip ahead of the route table so the guarantee also holds on the
-auth-exempt drain path. `c.get('user')` is the only channel a handler may treat
-as identity, and it is written only after peer trust is established.
+route and in every auth mode, so a direct caller cannot self-assert an
+identity. Two layers do this: the auth middleware strips it on the routes it
+guards, and the app mounts `stripIdentityHeader` ahead of the route table so
+the guarantee also holds on the auth-exempt drain path. That second layer reads
+the header name straight from the environment rather than from the parsed auth
+config — deriving it from the `proxy` variant would leave no strip at all under
+`AUTH_MODE=disabled` or unset, which are exactly the modes a staging box runs
+in. `c.get('user')` is the only channel a handler may treat as identity, and it
+is written only after peer trust is established.
+
+Because that strip is app-wide, `AUTH_USER_HEADER` may not name a header the
+service itself depends on. `x-vercel-signature` is the dangerous case —
+stripping it would fail HMAC verification on every delivery, losing all logs
+silently — so a reserved-name list is rejected at startup alongside the
+header-name syntax check.
 
 **Peer resolution is injected.** The middleware receives a `PeerResolver`
 function rather than reading the server binding directly. `@hono/node-server`
