@@ -39,6 +39,11 @@ function splitList(value: string | undefined): string[] | null {
   return items.length === 0 ? null : items;
 }
 
+// RFC 7230 token. Validated at parse time because an invalid name throws
+// inside Headers.get, turning every admin request into a 500 whose message
+// says nothing about the misconfigured variable.
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
 type ParsedCidr = { address: string; prefix: number; family: 'ipv4' | 'ipv6' };
 
 // Validated once, at config-parse time, so a typo in AUTH_TRUSTED_PROXIES
@@ -60,8 +65,8 @@ function parseCidr(raw: string): ParsedCidr {
 }
 
 export function parseAuthConfig(env: Record<string, string | undefined>): AuthConfig {
-  const mode = env['AUTH_MODE'];
-  if (mode === undefined || mode.trim().length === 0) return { mode: 'unset' };
+  const mode = env['AUTH_MODE']?.trim();
+  if (mode === undefined || mode.length === 0) return { mode: 'unset' };
   if (mode === 'disabled') return { mode: 'disabled' };
   if (mode !== 'proxy') {
     throw new Error(`AUTH_MODE must be "proxy" or "disabled", received "${mode}"`);
@@ -72,22 +77,35 @@ export function parseAuthConfig(env: Record<string, string | undefined>): AuthCo
     throw new Error('AUTH_MODE=proxy requires AUTH_TRUSTED_PROXIES, a comma-separated CIDR list');
   }
   // Fail loudly on the first bad entry rather than deferring to the
-  // middleware, which — per the brief's own fail-closed mandate — must
-  // never be left to "cope" with a malformed value per request.
+  // middleware, which must never be left to "cope" with a malformed value
+  // per request.
   for (const cidr of trustedProxies) {
     parseCidr(cidr);
   }
 
-  const userHeader = env['AUTH_USER_HEADER'];
-  if (userHeader === undefined || userHeader.trim().length === 0) {
+  const userHeader = env['AUTH_USER_HEADER']?.trim();
+  if (userHeader === undefined || userHeader.length === 0) {
     throw new Error('AUTH_MODE=proxy requires AUTH_USER_HEADER');
+  }
+  if (!HEADER_NAME.test(userHeader)) {
+    throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${userHeader}"`);
+  }
+
+  // Present-but-empty is a configuration mistake, not "no allowlist".
+  // Treating it as no allowlist hands admin to every identity the proxy
+  // authenticates — the opposite of what emptying the list intends.
+  // AUTH_TRUSTED_PROXIES already rejects the identical input.
+  const rawAllowed = env['AUTH_ALLOWED_USERS'];
+  const allowedUsers = splitList(rawAllowed);
+  if (rawAllowed !== undefined && allowedUsers === null) {
+    throw new Error('AUTH_ALLOWED_USERS was set but lists no users');
   }
 
   return {
     mode: 'proxy',
     trustedProxies,
-    userHeader: userHeader.trim().toLowerCase(),
-    allowedUsers: splitList(env['AUTH_ALLOWED_USERS']),
+    userHeader: userHeader.toLowerCase(),
+    allowedUsers,
   };
 }
 
@@ -100,20 +118,10 @@ function buildBlockList(cidrs: string[]): BlockList {
   return list;
 }
 
-// Node reports an IPv4 peer accepted on a dual-stack socket as
-// `::ffff:a.b.c.d`, which is the normal shape for a proxy on a dual-stack
-// host — this is not an edge case, it is the default deployment. Node's
-// own `net.BlockList#check` already treats `::ffff:a.b.c.d` checked as
-// 'ipv6' as a member of an IPv4 subnet added as 'ipv4', but relying on that
-// implicitly would leave the mapping undocumented and untested. Normalizing
-// explicitly here makes the decision visible, keeps CIDRs and peers on one
-// family for the `check` call, and is covered by its own test below.
-function normalizePeer(address: string): string {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  return mapped?.[1] ?? address;
-}
-
 export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
+  // Narrow by early return rather than carrying a `blockList === null` check
+  // into the request path: a null check standing in for "this cannot happen"
+  // is a branch nobody can reason about and no test can reach.
   if (config.mode === 'unset') {
     return async (c) =>
       c.text(
@@ -146,15 +154,24 @@ export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): Middle
     // branch, before any downstream handler can run. `c.get('user')` — set
     // exclusively below, after trust is established — is the only channel
     // a handler may treat as identity; a direct caller supplying this
-    // header itself must never have it echo through to a handler.
+    // header itself must never have it echo through to a handler. Note the
+    // strip only covers routes this middleware is mounted on — Task 23
+    // mounts a separate unconditional strip ahead of the route table so the
+    // guarantee also holds on the auth-exempt drain path.
     c.req.raw.headers.delete(userHeader);
 
-    const rawPeer = resolvePeer(c);
-    if (rawPeer === undefined) {
+    const peer = resolvePeer(c);
+    if (peer === undefined) {
       return c.text('forbidden: peer address could not be determined', 403);
     }
 
-    const peer = normalizePeer(rawPeer);
+    // No normalisation of `::ffff:a.b.c.d`: net.BlockList#check already maps
+    // in both directions, so a peer accepted on a dual-stack listener matches
+    // an IPv4 subnet and vice versa. An earlier version normalised
+    // explicitly and was measured to change no outcome. Dead code on a
+    // trust boundary is worse than none — it implies a protection that is
+    // not there. The mapped cases are asserted directly below, so a future
+    // Node changing this behaviour is caught rather than masked.
     const family = isIPv4(peer) ? 'ipv4' : isIPv6(peer) ? 'ipv6' : null;
     if (family === null || !blockList.check(peer, family)) {
       return c.text('forbidden: request did not arrive from a trusted proxy', 403);
@@ -162,10 +179,20 @@ export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): Middle
 
     const user = providedUser?.trim() ?? '';
     if (user.length === 0) {
-      return c.text(`forbidden: ${userHeader} was not supplied by the proxy`, 403);
+      // Name the variable, never its value. Echoing the configured header
+      // name tells anyone reaching this point from inside a trusted subnet
+      // — a co-located container, an SSRF — exactly which header to forge.
+      // Naming AUTH_USER_HEADER is just as discriminating for tests.
+      return c.text('forbidden: AUTH_USER_HEADER was not supplied by the proxy', 403);
+    }
+    // Two copies of the header arrive joined as "a, b". Once a second value
+    // exists neither is trustworthy, and with no allowlist configured the
+    // join would otherwise be accepted whole as an identity.
+    if (user.includes(',')) {
+      return c.text('forbidden: AUTH_USER_HEADER arrived more than once', 403);
     }
     if (allowedUsers !== null && !allowedUsers.includes(user)) {
-      return c.text('forbidden: user is not permitted by AUTH_ALLOWED_USERS', 403);
+      return c.text('forbidden: user is not in AUTH_ALLOWED_USERS', 403);
     }
 
     c.set('user', user);
