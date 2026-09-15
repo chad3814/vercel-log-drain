@@ -2,7 +2,12 @@ import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { buildPushPayload, labelWarnings, normalizePushUrl } from './loki-payload.js';
-import { AuthDeliveryError, PermanentDeliveryError, RetryableDeliveryError } from './types.js';
+import {
+  AuthDeliveryError,
+  ConfigDeliveryError,
+  PermanentDeliveryError,
+  RetryableDeliveryError,
+} from './types.js';
 import type { LogEvent } from '../vercel/event.js';
 import type { Sink, SinkContext, SinkType } from './types.js';
 
@@ -35,15 +40,35 @@ export const lokiSinkConfigSchema = z.object({
 
 export type LokiSinkConfig = z.infer<typeof lokiSinkConfigSchema>;
 
-export type LokiClassification = 'ok' | 'permanent' | 'retryable' | 'auth';
+export type LokiClassification = 'ok' | 'permanent' | 'retryable' | 'auth' | 'config';
 
 export function classifyLokiStatus(status: number): LokiClassification {
   if (status >= 200 && status < 300) return 'ok';
   if (status === 401 || status === 403 || status === 404) return 'auth';
-  // 400 covers malformed streams and entries outside reject_old_samples_max_age;
-  // 413/422 mean this exact payload will never be accepted. Retrying any of
-  // them forever would pin the head of the queue.
-  if (status === 400 || status === 413 || status === 422) return 'permanent';
+  // The ONLY permanent status, as spec §7.2's table has it: Loki returns 400
+  // for a malformed stream and for entries outside
+  // reject_old_samples_max_age, and replaying a week-old spool would
+  // otherwise return 400 forever with the queue head never advancing.
+  // Permanence destroys data — it moves the batch to dead/, out of the live
+  // queue, for an operator to find by hand — so it stays reserved for that.
+  if (status === 400) return 'permanent';
+  // 413 and 422 were permanent here, which the spec never said and which
+  // contradicts its own reasoning: a 413 is CONFIG-FIXABLE (lower the sink's
+  // maxBatchBytes, or raise the body limit on the proxy in front of Loki)
+  // and the same batch would then succeed unchanged. The error text even
+  // said so, about a batch it had already dead-lettered. An nginx in front
+  // of Loki with the default client_max_body_size 1m against the 4 MiB
+  // default maxBatchBytes turns every push into a 413, so this was
+  // reachable by default configuration on both sides.
+  //
+  // 422 is not a status Loki uses; it can only arrive from something in
+  // front of it, where it is no more inherently unfixable than a 413. Spec
+  // §7.2 lists it nowhere, and the spec is explicit that the code and it
+  // must not disagree about which statuses destroy data, so it is treated
+  // the same way rather than being the one undocumented permanent status.
+  // The residual risk is a genuinely unfixable 422 pinning the queue head,
+  // which escalated health surfaces immediately instead of hiding.
+  if (status === 413 || status === 422) return 'config';
   return 'retryable';
 }
 
@@ -127,11 +152,16 @@ class LokiSink implements Sink {
 
       if (classification === 'permanent') {
         throw new PermanentDeliveryError(
-          `${summary} — batch cannot be accepted as-is; dead-lettering. If this is 413, lower the sink's maxBatchBytes.`,
+          `${summary} — Loki will never accept this batch as-is; dead-lettering it to spool/${this.name}/dead/. Entries older than Loki's reject_old_samples_max_age are the usual cause.`,
         );
       }
       if (classification === 'auth') {
         throw new AuthDeliveryError(`${summary} — check the sink's credentials and URL`);
+      }
+      if (classification === 'config') {
+        throw new ConfigDeliveryError(
+          `${summary} — the batch is kept on disk and retried. Lower the sink's maxBatchBytes, or raise the body-size limit of whatever sits in front of Loki.`,
+        );
       }
       throw new RetryableDeliveryError(summary);
     } finally {

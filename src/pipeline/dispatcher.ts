@@ -5,7 +5,7 @@ import { SpoolQueue } from './spool.js';
 import { createSink } from '../sinks/registry.js';
 import { resolveLogsDirectory } from '../sinks/file.js';
 import { SINK_NAME_PATTERN } from '../config/schema.js';
-import { AuthDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
+import { EscalatingDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
 import { initialSinkHealth } from '../status/metrics.js';
 import type { AppConfig, SinkEntry } from '../config/schema.js';
 import type { EventPredicate } from './filter.js';
@@ -100,12 +100,13 @@ export class SinkWorker {
       this.maxBackoffMs,
       this.random,
     );
-    // An auth failure is surfaced as failed immediately: waiting five rounds
-    // to tell the operator their password is wrong wastes their time. It
-    // still carries a nextRetryAt because AuthDeliveryError is retryable —
-    // once the operator fixes the credential, the worker must resume on its
-    // own, not require a restart.
-    const escalate = error instanceof AuthDeliveryError;
+    // A failure the operator has to fix -- a wrong password, a body limit
+    // below the sink's maxBatchBytes -- is surfaced as failed immediately:
+    // waiting five rounds to tell them wastes their time. It still carries a
+    // nextRetryAt because these errors are retryable -- once the
+    // configuration is corrected, the worker must resume on its own, not
+    // require a restart.
+    const escalate = error instanceof EscalatingDeliveryError;
     this.state = {
       state: escalate || consecutiveFailures >= FAILURE_THRESHOLD ? 'failed' : 'retrying',
       consecutiveFailures,
@@ -144,7 +145,7 @@ export class SinkWorker {
         );
         return true;
       }
-      // Anything else — a RetryableDeliveryError, an AuthDeliveryError, or an
+      // Anything else — a RetryableDeliveryError, an escalating one, or an
       // outright bug in the sink — is retryable. The batch stays on disk:
       // at-least-once delivery means we never remove a batch we are not sure
       // was accepted.

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -7,7 +7,11 @@ import { createLogger } from '../../src/log.js';
 import { SpoolQueue } from '../../src/pipeline/spool.js';
 import { backoffDelayMs, SinkWorker } from '../../src/pipeline/dispatcher.js';
 import { Metrics } from '../../src/status/metrics.js';
-import { AuthDeliveryError, PermanentDeliveryError } from '../../src/sinks/types.js';
+import {
+  AuthDeliveryError,
+  ConfigDeliveryError,
+  PermanentDeliveryError,
+} from '../../src/sinks/types.js';
 import type { LogEvent } from '../../src/vercel/event.js';
 import type { Sink } from '../../src/sinks/types.js';
 
@@ -177,6 +181,26 @@ describe('SinkWorker', () => {
     expect(worker.health().state).toBe('failed');
     expect(worker.health().consecutiveFailures).toBe(1);
     expect(queue.fileCount()).toBe(1);
+  });
+
+  it('keeps the batch and escalates health on a config failure', async () => {
+    // The treatment a Loki 413 now gets: retryable, so the logs stay on disk
+    // until the operator lowers maxBatchBytes or raises the proxy's body
+    // limit, but health says `failed` at once rather than after five rounds.
+    // Asserting the dead-letter count is what distinguishes this from the
+    // permanent path -- the classification that used to destroy these
+    // batches.
+    const sink = new FakeSink('oversized', () => new ConfigDeliveryError('loki responded 413'));
+    const { worker, queue } = await makeWorker(sink);
+    await queue.enqueue([event('a')]);
+
+    await worker.drainOnce();
+
+    expect(worker.health().state).toBe('failed');
+    expect(worker.health().consecutiveFailures).toBe(1);
+    expect(queue.fileCount()).toBe(1);
+    expect(metrics.snapshot().sinkCounters['oversized']?.deadLettered ?? 0).toBe(0);
+    expect(await readdir(join(dir, 'dead'))).toEqual([]);
   });
 
   it('recovers health after a success', async () => {

@@ -9,6 +9,7 @@ import { classifyLokiStatus, lokiSinkType } from '../../src/sinks/loki.js';
 import type { LokiSinkConfig } from '../../src/sinks/loki.js';
 import {
   AuthDeliveryError,
+  ConfigDeliveryError,
   PermanentDeliveryError,
   RetryableDeliveryError,
 } from '../../src/sinks/types.js';
@@ -86,8 +87,8 @@ describe('classifyLokiStatus', () => {
     [200, 'ok'],
     [204, 'ok'],
     [400, 'permanent'],
-    [413, 'permanent'],
-    [422, 'permanent'],
+    [413, 'config'],
+    [422, 'config'],
     [401, 'auth'],
     [403, 'auth'],
     [404, 'auth'],
@@ -152,6 +153,31 @@ describe('loki sink delivery', () => {
     const url = await startServer(400, 'entry too far behind', []);
     const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
     await expect(sink.deliver([event])).rejects.toBeInstanceOf(PermanentDeliveryError);
+  });
+
+  it('throws a retryable error on 413 rather than dead-lettering the batch', async () => {
+    // 413 was classified permanent, so a body-size limit in front of Loki --
+    // an nginx with the default client_max_body_size 1m against the default
+    // 4 MiB maxBatchBytes -- dead-lettered every batch while the error text
+    // told the operator to lower maxBatchBytes. Spec §7.2 makes 400 the only
+    // permanent status precisely so a config-fixable failure preserves the
+    // logs on disk instead of destroying them.
+    const url = await startServer(413, 'entity too large', []);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+    const rejection = sink.deliver([event]);
+    await expect(rejection).rejects.toBeInstanceOf(ConfigDeliveryError);
+    await expect(rejection).rejects.toBeInstanceOf(RetryableDeliveryError);
+    await expect(rejection).rejects.not.toBeInstanceOf(PermanentDeliveryError);
+    // And it names the fix, since health will jump straight to `failed`.
+    await expect(rejection).rejects.toThrow(/maxBatchBytes/);
+  });
+
+  it('throws a retryable error on 422', async () => {
+    const url = await startServer(422, 'unprocessable', []);
+    const sink = lokiSinkType.create('loki', config(url), { log: silentLog });
+    const rejection = sink.deliver([event]);
+    await expect(rejection).rejects.toBeInstanceOf(RetryableDeliveryError);
+    await expect(rejection).rejects.not.toBeInstanceOf(PermanentDeliveryError);
   });
 
   it('throws an auth error on 401 so logs are preserved for retry', async () => {
