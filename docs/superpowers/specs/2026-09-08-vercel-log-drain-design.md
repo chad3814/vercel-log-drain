@@ -497,8 +497,12 @@ In `proxy` mode a request to an admin route passes only if both hold:
 2. The user header is present, non-empty, and in `AUTH_ALLOWED_USERS` when that
    is set.
 
-Any inbound copy of `AUTH_USER_HEADER` arriving from an untrusted peer is
-stripped before routing, so a direct caller cannot self-assert an identity.
+Any inbound copy of `AUTH_USER_HEADER` is stripped before routing, on every
+route, so a direct caller cannot self-assert an identity. Two layers do this:
+the auth middleware strips it on the routes it guards, and the app mounts an
+unconditional strip ahead of the route table so the guarantee also holds on the
+auth-exempt drain path. `c.get('user')` is the only channel a handler may treat
+as identity, and it is written only after peer trust is established.
 
 **Peer resolution is injected.** The middleware receives a `PeerResolver`
 function rather than reading the server binding directly. `@hono/node-server`

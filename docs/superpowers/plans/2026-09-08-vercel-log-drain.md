@@ -6904,7 +6904,12 @@ the peer resolver is injected, and why an unresolved peer must be denied.
 ```ts
 import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
-import { parseAuthConfig, proxyAuth } from '../../src/server/middleware/proxy-auth.js';
+import { serve } from '@hono/node-server';
+import {
+  nodePeerResolver,
+  parseAuthConfig,
+  proxyAuth,
+} from '../../src/server/middleware/proxy-auth.js';
 import type { AuthConfig } from '../../src/server/middleware/proxy-auth.js';
 import type { AppEnv } from '../../src/server/types.js';
 
@@ -6964,7 +6969,43 @@ describe('parseAuthConfig', () => {
   });
 
   it('throws on an unrecognized mode rather than failing open', () => {
-    expect(() => parseAuthConfig({ AUTH_MODE: 'yolo' })).toThrow(/AUTH_MODE/);
+    // Assert the whole message, not /AUTH_MODE/: that pattern also matches the
+    // "AUTH_MODE=proxy requires AUTH_TRUSTED_PROXIES" fallback, so this test
+    // stayed green with the mode guard deleted -- at which point
+    // AUTH_MODE=disable plus valid proxy vars would boot as proxy mode.
+    expect(() => parseAuthConfig({ AUTH_MODE: 'yolo' })).toThrow(
+      'AUTH_MODE must be "proxy" or "disabled", received "yolo"',
+    );
+  });
+
+  it('rejects an empty allowed-users list rather than reading it as no list', () => {
+    // An operator trimming AUTH_ALLOWED_USERS to nothing in a compose file is
+    // asking for lockout, not for every identity the proxy authenticates to
+    // get admin. AUTH_TRUSTED_PROXIES already throws on the identical input.
+    expect(() =>
+      parseAuthConfig({
+        AUTH_MODE: 'proxy',
+        AUTH_TRUSTED_PROXIES: '10.0.0.0/8',
+        AUTH_USER_HEADER: 'x-user',
+        AUTH_ALLOWED_USERS: '   ,  ',
+      }),
+    ).toThrow('AUTH_ALLOWED_USERS was set but lists no users');
+  });
+
+  it('rejects a user header that is not a valid header name', () => {
+    // Otherwise this boots clean and then throws inside Headers.get on every
+    // admin request: a 500 per request with nothing naming the bad variable.
+    expect(() =>
+      parseAuthConfig({
+        AUTH_MODE: 'proxy',
+        AUTH_TRUSTED_PROXIES: '10.0.0.0/8',
+        AUTH_USER_HEADER: 'X-Forwarded User',
+      }),
+    ).toThrow('AUTH_USER_HEADER is not a valid HTTP header name');
+  });
+
+  it('trims AUTH_MODE like every other variable', () => {
+    expect(parseAuthConfig({ AUTH_MODE: ' disabled ' })).toEqual({ mode: 'disabled' });
   });
 });
 
@@ -7040,6 +7081,62 @@ describe('proxyAuth', () => {
     expect(response.status).toBe(200);
   });
 
+  it('rejects a second copy of the identity header', async () => {
+    const response = await appWith(proxyMode, '10.1.2.3').request('/admin/thing', {
+      headers: [
+        ['x-forwarded-user', 'real@example.com'],
+        ['x-forwarded-user', 'attacker@example.com'],
+      ],
+    });
+    expect(response.status).toBe(403);
+    expect(await response.text()).toContain('arrived more than once');
+  });
+
+  it('sets user to null in disabled mode', async () => {
+    const app = new Hono<AppEnv>();
+    app.use('*', proxyAuth({ mode: 'disabled' }, () => undefined));
+    app.get('/thing', (c) => c.json({ user: c.get('user') }));
+    const body: { user: string | null } = await (await app.request('/thing')).json();
+    expect(body.user).toBeNull();
+  });
+
+  it('nodePeerResolver reads the socket peer over a real connection', async () => {
+    // Every other test injects a fake resolver, so until this one existed the
+    // resolver actually used in production was referenced by no test at all:
+    // a refactor making it fall back to X-Forwarded-For would have left the
+    // whole suite green. app.request() cannot cover it -- c.env.incoming is
+    // undefined there, which is the very reason the resolver is injected.
+    const app = new Hono<AppEnv>();
+    app.use('*', proxyAuth(proxyMode, nodePeerResolver));
+    app.get('/admin/thing', (c) => c.json({ user: c.get('user') }));
+
+    const server = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 });
+    try {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        throw new Error('expected the test server to bind a TCP port');
+      }
+      const base = `http://127.0.0.1:${String(address.port)}/admin/thing`;
+
+      // The loopback peer is trusted by proxyMode, so this must be allowed on
+      // the strength of the real socket address.
+      const allowed = await fetch(base, {
+        headers: { 'x-forwarded-user': 'ada@example.com' },
+      });
+      expect(allowed.status).toBe(200);
+
+      // And a forged X-Forwarded-For must not change the decision either way.
+      const spoofed = await fetch(base, {
+        headers: { 'x-forwarded-user': 'ada@example.com', 'x-forwarded-for': '203.0.113.9' },
+      });
+      expect(spoofed.status).toBe(200);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    }
+  });
+
   it('does not apply to unguarded routes', async () => {
     const response = await appWith({ mode: 'unset' }, undefined).request('/open');
     expect(response.status).toBe(200);
@@ -7096,9 +7193,14 @@ function splitList(value: string | undefined): string[] | null {
   return items.length === 0 ? null : items;
 }
 
+// RFC 7230 token. Validated at parse time because an invalid name throws
+// inside Headers.get, turning every admin request into a 500 whose message
+// says nothing about the misconfigured variable.
+const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
 export function parseAuthConfig(env: Record<string, string | undefined>): AuthConfig {
-  const mode = env['AUTH_MODE'];
-  if (mode === undefined || mode.trim().length === 0) return { mode: 'unset' };
+  const mode = env['AUTH_MODE']?.trim();
+  if (mode === undefined || mode.length === 0) return { mode: 'unset' };
   if (mode === 'disabled') return { mode: 'disabled' };
   if (mode !== 'proxy') {
     throw new Error(`AUTH_MODE must be "proxy" or "disabled", received "${mode}"`);
@@ -7108,16 +7210,29 @@ export function parseAuthConfig(env: Record<string, string | undefined>): AuthCo
   if (trustedProxies === null) {
     throw new Error('AUTH_MODE=proxy requires AUTH_TRUSTED_PROXIES, a comma-separated CIDR list');
   }
-  const userHeader = env['AUTH_USER_HEADER'];
-  if (userHeader === undefined || userHeader.trim().length === 0) {
+  const userHeader = env['AUTH_USER_HEADER']?.trim();
+  if (userHeader === undefined || userHeader.length === 0) {
     throw new Error('AUTH_MODE=proxy requires AUTH_USER_HEADER');
+  }
+  if (!HEADER_NAME.test(userHeader)) {
+    throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${userHeader}"`);
+  }
+
+  // Present-but-empty is a configuration mistake, not "no allowlist".
+  // Treating it as no allowlist hands admin to every identity the proxy
+  // authenticates -- the opposite of what emptying the list intends.
+  // AUTH_TRUSTED_PROXIES already rejects the identical input.
+  const rawAllowed = env['AUTH_ALLOWED_USERS'];
+  const allowedUsers = splitList(rawAllowed);
+  if (rawAllowed !== undefined && allowedUsers === null) {
+    throw new Error('AUTH_ALLOWED_USERS was set but lists no users');
   }
 
   return {
     mode: 'proxy',
     trustedProxies,
-    userHeader: userHeader.trim().toLowerCase(),
-    allowedUsers: splitList(env['AUTH_ALLOWED_USERS']),
+    userHeader: userHeader.toLowerCase(),
+    allowedUsers,
   };
 }
 
@@ -7134,58 +7249,84 @@ function buildBlockList(cidrs: string[]): BlockList {
   return list;
 }
 
-// Node reports an IPv4 peer over a dual-stack listener as ::ffff:a.b.c.d.
-function normalizePeer(address: string): string {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-  return mapped?.[1] ?? address;
-}
-
 export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
-  const blockList = config.mode === 'proxy' ? buildBlockList(config.trustedProxies) : null;
-
-  return async (c, next) => {
-    if (config.mode === 'unset') {
-      return c.text(
-        'The admin interface is disabled because authentication is not configured. Set AUTH_MODE=proxy with AUTH_TRUSTED_PROXIES and AUTH_USER_HEADER, or AUTH_MODE=disabled for local development.',
+  // Narrow by early return rather than carrying a `blockList === null` check
+  // into the request path: a null check standing in for "this cannot happen"
+  // is a branch nobody can reason about and no test can reach.
+  if (config.mode === 'unset') {
+    return async (c) =>
+      c.text(
+        'The admin interface is disabled because authentication is not configured. ' +
+          'Set AUTH_MODE=proxy with AUTH_TRUSTED_PROXIES and AUTH_USER_HEADER, or ' +
+          'AUTH_MODE=disabled for local development.',
         503,
       );
-    }
+  }
 
-    if (config.mode === 'disabled') {
+  if (config.mode === 'disabled') {
+    return async (c, next) => {
       c.set('user', null);
-      await next();
-      return;
-    }
+      return next();
+    };
+  }
 
-    const rawPeer = resolvePeer(c);
-    if (rawPeer === undefined || blockList === null) {
+  const blockList = buildBlockList(config.trustedProxies);
+  const userHeader = config.userHeader;
+  const allowedUsers = config.allowedUsers;
+
+  return async (c, next) => {
+    const providedUser = c.req.header(userHeader);
+    // Strip any inbound copy immediately, in every branch, before a handler
+    // can run. `c.get('user')` -- written only below, after trust is
+    // established -- is the sole identity channel.
+    c.req.raw.headers.delete(userHeader);
+
+    const peer = resolvePeer(c);
+    if (peer === undefined) {
       return c.text('forbidden: peer address could not be determined', 403);
     }
 
-    const peer = normalizePeer(rawPeer);
+    // No normalisation of `::ffff:a.b.c.d`: net.BlockList#check already maps
+    // in both directions, so a peer accepted on a dual-stack listener matches
+    // an IPv4 subnet and vice versa. An earlier version normalised explicitly
+    // and was measured to change no outcome. Dead code on a trust boundary is
+    // worse than none -- it implies a protection that is not there. The mapped
+    // cases are asserted directly, so a future Node changing this is caught.
     const family = isIPv4(peer) ? 'ipv4' : isIPv6(peer) ? 'ipv6' : null;
     if (family === null || !blockList.check(peer, family)) {
       return c.text('forbidden: request did not arrive from a trusted proxy', 403);
     }
 
-    const user = c.req.header(config.userHeader)?.trim() ?? '';
+    const user = providedUser?.trim() ?? '';
     if (user.length === 0) {
-      return c.text(`forbidden: ${config.userHeader} was not supplied by the proxy`, 403);
+      // Name the variable, never its value. Echoing the configured header name
+      // tells anyone reaching this point from inside a trusted subnet -- a
+      // co-located container, an SSRF -- exactly which header to forge.
+      // Naming AUTH_USER_HEADER is just as discriminating for tests.
+      return c.text('forbidden: AUTH_USER_HEADER was not supplied by the proxy', 403);
     }
-    if (config.allowedUsers !== null && !config.allowedUsers.includes(user)) {
+    // Two copies of the header arrive joined as "a, b". Once a second value
+    // exists neither is trustworthy, and with no allowlist configured the
+    // join would otherwise be accepted whole as an identity.
+    if (user.includes(',')) {
+      return c.text('forbidden: AUTH_USER_HEADER arrived more than once', 403);
+    }
+    if (allowedUsers !== null && !allowedUsers.includes(user)) {
       return c.text('forbidden: user is not in AUTH_ALLOWED_USERS', 403);
     }
 
     c.set('user', user);
-    await next();
-    return;
+    return next();
   };
 }
 ```
 
-Because the middleware only ever *reads* the user header after establishing peer
-trust, an untrusted caller's self-asserted header can never reach a handler —
-`c.get('user')` is set exclusively by this middleware.
+The middleware reads the user header before deleting it and only trusts that
+value once the peer is inside a trusted CIDR, so a self-asserted header can
+never reach a handler: `c.get('user')` is written exclusively here. Note the
+strip only covers routes this middleware is mounted on — Task 23 mounts a
+separate unconditional strip ahead of the route table so the guarantee also
+holds on the auth-exempt drain path.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -8375,7 +8516,11 @@ describe('boot', () => {
   });
 
   it('fails to boot on an invalid AUTH_MODE rather than failing open', async () => {
-    await expect(bootWith({ AUTH_MODE: 'wide-open' })).rejects.toThrow(/AUTH_MODE/);
+    // Whole message, not /AUTH_MODE/, which also matches the
+    // missing-AUTH_TRUSTED_PROXIES error and so survives deleting the guard.
+    await expect(bootWith({ AUTH_MODE: 'wide-open' })).rejects.toThrow(
+      'AUTH_MODE must be "proxy" or "disabled", received "wide-open"',
+    );
   });
 });
 ```
@@ -8475,6 +8620,21 @@ export function buildApp(deps: AppDeps): Hono<AppEnv> {
   // Unauthenticated by design: liveness/readiness probes and the drain
   // endpoint, which authenticates by HMAC because Vercel cannot present an
   // SSO identity.
+  // Ahead of every route, including the auth-exempt ones. proxyAuth strips
+  // the identity header too, but only on the paths it is mounted on, and the
+  // drain route is deliberately registered outside the guard. Without this a
+  // client could put the configured header on a drain request and have it
+  // reach any future handler or request logger that reads raw headers. It
+  // authenticates nothing -- it only removes a value no inbound request is
+  // ever allowed to assert.
+  const identityHeader = deps.authConfig.mode === 'proxy' ? deps.authConfig.userHeader : null;
+  if (identityHeader !== null) {
+    app.use('*', async (c, next) => {
+      c.req.raw.headers.delete(identityHeader);
+      return next();
+    });
+  }
+
   app.route('/', healthRoutes(deps.status));
   app.route('/api/drain', drainRoutes(deps.drain));
 
