@@ -2,7 +2,11 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { serve } from '@hono/node-server';
 import { buildApp } from './server/app.js';
-import { nodePeerResolver, parseAuthConfig } from './server/middleware/proxy-auth.js';
+import {
+  nodePeerResolver,
+  parseAuthConfig,
+  parseIdentityHeader,
+} from './server/middleware/proxy-auth.js';
 import { ConfigStore } from './config/store.js';
 import { Dispatcher } from './pipeline/dispatcher.js';
 import { Metrics } from './status/metrics.js';
@@ -74,12 +78,17 @@ export async function boot(options: BootOptions): Promise<Booted> {
 
   // Parse auth before touching disk: a bad AUTH_MODE must fail fast.
   const authConfig = parseAuthConfig(env);
-  // Read straight from the environment, not from authConfig: the strip has to
-  // happen whenever an operator has named an identity header, whatever
-  // AUTH_MODE says. parseAuthConfig has already rejected an invalid or
-  // reserved name in proxy mode; in the other modes a bad value here can only
-  // ever remove a header nobody should be sending.
-  const identityHeader = env['AUTH_USER_HEADER']?.trim().toLowerCase() ?? null;
+  // Resolved from the environment rather than from authConfig, because the
+  // strip has to happen whenever an operator has named an identity header,
+  // whatever AUTH_MODE says -- deriving it from the 'proxy' variant would
+  // leave no strip at all under `disabled` or unset, the modes a staging box
+  // runs in. But it goes through parseIdentityHeader, NOT a raw read: an
+  // empty or malformed value used to be mounted verbatim, and
+  // Headers.delete('') throws, so every /healthz, /readyz and /api/drain/*
+  // request became a 500 while this boot reported success. Empty is treated
+  // as absent (Docker passes '' for an unset interpolation) and a malformed
+  // name fails the boot in every mode, like every other bad variable here.
+  const identityHeader = parseIdentityHeader(env);
 
   await assertWritable('CONFIG_DIR', configDir);
   await assertWritable('SPOOL_DIR', spoolDir);

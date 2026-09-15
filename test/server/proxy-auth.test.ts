@@ -5,6 +5,7 @@ import { serve } from '@hono/node-server';
 import {
   nodePeerResolver,
   parseAuthConfig,
+  parseIdentityHeader,
   proxyAuth,
   stripIdentityHeader,
 } from '../../src/server/middleware/proxy-auth.js';
@@ -150,6 +151,48 @@ describe('parseAuthConfig', () => {
         AUTH_USER_HEADER: 'x-user',
       }),
     ).toThrow(/AUTH_TRUSTED_PROXIES/);
+  });
+});
+
+describe('parseIdentityHeader', () => {
+  // parseAuthConfig validated AUTH_USER_HEADER only inside its `proxy`
+  // branch, while boot() read the variable raw for the app-wide strip. Every
+  // case below therefore reached `Headers.delete(...)` unvalidated, and an
+  // empty or malformed name throws there -- measured as healthz 500 and
+  // drain 500 under AUTH_MODE=disabled and unset alike.
+
+  it('returns null when the variable is absent', () => {
+    expect(parseIdentityHeader({})).toBeNull();
+  });
+
+  it('treats an empty or whitespace-only value as absent', () => {
+    // Docker interpolates a missing variable to '', so
+    // `AUTH_USER_HEADER: ${SOMEVAR}` with SOMEVAR unset must mean the same
+    // as omitting the line. Before this it meant '' -- a name
+    // Headers.delete() rejects.
+    expect(parseIdentityHeader({ AUTH_USER_HEADER: '' })).toBeNull();
+    expect(parseIdentityHeader({ AUTH_USER_HEADER: '   ' })).toBeNull();
+  });
+
+  it('lowercases a valid name', () => {
+    expect(parseIdentityHeader({ AUTH_USER_HEADER: ' X-Forwarded-User ' })).toBe(
+      'x-forwarded-user',
+    );
+  });
+
+  it('rejects a malformed name whatever the mode', () => {
+    // Whole message, not /AUTH_USER_HEADER/: the reserved-name error below
+    // matches that pattern too, so a loose regex would survive deleting
+    // either guard.
+    expect(() => parseIdentityHeader({ AUTH_USER_HEADER: 'X Forwarded User' })).toThrow(
+      'AUTH_USER_HEADER is not a valid HTTP header name: "X Forwarded User"',
+    );
+  });
+
+  it('rejects a reserved name whatever the mode', () => {
+    expect(() => parseIdentityHeader({ AUTH_USER_HEADER: 'X-Vercel-Signature' })).toThrow(
+      'AUTH_USER_HEADER must not name a reserved header: "X-Vercel-Signature"',
+    );
   });
 });
 

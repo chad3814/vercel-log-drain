@@ -76,6 +76,50 @@ describe('boot', () => {
     }
   });
 
+  it.each([
+    ['', 'AUTH_MODE=disabled'],
+    ['   ', 'AUTH_MODE=disabled'],
+  ])('keeps healthz and ingest working with AUTH_USER_HEADER=%j under %s', async (headerName) => {
+    // Measured before the fix: AUTH_MODE=disabled with an empty or
+    // whitespace-only AUTH_USER_HEADER produced healthz 500 and drain 500,
+    // because boot() read the variable raw and mounted the strip on both,
+    // and Headers.delete('') throws. A compose file carrying
+    // `AUTH_USER_HEADER: ${SOMEVAR}` with SOMEVAR missing therefore lost
+    // every log AND failed the container HEALTHCHECK forever, while boot
+    // logged success.
+    const booted = await bootWith({ AUTH_MODE: 'disabled', AUTH_USER_HEADER: headerName });
+    try {
+      expect((await booted.app.request('/healthz')).status).toBe(200);
+      expect((await booted.app.request('/readyz')).status).not.toBe(500);
+      const drain = await booted.app.request('/api/drain/none', { method: 'POST', body: '[]' });
+      // 404 for the unknown id: the route ran rather than throwing inside
+      // the strip.
+      expect(drain.status).toBe(404);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('keeps healthz and ingest working with an empty AUTH_USER_HEADER and AUTH_MODE unset', async () => {
+    const booted = await bootWith({ AUTH_USER_HEADER: '' });
+    try {
+      expect((await booted.app.request('/healthz')).status).toBe(200);
+      const drain = await booted.app.request('/api/drain/none', { method: 'POST', body: '[]' });
+      expect(drain.status).toBe(404);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('fails the boot on a malformed AUTH_USER_HEADER even when AUTH_MODE is disabled', async () => {
+    // The docs promise boot "fails fast (and loudly) on a malformed
+    // AUTH_USER_HEADER"; that was true in proxy mode only. Whole message, so
+    // this cannot pass on the reserved-header error instead.
+    await expect(bootWith({ AUTH_MODE: 'disabled', AUTH_USER_HEADER: 'X User' })).rejects.toThrow(
+      'AUTH_USER_HEADER is not a valid HTTP header name: "X User"',
+    );
+  });
+
   it('closes the admin surface with 503 when AUTH_MODE is unset', async () => {
     const booted = await bootWith({});
     try {

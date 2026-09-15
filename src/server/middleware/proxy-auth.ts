@@ -61,6 +61,53 @@ const RESERVED_HEADERS = new Set([
   'x-vercel-signature',
 ]);
 
+/**
+ * Rejects a header name the service cannot use, with the same message
+ * whatever the mode. Shared by `parseAuthConfig` (proxy mode, where the name
+ * establishes identity) and `parseIdentityHeader` (every mode, where it
+ * drives the strip), so the two cannot drift into disagreeing about which
+ * names are acceptable.
+ */
+function assertUsableHeaderName(name: string): void {
+  if (!HEADER_NAME.test(name)) {
+    throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${name}"`);
+  }
+  if (RESERVED_HEADERS.has(name.toLowerCase())) {
+    throw new Error(`AUTH_USER_HEADER must not name a reserved header: "${name}"`);
+  }
+}
+
+/**
+ * The identity header to strip from inbound requests, resolved for EVERY
+ * auth mode rather than only for `proxy`.
+ *
+ * Absent, empty or whitespace-only means null — no header was named, so
+ * there is nothing to strip. Docker interpolates a missing variable to an
+ * empty string, so `AUTH_USER_HEADER: ${SOMEVAR}` with `SOMEVAR` unset has
+ * to mean the same thing as omitting the line; failing the boot on it would
+ * turn a common compose idiom into an outage.
+ *
+ * A present-but-malformed or reserved name throws, which fails the boot in
+ * every mode. It has to: `Headers.delete('')` and `Headers.delete('X User')`
+ * both throw a `TypeError`, and `boot()` used to read this variable raw and
+ * mount the strip regardless — so an empty or malformed value turned
+ * `/healthz`, `/readyz` and every `/api/drain/*` delivery into a 500 while
+ * boot itself reported success. Measured: `""`, `"   "` and `"X User"` each
+ * produced healthz 500 and drain 500, which loses every log AND fails the
+ * container's own HEALTHCHECK forever. Failing the boot instead matches what
+ * `docker-compose.example.yml` and the README already promise ("boot fails
+ * fast and loudly on a malformed AUTH_USER_HEADER") and what every other
+ * malformed variable here does. Silently treating an invalid name as absent
+ * was the alternative, and it is worse: a staging box would run with no
+ * strip at all and nothing anywhere saying why.
+ */
+export function parseIdentityHeader(env: Record<string, string | undefined>): string | null {
+  const raw = env['AUTH_USER_HEADER']?.trim();
+  if (raw === undefined || raw.length === 0) return null;
+  assertUsableHeaderName(raw);
+  return raw.toLowerCase();
+}
+
 type ParsedCidr = { address: string; prefix: number; family: 'ipv4' | 'ipv6' };
 
 // Validated once, at config-parse time, so a typo in AUTH_TRUSTED_PROXIES
@@ -104,12 +151,7 @@ export function parseAuthConfig(env: Record<string, string | undefined>): AuthCo
   if (userHeader === undefined || userHeader.length === 0) {
     throw new Error('AUTH_MODE=proxy requires AUTH_USER_HEADER');
   }
-  if (!HEADER_NAME.test(userHeader)) {
-    throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${userHeader}"`);
-  }
-  if (RESERVED_HEADERS.has(userHeader.toLowerCase())) {
-    throw new Error(`AUTH_USER_HEADER must not name a reserved header: "${userHeader}"`);
-  }
+  assertUsableHeaderName(userHeader);
 
   // Present-but-empty is a configuration mistake, not "no allowlist".
   // Treating it as no allowlist hands admin to every identity the proxy
