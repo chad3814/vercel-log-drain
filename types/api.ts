@@ -147,3 +147,26 @@ export type RedactedConfigDto = {
 export type ConfigResponse = { config: RedactedConfigDto; etag: string; warnings: string[] };
 export type CreatedDrain = { id: string; name: string; secret: string; etag: string };
 export type TestSinkResponse = { ok: boolean; detail: string };
+
+// A plain runtime value, not a type -- which looks like it belongs somewhere
+// else at first glance. It lives here anyway: this is the one module both
+// the server and the browser bundle may import, because the rule that keeps
+// it safe for both is "zero imports", not "types only". A string array with
+// no imports of its own is exactly as safe to pull into the Vite bundle as
+// any type-only export here, and this is the single source of truth for
+// which Loki label fields are high-cardinality -- the server (which warns
+// after a save) and the web Sinks view (which warns live, before one) must
+// agree on the list, or the two warnings drift apart every time one side's
+// list changes and the other doesn't.
+export const HIGH_CARDINALITY_FIELDS: readonly string[] = [
+  'id',
+  'requestId',
+  'deploymentId',
+  'path',
+  'host',
+  'traceId',
+  'spanId',
+  'buildId',
+  'trace.id',
+  'span.id',
+];

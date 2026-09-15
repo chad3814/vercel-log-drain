@@ -1,4 +1,14 @@
+import { HIGH_CARDINALITY_FIELDS } from '../../types/api.js';
 import type { LogEvent } from '../vercel/event.js';
+
+// Re-exported, not just imported: this module is where `labelWarnings`
+// below uses the name, and it's also where every existing importer of
+// `HIGH_CARDINALITY_FIELDS` from this file expects to find it. A bare
+// `export ... from '../../types/api.js'` would satisfy those importers but
+// not `labelWarnings` in *this* file, which needs the binding in scope --
+// so this has to be a real import plus a separate `export { ... }`, not a
+// re-export statement.
+export { HIGH_CARDINALITY_FIELDS };
 
 const PUSH_PATH = '/loki/api/v1/push';
 const LABEL_VALUE_LIMIT = 1024;
@@ -11,19 +21,6 @@ export const DEFAULT_LABEL_CONFIG: LokiLabelConfig = {
   static: { job: 'vercel' },
   fromFields: ['projectName', 'environment', 'source', 'level'],
 };
-
-export const HIGH_CARDINALITY_FIELDS: readonly string[] = [
-  'id',
-  'requestId',
-  'deploymentId',
-  'path',
-  'host',
-  'traceId',
-  'spanId',
-  'buildId',
-  'trace.id',
-  'span.id',
-];
 
 export function sanitizeLabelName(name: string): string {
   const replaced = name.replace(/[^a-zA-Z0-9_]/g, '_');

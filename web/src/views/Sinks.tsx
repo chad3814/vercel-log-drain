@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { testSink } from '../api.ts';
 import { useConfig } from '../useConfig.ts';
+import { HIGH_CARDINALITY_FIELDS } from '@shared/api';
 import type {
   FileSinkConfigDto,
   LokiAuthDto,
@@ -10,8 +11,6 @@ import type {
 } from '@shared/api';
 
 const MIB = 1_048_576;
-
-const HIGH_CARDINALITY = ['id', 'requestId', 'deploymentId', 'path', 'host', 'traceId', 'spanId'];
 
 type Level = 'info' | 'warning' | 'error';
 
@@ -317,7 +316,7 @@ export function Sinks(): React.JSX.Element {
           }
         />
       </label>
-      {sinkConfig.labels.fromFields.some((field) => HIGH_CARDINALITY.includes(field)) ? (
+      {sinkConfig.labels.fromFields.some((field) => HIGH_CARDINALITY_FIELDS.includes(field)) ? (
         <p className="warn">
           One or more of these fields is high-cardinality. Every distinct value creates a new Loki
           stream; prefer filtering them from the log line with <code>| json</code>.
