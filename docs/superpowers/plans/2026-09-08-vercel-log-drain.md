@@ -6688,6 +6688,18 @@ export type DispatcherOptions = {
   metrics: Metrics;
   log: Logger;
   freeSpace?: FreeSpaceProbe;
+  /**
+   * Retry cadence for every worker this dispatcher starts. Operational, not
+   * merely a test seam: how hard to retry a sink that has been down for
+   * hours is a deployment decision, and the defaults (1s doubling to 60s)
+   * suit a brief outage rather than a long one. Threading them through also
+   * lets the end-to-end durability test reach a `failed` sink in
+   * milliseconds instead of the ~18s five jittered backoffs take at the
+   * production defaults -- that one test otherwise accounted for 18s of a
+   * 19s suite, which is how a durability test ends up skipped.
+   */
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
 };
 
 type ActiveSink = {
@@ -6818,6 +6830,9 @@ export class Dispatcher {
       ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
     });
 
+    // Conditional spread, not `baseBackoffMs: this.options.baseBackoffMs`:
+    // `exactOptionalPropertyTypes` is on, so an explicit `undefined` is not
+    // assignable to an optional property.
     const worker = new SinkWorker({
       sink,
       queue,
@@ -6825,6 +6840,12 @@ export class Dispatcher {
       log: this.options.log,
       maxBatchEvents: entry.maxBatchEvents,
       maxBatchBytes: entry.maxBatchBytes,
+      ...(this.options.baseBackoffMs === undefined
+        ? {}
+        : { baseBackoffMs: this.options.baseBackoffMs }),
+      ...(this.options.maxBackoffMs === undefined
+        ? {}
+        : { maxBackoffMs: this.options.maxBackoffMs }),
     });
 
     this.active.set(entry.name, {
@@ -9200,6 +9221,26 @@ async function assertWritable(label: string, dir: string): Promise<void> {
   }
 }
 
+/**
+ * Reads a positive-integer env var, or throws. Deliberately not tolerant: a
+ * typo silently falling back to the default is how a deployment ends up
+ * retrying on a cadence nobody chose, and boot already fails loudly for every
+ * other malformed variable.
+ */
+function positiveIntEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw.length === 0) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value <= 0 || String(value) !== raw) {
+    throw new Error(`${name} must be a positive integer, received "${raw}"`);
+  }
+  return value;
+}
+
 export async function boot(options: BootOptions): Promise<Booted> {
   const env = options.env;
   const configDir = env['CONFIG_DIR'] ?? '/config';
@@ -9241,7 +9282,14 @@ export async function boot(options: BootOptions): Promise<Booted> {
   let config: AppConfig = loaded.config;
   let etag = loaded.etag;
 
-  const dispatcher = new Dispatcher({ spoolRoot: spoolDir, logsRoot, metrics, log });
+  const dispatcher = new Dispatcher({
+    spoolRoot: spoolDir,
+    logsRoot,
+    metrics,
+    log,
+    baseBackoffMs: positiveIntEnv(env, 'RETRY_BASE_MS', 1000),
+    maxBackoffMs: positiveIntEnv(env, 'RETRY_MAX_MS', 60_000),
+  });
   await dispatcher.applyConfig(config);
   dispatcher.start();
 
@@ -9388,7 +9436,7 @@ function sign(body: string): string {
 
 async function post(booted: Booted, events: ReturnType<typeof event>[]) {
   const body = JSON.stringify(events);
-  return booted.app.request('/api/drain/e2e', {
+  return booted.app.request('/api/drain/e2e-drain', {
     method: 'POST',
     body,
     headers: { 'x-vercel-signature': sign(body) },
@@ -9466,12 +9514,30 @@ describe('end-to-end durability', () => {
     await new Promise<void>((resolve) => instance.listen(port, '127.0.0.1', resolve));
   }
 
+  /** A Loki that rejects every push with 401, as a wrong password would. */
+  async function startUnauthorizedLoki(port: number): Promise<void> {
+    const instance = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(401);
+        res.end('unauthorized');
+      });
+    });
+    lokiServer = instance;
+    await new Promise<void>((resolve) => instance.listen(port, '127.0.0.1', resolve));
+  }
+
   async function writeConfig(lokiPort: number): Promise<void> {
     const base = defaultAppConfig();
     await new ConfigStore(configDir).save(
       {
         ...base,
-        drains: [{ id: 'e2e', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 }],
+        // `id` must satisfy drainEntrySchema's min(8); 'e2e' threw before
+        // boot() ever ran, and this is the first test to save config
+        // through the real ConfigStore, so nothing caught it earlier.
+        drains: [
+          { id: 'e2e-drain', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 },
+        ],
         sinks: [
           {
             name: 'local',
@@ -9518,6 +9584,12 @@ describe('end-to-end durability', () => {
         LOGS_ROOT: logsRoot,
         LOG_LEVEL: 'silent',
         AUTH_MODE: 'disabled',
+        // Production defaults make five jittered backoffs take ~18s, which
+        // was 18s of a 19s suite -- the surest way to get a durability test
+        // skipped. The cadence is not what these tests assert; what they
+        // assert is that nothing is lost while it retries.
+        RETRY_BASE_MS: '5',
+        RETRY_MAX_MS: '20',
       },
       webRoot: null,
     });
@@ -9586,6 +9658,56 @@ describe('end-to-end durability', () => {
       await second.shutdown();
     }
   }, 30_000);
+
+  it('never dead-letters an auth failure, across a restart', async () => {
+    // The scenario this whole classification exists for: an operator fat-
+    // fingers a Loki password. 401/403/404 are RETRYABLE, never permanent,
+    // because dead-lettering them would destroy logs that a credential fix
+    // would have delivered. Health still escalates so the operator is told.
+    //
+    // Driven end to end rather than at the worker level, and across a
+    // restart, because that is the shape that hid a real data-destroying bug
+    // earlier in this project: nine single-lifetime durability tests passed
+    // while a dead-letter overwrite went unnoticed.
+    const port = 45_411;
+    await startUnauthorizedLoki(port);
+    await writeConfig(port);
+
+    let booted = await bootService();
+    try {
+      expect((await post(booted, [event('auth-1')])).status).toBe(200);
+
+      // Precondition, asserted rather than assumed: the batch really is on
+      // disk before anything claims it survived.
+      const spool = join(spoolDir, 'loki');
+      await waitFor(async () => (await readdir(spool)).some((f) => f.endsWith('.jsonl')));
+      const beforeNames = (await readdir(spool)).filter((f) => f.endsWith('.jsonl'));
+      expect(beforeNames).toHaveLength(1);
+      const beforeBody = await readFile(join(spool, beforeNames[0]!), 'utf8');
+      expect(beforeBody).toContain('auth-1');
+
+      // Let it retry enough times to escalate. Retryable, so the batch stays.
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
+      expect(await readdir(join(spool, 'dead')).catch(() => [])).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+
+    // Restart with the same volumes. The batch must still be there, byte for
+    // byte, and still not dead-lettered.
+    booted = await bootService();
+    try {
+      const spool = join(spoolDir, 'loki');
+      const afterNames = (await readdir(spool)).filter((f) => f.endsWith('.jsonl'));
+      expect(afterNames).toHaveLength(1);
+      expect(await readFile(join(spool, afterNames[0]!), 'utf8')).toContain('auth-1');
+
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
+      expect(await readdir(join(spool, 'dead')).catch(() => [])).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+  });
 
   it('keeps accepting deliveries while a sink is wedged, and reports degraded', async () => {
     const lokiPort = 45_232;

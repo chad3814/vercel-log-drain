@@ -481,6 +481,14 @@ Identity is delegated to a reverse proxy. The service ships **fail-closed**.
 | `AUTH_USER_HEADER` | Header carrying the authenticated identity, e.g. `Cf-Access-Authenticated-User-Email`. Required when `AUTH_MODE=proxy`. |
 | `AUTH_ALLOWED_USERS` | Optional comma-separated allowlist of identities. |
 
+Two further variables tune retry cadence: `RETRY_BASE_MS` (default `1000`) and
+`RETRY_MAX_MS` (default `60000`), the base and cap of the per-sink exponential
+backoff. How hard to retry a sink that has been down for hours is a deployment
+decision, and the defaults suit a brief outage. Both must parse as positive
+integers or the boot fails, like every other malformed variable. Note the cap
+bounds the exponential term rather than the delay slept, since jitter is
+applied after capping.
+
 `AUTH_MODE=disabled` exists for local development and logs a loud warning on
 every boot.
 
