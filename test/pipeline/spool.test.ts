@@ -231,6 +231,30 @@ describe('SpoolQueue', () => {
     expect(queue.fileCount()).toBe(0);
   });
 
+  it('drops an already-spooled event whose timestamp no sink can render', async () => {
+    // Heals a spool poisoned by an earlier build. One event with
+    // `timestamp: 1e21` validated at ingest, reached the file sink, and threw
+    // RangeError from new Date(ts).toISOString() -- classified retryable, so
+    // the batch stayed at the head of the queue and was re-attempted forever,
+    // surviving every restart. nextBatch re-validates each line it reads, so
+    // bounding the schema means the poison line is now skipped and the good
+    // one is still delivered.
+    await writeFile(
+      join(dir, '000000000000.jsonl'),
+      `${JSON.stringify({ id: 'poison', timestamp: 1e21, source: 'lambda', projectId: 'p1' })}\n${JSON.stringify(event('good'))}\n`,
+    );
+
+    const queue = await SpoolQueue.open(dir, options());
+    const batch = await queue.nextBatch(1000, BIG);
+
+    expect(batch?.events.map((e) => e['id'])).toEqual(['good']);
+    // Every event that survives is one the file sink can derive a date from,
+    // which is the property the wedge violated.
+    for (const parsed of batch?.events ?? []) {
+      expect(() => new Date(parsed.timestamp).toISOString()).not.toThrow();
+    }
+  });
+
   it('reports the age of the head of the queue', async () => {
     const queue = await SpoolQueue.open(dir, options());
     expect(await queue.oldestMtimeMs()).toBeNull();

@@ -214,6 +214,34 @@ describe('drain route', () => {
     expect(metrics.snapshot().recent.rejects).toHaveLength(1);
   });
 
+  it('rejects an out-of-range timestamp at ingest and still spools the rest', async () => {
+    // Measured before the bound: all three events were accepted, the file
+    // sink threw RangeError("Invalid time value") on the poison one, the
+    // worker classified that as retryable, and the sink delivered nothing
+    // ever again -- three batches spooled, zero log files, surviving
+    // restarts. The reject path the design already provides for one bad
+    // entry among a thousand good ones is where this belongs.
+    const poison = { id: 'poison', timestamp: 1e21, source: 'lambda', projectId: 'p1' };
+    const body = JSON.stringify([poison, event('good-1'), event('good-2')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ received: 3, accepted: 2, rejected: 1 });
+
+    const rejects = metrics.snapshot().recent.rejects;
+    expect(rejects).toHaveLength(1);
+    expect(rejects[0]?.index).toBe(0);
+    expect(rejects[0]?.reason).toContain('timestamp');
+
+    // The good events are on disk, and nothing that can wedge a sink is.
+    const batch = await dispatcher.snapshotSinks();
+    expect(batch.find((sink) => sink.name === 'local')?.queue.files).toBe(1);
+    expect(metrics.snapshot().recent.events.map((entry) => entry['id'])).toEqual([
+      'good-1',
+      'good-2',
+    ]);
+  });
+
   it('returns 200 with rejected: 1 for a corrupt gzip body, not a thrown error', async () => {
     // decodeBody's contract: corruption is reported as a WHOLE_BODY_INDEX
     // reject, not a thrown PayloadTooLargeError. Only the size cap throws.

@@ -47,6 +47,34 @@ describe('logEventSchema', () => {
     );
   });
 
+  it.each([
+    ['above the Date range', 1e21],
+    ['just above the Date range', 8_640_000_000_000_001],
+    ['negative', -1],
+  ])('rejects a timestamp %s with one issue on timestamp', (_label, timestamp) => {
+    // An otherwise-valid fixture and an issue count, per spec §12: a
+    // doubly-invalid fixture, or a bare `success === false`, would pass with
+    // this very bound deleted. `new Date(1e21).toISOString()` throws
+    // RangeError, which used to escape the file sink as a plain retryable
+    // error and pin the head of that sink's queue forever.
+    const result = logEventSchema.safeParse({ ...validEvent, timestamp });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    expect(result.error.issues[0]?.path).toEqual(['timestamp']);
+  });
+
+  it.each([
+    ['the epoch', 0],
+    ['the largest representable instant', 8_640_000_000_000_000],
+  ])('still accepts a timestamp at %s', (_label, timestamp) => {
+    // The other direction: the bound must not reject a timestamp the sinks
+    // can in fact render, or a lenient schema has quietly become a strict
+    // one. Both of these round-trip through new Date(ms).toISOString().
+    expect(logEventSchema.safeParse({ ...validEvent, timestamp }).success).toBe(true);
+    expect(() => new Date(timestamp).toISOString()).not.toThrow();
+  });
+
   it('rejects a non-JSON value in an unknown field', () => {
     expect(logEventSchema.safeParse({ ...validEvent, weird: () => 1 }).success).toBe(false);
   });
