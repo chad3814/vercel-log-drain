@@ -6550,6 +6550,48 @@ describe('Dispatcher', () => {
     }
   });
 
+  it("isolates one sink's status failure from the rest of the snapshot", async () => {
+    // Forces the failure through an INJECTED dependency, not a seam added to
+    // Dispatcher for the test's benefit. snapshotSinks() calls
+    // metrics.getSinkHealth() per entry inside its try/catch, so a Metrics
+    // that throws for exactly one sink drives the real production path while
+    // leaving the class's API exactly as production needs it. A `protected`
+    // method existing only so a test can subclass it is production shape
+    // paying for test convenience.
+    class FlakyMetrics extends Metrics {
+      override getSinkHealth(sinkName: string): SinkHealth {
+        if (sinkName === 'broken') throw new Error('stat failed: permission denied');
+        return super.getSinkHealth(sinkName);
+      }
+    }
+
+    const flakyMetrics = new FlakyMetrics();
+    const flaky = new Dispatcher({ spoolRoot, logsRoot, metrics: flakyMetrics, log: silentLog });
+    try {
+      await flaky.applyConfig(configWith([fileSink('healthy'), fileSink('broken')]));
+      await flaky.enqueue([event('a')]);
+
+      const statuses = await flaky.snapshotSinks();
+
+      // The healthy sink still reports real values -- the whole point.
+      const healthy = statuses.find((sink) => sink.name === 'healthy');
+      expect(healthy?.queue.files).toBe(1);
+      expect(healthy?.health.state).toBe('ok');
+
+      const broken = statuses.find((sink) => sink.name === 'broken');
+      expect(broken?.health.state).toBe('failed');
+      expect(broken?.health.lastError).toBe('stat failed: permission denied');
+      expect(broken?.queue).toEqual({ files: 0, bytes: 0, oldestAgeSec: null });
+
+      // Read straight off the snapshot map rather than through
+      // getSinkHealth(), which this subclass throws from: the synthesized
+      // failure must not have been written into shared metrics.
+      expect(flakyMetrics.snapshot().sinkHealth['broken']?.state).not.toBe('failed');
+    } finally {
+      await flaky.stop(500);
+    }
+  });
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
@@ -6836,20 +6878,49 @@ export class Dispatcher {
     const statuses: SinkStatus[] = [];
 
     for (const entry of this.config?.sinks ?? []) {
-      const active = this.active.get(entry.name);
-      const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
-      statuses.push({
-        name: entry.name,
-        type: entry.config.type,
-        enabled: entry.enabled,
-        health: this.options.metrics.getSinkHealth(entry.name),
-        queue: {
-          files: active?.queue.fileCount() ?? 0,
-          bytes: active?.queue.bytes() ?? 0,
-          oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
-        },
-        counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
-      });
+      // Per-sink isolation: one sink's stat failing -- its spool directory
+      // removed, a permission change underneath it -- must not blank out
+      // every other sink in the same response. A monitoring system polls
+      // this endpoint forever, so it has to degrade to partial rather than
+      // to nothing. Keep the try INSIDE the loop; wrapping the whole loop
+      // would lose every sink to one failure, which is the bug this avoids.
+      try {
+        const active = this.active.get(entry.name);
+        const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+        statuses.push({
+          name: entry.name,
+          type: entry.config.type,
+          enabled: entry.enabled,
+          health: this.options.metrics.getSinkHealth(entry.name),
+          queue: {
+            files: active?.queue.fileCount() ?? 0,
+            bytes: active?.queue.bytes() ?? 0,
+            oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+          },
+          counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+        });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'unknown error';
+        this.options.log.warn({ sink: entry.name, err: message }, 'sink status snapshot failed');
+        // Synthesized for THIS response only, never written to `metrics`:
+        // the status route this feeds is read-only and must not mutate
+        // shared state as a side effect of being polled.
+        statuses.push({
+          name: entry.name,
+          type: entry.config.type,
+          enabled: entry.enabled,
+          health: {
+            state: 'failed',
+            consecutiveFailures: 0,
+            lastError: message,
+            lastErrorAt: Date.now(),
+            lastSuccessAt: null,
+            nextRetryAt: null,
+          },
+          queue: { files: 0, bytes: 0, oldestAgeSec: null },
+          counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+        });
+      }
     }
     return statuses;
   }
