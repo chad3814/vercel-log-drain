@@ -9763,6 +9763,7 @@ arrives exactly once with nothing dead-lettered."
 
 **Files:**
 - Create: `web/index.html`, `web/src/main.tsx`, `web/src/App.tsx`, `web/src/api.ts`, `web/src/styles.css`, `web/src/views/Status.tsx`
+- Modify: `web/tsconfig.json` (add `allowImportingTsExtensions`, which the extension-qualified imports below require)
 - Create: `src/config/api-contract.ts`
 - Modify: `types/api.ts` (add the config DTOs the SPA consumes)
 - Modify: `package.json` (typecheck script now covers the web project)
@@ -9892,11 +9893,23 @@ import type { RedactedConfigDto, SinkEntryDto } from '../../types/api.js';
  * Compile-time guard. If the zod-inferred server types and the hand-written
  * DTOs in types/api.ts ever drift, `npm run typecheck` fails here rather than
  * the SPA silently reading a field that no longer exists.
+ *
+ * Asserted in BOTH directions, and that is not belt-and-braces. One direction
+ * alone misses the most likely drift: a DTO that DROPS a required field is a
+ * SUPERTYPE of the server type, so `Source extends Target` still holds.
+ * Measured by deleting `maxBatchEvents` from `SinkEntryDto` -- the forward
+ * assertion alone produced zero errors, while the reverse caught it with
+ * TS2741 ("Property 'maxBatchEvents' is missing in type 'SinkEntryDto'").
+ * Forward catches a wrong field type or an extra required field; reverse
+ * catches a missing one. Keep both, and if one ever fails to compile, fix the
+ * DTO rather than deleting the assertion.
  */
-type AssertAssignable<Target, Source extends Target> = Source;
+type Assignable<Target, Source extends Target> = Source;
 
-export type ConfigContract = AssertAssignable<RedactedConfigDto, RedactedConfig>;
-export type SinkEntryContract = AssertAssignable<SinkEntryDto, SinkEntry>;
+export type ConfigContract = Assignable<RedactedConfigDto, RedactedConfig>;
+export type ConfigContractReverse = Assignable<RedactedConfig, RedactedConfigDto>;
+export type SinkEntryContract = Assignable<SinkEntryDto, SinkEntry>;
+export type SinkEntryContractReverse = Assignable<SinkEntry, SinkEntryDto>;
 
 export const CONTRACT_OK = true;
 ```
@@ -10315,7 +10328,7 @@ stubs** — this task's `App.tsx` wires only the Status tab, and Task 26 adds th
 other two tabs together with their views. Nothing is committed in a
 placeholder state.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add -A
