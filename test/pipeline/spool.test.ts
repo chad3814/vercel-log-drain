@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readSpoolDirStats, SpoolQueue } from '../../src/pipeline/spool.js';
@@ -365,6 +365,60 @@ describe('SpoolQueue', () => {
     expect(bodies.some((b) => b.includes('precious'))).toBe(true);
     expect(bodies.some((b) => b.includes('newer'))).toBe(true);
   });
+
+  it('preserves both batches when a dead-letter name is already taken', async () => {
+    // Spec §3.4's second binding consequence: "the move into dead/ must not
+    // overwrite an existing name even if one somehow appears". Removing the
+    // guard -- deadPathFor returning `preferred` unconditionally -- left
+    // 356/356 tests green, while POSIX rename replaces its destination
+    // silently, in the one directory the design promises is terminal.
+    //
+    // The canary is planted AFTER open() has recovered its counter, which is
+    // what makes the collision reachable without faking anything: recovery
+    // saw an empty dead/, so the first batch takes seq 0, and dead/ now
+    // holds 000000000000.jsonl. The same window opens for real whenever
+    // recovery could not read dead/ on some earlier boot.
+    const queue = await SpoolQueue.open(dir, options());
+    const canary = 'CANARY-already-failed-batch';
+    await writeFile(join(dir, 'dead', '000000000000.jsonl'), canary, 'utf8');
+
+    await queue.enqueue([event('newly-failed')]);
+    const batch = await queue.nextBatch(1000, BIG);
+    expect(batch?.files).toEqual(['000000000000.jsonl']);
+    await queue.deadLetter(batch!);
+
+    const dead = await readdir(join(dir, 'dead'));
+    expect(dead).toHaveLength(2);
+    const bodies = await Promise.all(dead.map((f) => readFile(join(dir, 'dead', f), 'utf8')));
+    expect(bodies.some((body) => body.includes(canary))).toBe(true);
+    expect(bodies.some((body) => body.includes('newly-failed'))).toBe(true);
+    // And the live directory is empty either way, so this cannot pass by
+    // the move simply not happening.
+    expect(queue.fileCount()).toBe(0);
+    expect((await readdir(dir)).filter((f) => f.endsWith('.jsonl'))).toEqual([]);
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    'refuses to open a queue whose dead directory cannot be read',
+    async () => {
+      // Recovery used to swallow every readdir error on dead/, not just
+      // ENOENT. A permissions change on the volume, or a transient NFS
+      // error, then reset the sequence counter to the live directory's max
+      // and made the collision above reachable in production. Failing the
+      // open is loud and recoverable; silently reissuing names is neither.
+      //
+      // Skipped as root, which ignores the mode bits: the assertion would
+      // then be vacuous rather than wrong.
+      const first = await SpoolQueue.open(dir, options());
+      await first.enqueue([event('a')]);
+      await chmod(join(dir, 'dead'), 0o000);
+      try {
+        await expect(SpoolQueue.open(dir, options())).rejects.toThrow(/EACCES|permission/i);
+      } finally {
+        await chmod(join(dir, 'dead'), 0o755);
+      }
+    },
+  );
 
   it('evicts nothing when the new batch cannot be written', async () => {
     const queue = await SpoolQueue.open(dir, options());

@@ -177,7 +177,19 @@ export class SpoolQueue {
     // Reproduced before this was added: a batch dead-lettered in one process
     // life was silently destroyed by an unrelated batch dead-lettered after a
     // restart, with no error and no log line.
-    for (const name of await readdir(join(this.dir, DEAD_DIR)).catch(() => [])) {
+    // ENOENT only. `catch(() => [])` also swallowed EACCES, EIO and
+    // ENOTDIR, and any of those means the sequence counter was recovered
+    // from the live directory alone -- so it can reissue a name `dead/`
+    // already holds, and rename replaces its destination silently. One
+    // permissions change on the volume, or a transient NFS error on a single
+    // boot, was enough. That must not be recoverable-looking: this queue
+    // cannot honour the monotonicity §3.4 binds it to, so opening it fails
+    // and the boot (or the admin PUT) says why. deadPathFor's stat guard
+    // stays as the backstop for whatever this does not foresee.
+    for (const name of await readdir(join(this.dir, DEAD_DIR)).catch((error: unknown) => {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
+      throw error;
+    })) {
       const match = DEAD_SEQ.exec(name);
       if (match?.[1] === undefined) continue;
       maxSeq = Math.max(maxSeq, Number.parseInt(match[1], 10));
