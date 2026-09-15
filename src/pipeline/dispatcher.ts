@@ -401,11 +401,31 @@ export class Dispatcher {
       if (unchanged) continue;
       await current.worker.stop(5000);
       this.active.delete(name);
-      // Dropped with the queue that observed it. The flag describes a live
-      // queue's last enqueue, so keeping it across a teardown would report a
-      // sink as dropping at the floor when it no longer exists (or has been
-      // reopened); the next enqueue re-detects a volume that is still full.
-      this.belowFloor.delete(name);
+      // The floor latch survives a RECONFIGURE, and must. Recreating a sink
+      // against the same spool directory (spec §8.3, "settings changed")
+      // does not empty a full volume, and clearing it here reported
+      // `service.state: ok` and /readyz 200 over active data loss --
+      // measured: drop, /readyz 503, then an ordinary PUT changing one
+      // setting, and the page went green with the volume still full. Nothing
+      // re-checks until the next enqueue, so on a quiet drain that reads
+      // green for hours and a load balancer returns the instance to
+      // rotation on it. Worse, it happens while the operator is doing
+      // exactly the right thing: they saw `degraded` and went to lower
+      // maxSpoolBytes or disable the noisy sink.
+      //
+      // It is cleared only when this sink stops being an enqueue
+      // destination -- removed, or disabled, which §8.3 treats together as
+      // "stop enqueuing". A flag describing a sink's last enqueue is
+      // meaningless for a sink that will receive none, and a latch nothing
+      // can clear is its own outage: /readyz would answer 503 for the rest
+      // of the process's life, unclearable even after an operator freed the
+      // volume, because the sink that set it never enqueues again. Any
+      // other still-enabled sink re-detects a full volume on its very next
+      // delivery, and a sole remaining disabled sink leaves
+      // `enabledSinkCount() === 0`, which is degraded on its own.
+      if (next === undefined || !next.enabled) {
+        this.belowFloor.delete(name);
+      }
       if (next === undefined) {
         // Deliberately leaves the spool directory on disk.
         this.options.metrics.forgetSink(name);
@@ -415,7 +435,45 @@ export class Dispatcher {
     for (const entry of normalized) {
       if (this.active.has(entry.name)) continue;
       if (!entry.enabled) continue;
-      await this.startSink(entry);
+      try {
+        await this.startSink(entry);
+      } catch (error: unknown) {
+        // One sink that cannot be started must not take the process down.
+        // Same isolation as snapshotSinks(): this sink reports `failed` with
+        // a message naming what could not be opened, every other sink keeps
+        // running, and ingest keeps working for every drain.
+        //
+        // The case that forced this: SpoolQueue.recover() rethrows anything
+        // but ENOENT when it reads `dead/`, because a sequence counter it
+        // could not verify against dead/ may reissue a name already there
+        // (spec §3.4). Rethrowing was right; letting it reject applyConfig
+        // was not -- `BOOT FAILED -> EACCES ... scandir` took ingest down
+        // for every drain and sink over one directory, and it is reachable
+        // through the README's own "clear them by hand" procedure, which can
+        // leave a root-owned dead/ behind.
+        //
+        // Not swallowed: the health entry and the error ring both carry the
+        // message, and `failed` health degrades the service. This is
+        // visible without being fatal, which is the whole point.
+        const message = error instanceof Error ? error.message : 'unknown error';
+        this.options.log.error(
+          { sink: entry.name, err: message },
+          'sink could not be started; leaving it failed and continuing',
+        );
+        this.options.metrics.setSinkHealth(entry.name, {
+          state: 'failed',
+          // Zero, because no delivery attempt failed -- the sink never
+          // started. The prefix on lastError says so, since `failed` with no
+          // consecutive failures would otherwise read as "just started
+          // failing".
+          consecutiveFailures: 0,
+          lastError: `sink could not be started: ${message}`,
+          lastErrorAt: Date.now(),
+          lastSuccessAt: null,
+          nextRetryAt: null,
+        });
+        this.options.metrics.recordError(entry.name, `sink could not be started: ${message}`);
+      }
     }
   }
 

@@ -79,7 +79,7 @@ export function Status(): React.JSX.Element {
             <th>Head age</th>
             <th>Delivered</th>
             <th>Dropped</th>
-            <th>Dead</th>
+            <th>Dead (events / on disk)</th>
           </tr>
         </thead>
         <tbody>
@@ -98,7 +98,14 @@ export function Status(): React.JSX.Element {
               </td>
               <td>{String(sink.counters.delivered)}</td>
               <td>{String(sink.counters.dropped)}</td>
-              <td>{String(sink.counters.deadLettered)}</td>
+              {/* Events dead-lettered by THIS process, plus the size of the
+                  dead/ directory, which survives restarts and which nothing
+                  removes automatically -- the counter alone resets to zero on
+                  every restart, so it cannot tell an operator how much is
+                  sitting there. The README tells them to watch this figure. */}
+              <td title={`${String(sink.dead.files)} file(s) in spool/${sink.name}/dead/`}>
+                {String(sink.counters.deadLettered)} / {bytes(sink.dead.bytes)}
+              </td>
             </tr>
           ))}
         </tbody>

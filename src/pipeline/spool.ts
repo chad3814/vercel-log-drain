@@ -184,8 +184,13 @@ export class SpoolQueue {
     // permissions change on the volume, or a transient NFS error on a single
     // boot, was enough. That must not be recoverable-looking: this queue
     // cannot honour the monotonicity §3.4 binds it to, so opening it fails
-    // and the boot (or the admin PUT) says why. deadPathFor's stat guard
-    // stays as the backstop for whatever this does not foresee.
+    // and says why. `Dispatcher.reconcileNow` catches that and fails THIS
+    // SINK -- reporting `failed` health naming the directory -- rather than
+    // the process: one unreadable dead/ taking ingest down for every drain
+    // and sink was worse than the collision it guards against, and it is
+    // reachable through the README's "clear them by hand" procedure.
+    // deadPathFor's stat guard stays as the backstop for whatever this does
+    // not foresee.
     for (const name of await readdir(join(this.dir, DEAD_DIR)).catch((error: unknown) => {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return [];
       throw error;

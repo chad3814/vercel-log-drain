@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -390,6 +390,49 @@ describe('Dispatcher', () => {
     expect(await batchCount()).toBe(before);
   });
 
+  it.skipIf(process.getuid?.() === 0)(
+    'fails one sink whose spool cannot be opened, not the whole process',
+    async () => {
+      // SpoolQueue.recover() rethrows anything but ENOENT when it reads
+      // dead/, because a sequence counter it could not check against dead/
+      // may reissue a name already in there (spec §3.4). That rethrow is
+      // right, but letting it reject applyConfig took ingest down for EVERY
+      // drain and sink over one directory -- `BOOT FAILED -> EACCES ...
+      // scandir` -- and it is reachable through the README's own "clear them
+      // by hand" procedure, which can leave a root-owned dead/ behind.
+      //
+      // Skipped as root, which ignores the mode bits: the spool would open
+      // fine and the assertions would be vacuous rather than wrong.
+      await mkdir(join(spoolRoot, 'unreadable', 'dead'), { recursive: true });
+      await chmod(join(spoolRoot, 'unreadable', 'dead'), 0o000);
+
+      try {
+        await dispatcher.applyConfig(configWith([fileSink('unreadable'), fileSink('healthy')]));
+
+        // The healthy sink runs and still accepts deliveries: ingest for
+        // every drain survives one broken directory.
+        await dispatcher.enqueue([event('a')]);
+        const statuses = await dispatcher.snapshotSinks();
+        expect(statuses.find((sink) => sink.name === 'healthy')?.queue.files).toBe(1);
+        expect(statuses.find((sink) => sink.name === 'healthy')?.health.state).toBe('ok');
+
+        // The broken one is visible, not swallowed: failed health naming
+        // what could not be opened, an entry in the error ring, and a
+        // degraded service.
+        const broken = statuses.find((sink) => sink.name === 'unreadable');
+        expect(broken?.health.state).toBe('failed');
+        expect(broken?.health.lastError).toMatch(/sink could not be started/);
+        expect(broken?.health.lastError).toMatch(/unreadable/);
+        expect(dispatcher.isDegraded()).toBe(true);
+        expect(metrics.snapshot().recent.errors.some((entry) => entry.scope === 'unreadable')).toBe(
+          true,
+        );
+      } finally {
+        await chmod(join(spoolRoot, 'unreadable', 'dead'), 0o755);
+      }
+    },
+  );
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
@@ -552,6 +595,89 @@ describe('Dispatcher', () => {
       );
     } finally {
       await flapping.stop(500);
+    }
+  });
+
+  it('keeps reporting degraded when a sink is reconfigured while the volume is full', async () => {
+    // The reconcile path had no test at all (`grep belowFloor test/` found
+    // nothing), and the teardown cleared the latch for ANY changed entry.
+    // Measured: drop, /readyz 503, then an ordinary PUT changing one sink
+    // setting -> /readyz 200 and service.state ok, with the volume still
+    // full. Recreating a sink against the same spool directory (spec §8.3)
+    // does not empty a volume, and nothing re-checks until the next
+    // enqueue, so on a quiet drain the page reads green for hours -- while
+    // the operator is doing exactly the right thing, having seen `degraded`
+    // and gone to lower maxSpoolBytes.
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: noFreeSpace,
+    });
+    const config = configWith([fileSink('reconfigured-full')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    try {
+      await floored.applyConfig(config);
+      await floored.enqueue([event('a')]);
+      expect(floored.isDegraded()).toBe(true);
+      expect(floored.spoolBelowFloor()).toBe(true);
+
+      // An ordinary settings change on that same sink: stop, recreate,
+      // restart against the same spool directory.
+      const changed = configWith([fileSink('reconfigured-full', { maxBatchEvents: 42 })]);
+      changed.server.spoolFreeSpaceFloorBytes = 1_000_000;
+      await floored.applyConfig(changed);
+
+      expect(floored.spoolBelowFloor()).toBe(true);
+      expect(floored.isDegraded()).toBe(true);
+    } finally {
+      await floored.stop(500);
+    }
+  });
+
+  it.each([
+    ['removed', (): SinkEntry[] => []],
+    ['disabled', (): SinkEntry[] => [fileSink('going-away', { enabled: false })]],
+  ])('clears the floor latch when the sink is %s', async (_label, nextSinks) => {
+    // The other direction, which the fix above must not break -- the bug was
+    // a delete firing too broadly, so pinning only "it stops firing" would
+    // trade one wrong answer for another. A latch is cleared exactly when
+    // the sink stops being an enqueue destination: removed, or disabled,
+    // which spec §8.3 treats together as "stop enqueuing". A flag
+    // describing a sink's last enqueue is meaningless for a sink that will
+    // receive none, and a latch nothing can clear is its own outage --
+    // /readyz would answer 503 for the rest of the process's life, even
+    // after an operator freed the volume, because the sink that set it
+    // never enqueues again.
+    //
+    // Asserting spoolBelowFloor() rather than isDegraded(): in the disabled
+    // case this leaves zero enabled sinks, which is degraded in its own
+    // right, so isDegraded() cannot tell the two reasons apart. Readiness
+    // reads this predicate.
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: noFreeSpace,
+    });
+    const config = configWith([fileSink('going-away')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    try {
+      await floored.applyConfig(config);
+      await floored.enqueue([event('a')]);
+      expect(floored.spoolBelowFloor()).toBe(true);
+
+      const next = configWith(nextSinks());
+      next.server.spoolFreeSpaceFloorBytes = 1_000_000;
+      await floored.applyConfig(next);
+
+      expect(floored.spoolBelowFloor()).toBe(false);
+    } finally {
+      await floored.stop(500);
     }
   });
 
