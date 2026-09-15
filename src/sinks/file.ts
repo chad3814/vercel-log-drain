@@ -1,6 +1,6 @@
-import { mkdir, open, readdir, stat, statfs, unlink } from 'node:fs/promises';
+import { mkdir, open, readdir, realpath, stat, statfs, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { LogEvent } from '../vercel/event.js';
 import { RetryableDeliveryError } from './types.js';
@@ -45,9 +45,64 @@ export function groupByUtcDate(events: LogEvent[]): Map<string, LogEvent[]> {
   return grouped;
 }
 
-export function resolveLogsDirectory(candidate: string, logsRoot: string): string {
-  const root = resolve(logsRoot);
-  const target = resolve(candidate);
+function isMissingPath(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  // `in` narrowing, not an assertion and not a weak-typed annotation -- the
+  // same form used in decode.ts, store.ts and admin.ts.
+  return 'code' in error && (error.code === 'ENOENT' || error.code === 'ENOTDIR');
+}
+
+/**
+ * `realpath` of the deepest part of `target` that exists, with the missing
+ * tail appended unresolved.
+ *
+ * A file sink's directory usually does not exist yet -- `deliver()` mkdirs it
+ * -- so plain `realpath` would throw ENOENT on exactly the configuration an
+ * operator is trying to save. Resolving the existing prefix still follows
+ * every symlink that is actually there, which is the whole point: a symlink
+ * anywhere along the path is what the lexical check missed.
+ */
+async function realpathNearest(target: string): Promise<string> {
+  const missing: string[] = [];
+  let current = target;
+  for (;;) {
+    try {
+      const real = await realpath(current);
+      return missing.length === 0 ? real : join(real, ...missing.toReversed());
+    } catch (error) {
+      if (!isMissingPath(error)) throw error;
+      const parent = dirname(current);
+      // Hit the filesystem root without finding anything that exists: no
+      // symlink can be involved, so the lexical form is the answer.
+      if (parent === current) return join(current, ...missing.toReversed());
+      missing.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Contains a file sink's operator-editable `directory` under `LOGS_ROOT`,
+ * resolving both with `realpath` as spec §4 requires.
+ *
+ * It used to use `path.resolve` alone, which is purely lexical: a symlink
+ * under `/logs` pointing anywhere at all was accepted, and the sink then
+ * wrote outside the logs volume. Measured: with `/logs/escape -> /outside`,
+ * both `/logs/escape` and `/logs/escape/sub` were accepted. The blast radius
+ * was bounded -- `filePrefix` is regex-constrained, so the written name is
+ * always `<prefix>-<date>.jsonl` and cannot be made into `config.json` or a
+ * spool batch name -- but "JSONL written outside the logs volume" is still
+ * not what the operator configured, and the mitigation was incidental rather
+ * than designed.
+ *
+ * Resolution happens when the config is applied. A symlink planted between
+ * then and a later write is not covered; catching that would need the write
+ * path to re-resolve on every delivery, which is a syscall per batch for a
+ * threat that already requires write access to the logs volume.
+ */
+export async function resolveLogsDirectory(candidate: string, logsRoot: string): Promise<string> {
+  const root = await realpathNearest(resolve(logsRoot));
+  const target = await realpathNearest(resolve(candidate));
   const rel = relative(root, target);
   const escapes = rel.startsWith('..') || isAbsolute(rel);
   if (escapes) {

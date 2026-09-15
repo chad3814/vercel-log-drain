@@ -353,9 +353,9 @@ export class Dispatcher {
    * Normalizes a sink entry, resolving and containing a file sink's directory.
    * Throws before anything is created so an invalid config cannot half-apply.
    */
-  private normalize(entry: SinkEntry): SinkEntry {
+  private async normalize(entry: SinkEntry): Promise<SinkEntry> {
     if (entry.config.type !== 'file') return entry;
-    const directory = resolveLogsDirectory(entry.config.directory, this.options.logsRoot);
+    const directory = await resolveLogsDirectory(entry.config.directory, this.options.logsRoot);
     return { ...entry, config: { ...entry.config, directory } };
   }
 
@@ -378,7 +378,11 @@ export class Dispatcher {
       this.options.log.warn('ignoring a config apply that arrived after shutdown');
       return;
     }
-    const normalized = config.sinks.map((entry) => this.normalize(entry));
+    // Awaited as a whole before anything below runs: `normalize` resolves a
+    // file sink's directory with `realpath`, which is I/O, and it is still
+    // the only step allowed to reject the config -- so it must finish, and
+    // reject, before a single worker has been stopped or started.
+    const normalized = await Promise.all(config.sinks.map((entry) => this.normalize(entry)));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
     // Committed to applying from here on: `normalize()` above is the only

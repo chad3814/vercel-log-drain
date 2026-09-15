@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -54,24 +54,80 @@ describe('groupByUtcDate', () => {
 });
 
 describe('resolveLogsDirectory', () => {
-  it('accepts a directory under the root', () => {
-    expect(resolveLogsDirectory('/logs/app', '/logs')).toBe('/logs/app');
+  // Real directories, not string fixtures: containment is resolved with
+  // realpath (spec §4), so it has to run against a filesystem that can
+  // actually hold a symlink. `root` is itself realpath'd, because on macOS
+  // the temp directory is reached through a symlink (/var -> /private/var)
+  // and every expectation below would otherwise compare the two spellings.
+  let base = '';
+  let root = '';
+
+  beforeEach(async () => {
+    base = await realpath(await mkdtemp(join(tmpdir(), 'vld-logsroot-')));
+    root = join(base, 'logs');
+    await mkdir(root, { recursive: true });
   });
 
-  it('accepts the root itself', () => {
-    expect(resolveLogsDirectory('/logs', '/logs')).toBe('/logs');
+  afterEach(async () => {
+    await rm(base, { recursive: true, force: true });
   });
 
-  it('rejects a traversal escape', () => {
-    expect(() => resolveLogsDirectory('/logs/../config', '/logs')).toThrow(/outside/i);
+  it('accepts a directory under the root', async () => {
+    await mkdir(join(root, 'app'), { recursive: true });
+    expect(await resolveLogsDirectory(join(root, 'app'), root)).toBe(join(root, 'app'));
   });
 
-  it('rejects an unrelated absolute path', () => {
-    expect(() => resolveLogsDirectory('/config', '/logs')).toThrow(/outside/i);
+  it('accepts a directory under the root that does not exist yet', async () => {
+    // The common case when saving a new sink: `deliver()` mkdirs it later.
+    // Plain realpath would throw ENOENT here and reject a valid config.
+    expect(await resolveLogsDirectory(join(root, 'not-created-yet', 'deeper'), root)).toBe(
+      join(root, 'not-created-yet', 'deeper'),
+    );
   });
 
-  it('rejects a sibling with a matching name prefix', () => {
-    expect(() => resolveLogsDirectory('/logs-evil', '/logs')).toThrow(/outside/i);
+  it('accepts the root itself', async () => {
+    expect(await resolveLogsDirectory(root, root)).toBe(root);
+  });
+
+  it('rejects a traversal escape', async () => {
+    await expect(resolveLogsDirectory(join(root, '..', 'config'), root)).rejects.toThrow(
+      /outside/i,
+    );
+  });
+
+  it('rejects an unrelated absolute path', async () => {
+    await expect(resolveLogsDirectory(join(base, 'config'), root)).rejects.toThrow(/outside/i);
+  });
+
+  it('rejects a sibling with a matching name prefix', async () => {
+    await expect(resolveLogsDirectory(`${root}-evil`, root)).rejects.toThrow(/outside/i);
+  });
+
+  it('rejects a symlink under the root that points outside it', async () => {
+    // The lexical check accepted this, and the sink then wrote outside the
+    // logs volume: /logs is a shared mount (a shipping sidecar, a backup
+    // agent, an operator with host shell access), so a symlink appearing in
+    // it is not exotic. Measured before the fix: both the link and a path
+    // under it were ACCEPTED.
+    const outside = join(base, 'outside');
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, join(root, 'escape'));
+
+    await expect(resolveLogsDirectory(join(root, 'escape'), root)).rejects.toThrow(/outside/i);
+    await expect(resolveLogsDirectory(join(root, 'escape', 'sub'), root)).rejects.toThrow(
+      /outside/i,
+    );
+  });
+
+  it('accepts a symlink that resolves back inside the root', async () => {
+    // The other direction, so the fix is containment rather than a blanket
+    // ban on symlinks: a link pointing at a real directory inside the root
+    // is fine, and resolves to its target.
+    const real = join(root, 'real');
+    await mkdir(real, { recursive: true });
+    await symlink(real, join(root, 'alias'));
+
+    expect(await resolveLogsDirectory(join(root, 'alias'), root)).toBe(real);
   });
 });
 
