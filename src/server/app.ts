@@ -13,11 +13,21 @@ import type { AppEnv } from './types.js';
 export type AppDeps = {
   authConfig: AuthConfig;
   /**
-   * The identity header to strip from every inbound request, independent of
-   * `authConfig.mode`. Deriving it from the 'proxy' variant would mean no
-   * strip at all under `AUTH_MODE=disabled` or unset -- precisely the modes a
-   * staging box runs in, and where a caller could put the header on a drain
-   * request and have a request logger record it as the actor.
+   * The identity header to strip from every route the proxy guard does NOT
+   * already cover, independent of `authConfig.mode`. Deriving it from the
+   * 'proxy' variant would mean no strip at all under `AUTH_MODE=disabled` or
+   * unset -- precisely the modes a staging box runs in, and where a caller
+   * could put the header on a drain request and have a request logger
+   * record it as the actor.
+   *
+   * NOT stripped globally. `proxyAuth` reads this same header to establish
+   * identity, so a global strip ahead of the route table deletes it before
+   * the guard ever sees it, and every admin request under `AUTH_MODE=proxy`
+   * is rejected with "AUTH_USER_HEADER was not supplied by the proxy" --
+   * measured over a real socket from a trusted loopback peer, on a header
+   * the client had in fact supplied. See the strip's call sites in
+   * `buildApp` for the exact, deliberately non-exhaustive list of routes
+   * this covers.
    */
   identityHeader: string | null;
   peerResolver: PeerResolver;
@@ -32,13 +42,18 @@ export type AppDeps = {
  * applies `app.use()` only to routes registered *after* it -- which is why
  * this function's shape below matters as much as its contents:
  *
- * 1. `stripIdentityHeader` is mounted with `app.use('*', ...)` FIRST, ahead
- *    of the entire route table (including the auth-exempt drain route), and
+ * 1. `stripIdentityHeader` is mounted, per route group, ahead of every
+ *    route the proxy guard does not already cover (health and drain), and
  *    unconditionally on `AppDeps.identityHeader` rather than on
- *    `authConfig.mode`. It authenticates nothing -- it only removes a value
- *    no inbound request may assert -- so it must run in every auth mode,
- *    including `disabled` and `unset`, which are exactly the modes a
- *    staging box runs in.
+ *    `authConfig.mode`, so it strips in every auth mode including
+ *    `disabled` and `unset`. It is deliberately NOT a single global
+ *    `app.use('*', ...)`: `proxyAuth` reads this same header to establish
+ *    identity, so a global strip ahead of the route table would delete it
+ *    before the guard ever sees it and reject every admin request under
+ *    `AUTH_MODE=proxy` -- see `AppDeps.identityHeader` for the incident.
+ *    `proxyAuth` already strips internally on the paths it guards (the SPA
+ *    catch-all included), so those need no separate strip here; a future
+ *    route added outside the guard's coverage must be added to this list.
  * 2. `proxyAuth`'s guard must NOT cover `/api/drain` or the health routes:
  *    Vercel authenticates by HMAC, not by proxy identity, and a deployment
  *    must never lose ingest to an auth misconfiguration. Both are therefore
@@ -57,11 +72,16 @@ export type AppDeps = {
 export function buildApp(deps: AppDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
-  // (1) Ahead of every route, including the auth-exempt ones, and in every
-  // auth mode. See AppDeps.identityHeader for why this reads the environment
-  // directly rather than authConfig.mode.
+  // (1) Stripped on exactly the routes the guard does NOT cover, and never
+  // globally -- see AppDeps.identityHeader for why a global strip is
+  // catastrophic here (it deletes the header proxyAuth needs to read). A new
+  // route the guard does not cover MUST be added to this list; that is the
+  // price of not being able to do it globally.
   if (deps.identityHeader !== null) {
-    app.use('*', stripIdentityHeader(deps.identityHeader));
+    const strip = stripIdentityHeader(deps.identityHeader);
+    app.use('/healthz', strip);
+    app.use('/readyz', strip);
+    app.use('/api/drain/*', strip);
   }
 
   // (2) Unauthenticated by design: liveness/readiness probes and the drain

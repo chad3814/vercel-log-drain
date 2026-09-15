@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { serve } from '@hono/node-server';
 import { boot } from '../../src/index.js';
 
 describe('boot', () => {
@@ -113,6 +114,54 @@ describe('boot', () => {
       expect(deep.status).toBe(200);
       expect(await deep.text()).toContain('<title>drain</title>');
     } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('authenticates an admin request in proxy mode over a real socket', async () => {
+    // The ONLY test that exercises the auth feature in its production mode
+    // end to end, and it needs a real listener: under app.request() there is
+    // no socket, so nodePeerResolver returns undefined and the request is
+    // refused at the peer check before the identity header is ever read.
+    // That is why every other test in this file boots unset or disabled, and
+    // why a global identity strip that broke proxy mode completely survived
+    // two reviews.
+    const booted = await bootWith({
+      AUTH_MODE: 'proxy',
+      AUTH_TRUSTED_PROXIES: '127.0.0.1/32',
+      AUTH_USER_HEADER: 'x-forwarded-user',
+    });
+    const server = serve({ fetch: booted.app.fetch, hostname: '127.0.0.1', port: 0 });
+    // serve() returns before the underlying listen() has actually bound a
+    // port -- server.address() is null until the 'listening' event fires --
+    // so this waits for it rather than reading the address immediately.
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        throw new Error('expected the test server to bind a TCP port');
+      }
+      const base = `http://127.0.0.1:${String(address.port)}`;
+
+      // A trusted peer presenting an identity reaches the admin API.
+      const allowed = await fetch(`${base}/api/admin/config`, {
+        headers: { 'x-forwarded-user': 'ada@example.com' },
+      });
+      expect(allowed.status).toBe(200);
+
+      // The same peer without one is refused, so the 200 above is not merely
+      // an unguarded route answering everybody.
+      const refused = await fetch(`${base}/api/admin/config`);
+      expect(refused.status).toBe(403);
+
+      // And the drain route stays reachable, since it sits outside the guard:
+      // the strip covering it must not have been dropped to fix the above.
+      const drain = await fetch(`${base}/api/drain/none`, { method: 'POST', body: '[]' });
+      expect(drain.status).toBe(404);
+    } finally {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
       await booted.shutdown();
     }
   });
