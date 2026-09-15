@@ -22,6 +22,7 @@ Every task's requirements implicitly include this section.
 - **Read a Node error's `code` with `in` narrowing**, never a weak-typed annotation or an assertion. `if ('code' in error && typeof error.code === 'string')` is the only form that satisfies both the compiler and the linter: `const c: { code?: string } = error;` fails `TS2559` because `Error` has no properties in common with that shape, and `error as { code?: string }` trips oxlint's `no-unsafe-type-assertion` for narrowing. Verified 2026-09-11.
 - **Never `String(x)` a `JsonValue`.** oxlint's type-aware `typescript/no-base-to-string` rejects it, because an object would stringify to `[object Object]`. Narrow first (`typeof x === 'string' ? x : …`) or use `JSON.stringify`. Verified 2026-09-11.
 - **Never write `JSON.parse(x) as T`.** oxlint's type-aware `typescript/no-unsafe-type-assertion` rejects asserting away `JSON.parse`'s `any`. Use an annotated assignment instead — `const value: T = JSON.parse(x);` — which is lint-clean AND type-checked. Do **not** simply drop the annotation (`const value = JSON.parse(x)`): that silences the rule by leaving an inferred `any`, which is the invisible form of the thing the project bans.
+- **`Response.json()` is NOT the same case, and the annotated assignment does not work on it.** This project sets `lib: ["es2023"]` with `types: ["node"]`, so `Response` comes from Node's undici typings where `json()` returns `Promise<unknown>`, not `Promise<any>`. `const body: T = await response.json();` therefore fails with `TS2322` ("Type 'unknown' is not assignable to type 'T'"), while `(await response.json()) as T` trips `no-unsafe-type-assertion`. Read the body as text and parse it: `const body: T = JSON.parse(await response.text());` — that routes through `JSON.parse`'s `any`, which is the form the rule above already sanctions, and it passes typecheck, lint and runtime. Verified 2026-09-15. Where the body is only being shape-asserted and never read from, `expect(await response.json()).toMatchObject({...})` is simpler still, because `toMatchObject` accepts `unknown` directly. The distinction is easy to miss because the two look identical at the call site; `any` is assignable to `T` and `unknown` is not.
 - **Never call `Array#sort()`; use `Array#toSorted()`.** oxlint enables `unicorn/no-array-sort`, which flags EVERY `.sort()` call — with or without a comparator — because it mutates in place. `toSorted()` is available under `target`/`lib` `es2023`. Where the old code relied on in-place mutation, assign the result (`x = x.toSorted(...)`); a blind swap silently leaves the original unsorted.
 - **oxlint does not support `no-restricted-syntax`.** Attempting to configure it is a hard config-parse error (`Rule 'no-restricted-syntax' not found in plugin 'eslint'`). Use the named rules in `.oxlintrc.json` instead.
 - **Node version floor:** 24. `fs.statfs`, `net.BlockList`, and `FileHandle.sync()` are all used and require it.
@@ -7110,7 +7111,7 @@ describe('proxyAuth', () => {
     const app = new Hono<AppEnv>();
     app.use('*', proxyAuth({ mode: 'disabled' }, () => undefined));
     app.get('/thing', (c) => c.json({ user: c.get('user') }));
-    const body: { user: string | null } = await (await app.request('/thing')).json();
+    const body: { user: string | null } = JSON.parse(await (await app.request('/thing')).text());
     expect(body.user).toBeNull();
   });
 
@@ -7163,7 +7164,7 @@ describe('proxyAuth', () => {
     const response = await app.request('/anything', {
       headers: { 'x-forwarded-user': 'attacker@example.com' },
     });
-    const body: { seen: string | null } = await response.json();
+    const body: { seen: string | null } = JSON.parse(await response.text());
     expect(body.seen).toBeNull();
   });
 
@@ -7175,7 +7176,7 @@ describe('proxyAuth', () => {
     const response = await app.request('/anything', {
       headers: { 'x-vercel-signature': 'abc123', 'x-forwarded-user': 'a@b.c' },
     });
-    const body: { sig: string | null } = await response.json();
+    const body: { sig: string | null } = JSON.parse(await response.text());
     expect(body.sig).toBe('abc123');
   });
 
@@ -7524,6 +7525,14 @@ describe('drain route', () => {
     return app().request(path, { method: 'POST', body, headers });
   }
 
+  // Every rejection path must leave the spool untouched. A status code alone
+  // does not show that: a 404 that spooled the batch anyway would still be a
+  // 404, and a rejection test passes when the request fails for any reason.
+  async function spooledFiles(): Promise<number | undefined> {
+    const statuses = await dispatcher.snapshotSinks();
+    return statuses.find((sink) => sink.name === 'local')?.queue.files;
+  }
+
   it('accepts a correctly signed JSON array and spools it', async () => {
     const body = JSON.stringify([event('a'), event('b')]);
     const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
@@ -7564,12 +7573,32 @@ describe('drain route', () => {
   it('rejects a missing signature with 401', async () => {
     const body = JSON.stringify([event('a')]);
     expect((await post('/api/drain/drain1', body)).status).toBe(401);
+    expect(await spooledFiles()).toBe(0);
+  });
+
+  it('returns 413 from the declared content-length, before reading the body', async () => {
+    // The other 413 test sends an oversized body, so it only ever exercises
+    // the raw.byteLength fallback -- which runs after the whole body has been
+    // buffered. The pre-check exists precisely to reject without buffering,
+    // and was untested. A small body here means the fallback cannot fire, so
+    // deleting the pre-check turns this into a 200.
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, {
+      'x-vercel-signature': sign(body),
+      'content-length': String(config.server.maxBodyBytes + 1),
+    });
+    expect(response.status).toBe(413);
+    // toMatchObject accepts `unknown`, so no parse dance is needed where the
+    // body is only being shape-asserted rather than read from.
+    expect(await response.json()).toMatchObject({ code: 'payload_too_large' });
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 404 for an unknown drain', async () => {
     const body = JSON.stringify([event('a')]);
     const response = await post('/api/drain/nope', body, { 'x-vercel-signature': sign(body) });
     expect(response.status).toBe(404);
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 403 for a disabled drain', async () => {
@@ -7580,6 +7609,7 @@ describe('drain route', () => {
     const body = JSON.stringify([event('a')]);
     const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
     expect(response.status).toBe(403);
+    expect(await spooledFiles()).toBe(0);
   });
 
   it('returns 413 when the body exceeds maxBodyBytes', async () => {
@@ -7865,7 +7895,7 @@ describe('status routes', () => {
     const response = await app().request('/api/status');
     expect(response.status).toBe(200);
 
-    const snapshot: StatusSnapshot = await response.json();
+    const snapshot: StatusSnapshot = JSON.parse(await response.text());
     expect(snapshot.service.state).toBe('ok');
     expect(snapshot.service.version).toBe('9.9.9');
     expect(snapshot.volumes.spool.totalBytes).toBeGreaterThan(0);
@@ -7888,7 +7918,7 @@ describe('status routes', () => {
       lastSuccessAt: null,
       nextRetryAt: 2,
     });
-    const snapshot: StatusSnapshot = await (await app().request('/api/status')).json();
+    const snapshot: StatusSnapshot = JSON.parse(await (await app().request('/api/status')).text());
     expect(snapshot.service.state).toBe('degraded');
   });
 
@@ -8149,7 +8179,7 @@ describe('admin routes', () => {
   it('returns the redacted config with its etag', async () => {
     const response = await app().request('/api/admin/config');
     expect(response.status).toBe(200);
-    const body: { etag: string; config: { drains: unknown[] } } = await response.json();
+    const body: { etag: string; config: { drains: unknown[] } } = JSON.parse(await response.text());
     expect(body.etag).toBe(etag);
     expect(body.config.drains).toEqual([]);
   });
@@ -8162,12 +8192,12 @@ describe('admin routes', () => {
     });
     expect(response.status).toBe(201);
 
-    const created: { id: string; secret: string } = await response.json();
+    const created: { id: string; secret: string } = JSON.parse(await response.text());
     expect(created.secret.length).toBeGreaterThanOrEqual(16);
 
     const after: {
       config: { drains: { id: string; secret: null; hasSecret: boolean }[] };
-    } = await (await app().request('/api/admin/config')).json();
+    } = JSON.parse(await (await app().request('/api/admin/config')).text());
     expect(after.config.drains[0]?.id).toBe(created.id);
     expect(after.config.drains[0]?.secret).toBeNull();
     expect(after.config.drains[0]?.hasSecret).toBe(true);
@@ -8193,7 +8223,7 @@ describe('admin routes', () => {
       },
     };
     const response = await put({ config: { ...current, sinks: [lokiSink] }, etag });
-    const body: { warnings: string[] } = await response.json();
+    const body: { warnings: string[] } = JSON.parse(await response.text());
     expect(body.warnings.join(' ')).toContain('requestId');
   });
 
@@ -8216,7 +8246,7 @@ describe('admin routes', () => {
     expect(codes).toEqual([200, 409]);
 
     const status = await app().request('/api/status');
-    const snapshot: { sinks: { name: string }[] } = await status.json();
+    const snapshot: { sinks: { name: string }[] } = JSON.parse(await status.text());
     expect(snapshot.sinks.filter((sink) => sink.name === 'racer')).toHaveLength(1);
   });
 
@@ -8599,7 +8629,7 @@ describe('boot', () => {
     try {
       const response = await booted.app.request('/api/admin/config');
       expect(response.status).toBe(200);
-      const body: { config: { drains: unknown[] } } = await response.json();
+      const body: { config: { drains: unknown[] } } = JSON.parse(await response.text());
       expect(body.config.drains).toEqual([]);
     } finally {
       await booted.shutdown();
@@ -9217,7 +9247,7 @@ describe('end-to-end durability', () => {
       const snapshot: {
         service: { state: string };
         sinks: { name: string; health: { state: string }; queue: { files: number } }[];
-      } = await status.json();
+      } = JSON.parse(await status.text());
       expect(snapshot.service.state).toBe('degraded');
       const loki = snapshot.sinks.find((sink) => sink.name === 'loki');
       expect(loki?.health.state).toBe('failed');
@@ -9478,12 +9508,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { 'content-type': 'application/json', ...init?.headers },
   });
   if (!response.ok) {
-    const body: { error?: string } = await response.json().catch(() => ({}));
+    const body: { error?: string } = JSON.parse(await response.text().catch(() => '{}'));
     throw new ApiError(response.status, body.error ?? `request failed (${response.status})`);
   }
   // Annotated assignment, not `as T`: oxlint's no-unsafe-type-assertion
   // rejects narrowing the `any` that .json() returns.
-  const body: T = await response.json();
+  const body: T = JSON.parse(await response.text());
   return body;
 }
 
