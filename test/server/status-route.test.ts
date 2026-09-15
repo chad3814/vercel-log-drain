@@ -9,11 +9,27 @@ import { healthRoutes, statusRoutes } from '../../src/server/routes/status.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
 import { Metrics } from '../../src/status/metrics.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
-import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
+import type { AppConfig } from '../../src/config/schema.js';
 import type { AppEnv } from '../../src/server/types.js';
-import type { SinkCounters, SinkStatus, StatusSnapshot } from '../../types/api.js';
+import type { SinkHealth, StatusSnapshot } from '../../types/api.js';
 
 const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
+
+/**
+ * Reads a response body as `T`. This is an UNCHECKED cast, concentrated in one
+ * place on purpose: the server tsconfig has no "dom" lib, so
+ * `Response.json()` is typed `Promise<unknown>` and cannot be landed in a
+ * typed binding without one. Prefer asserting directly --
+ * `expect(await response.json()).toMatchObject({...})` takes `unknown` and
+ * needs no cast. Reach for this only where a test genuinely has to read a
+ * value out of the body: reuse it in a later request, filter a list, or
+ * compare a number. Never launder the cast through
+ * `JSON.parse(await response.text())`, which hides it behind `any`.
+ */
+async function jsonBody<T>(response: Response): Promise<T> {
+  // oxlint-disable-next-line typescript/no-unsafe-type-assertion
+  return (await response.json()) as T;
+}
 
 describe('status routes', () => {
   let spoolRoot = '';
@@ -76,7 +92,7 @@ describe('status routes', () => {
     const response = await app().request('/api/status');
     expect(response.status).toBe(200);
 
-    const snapshot: StatusSnapshot = JSON.parse(await response.text());
+    const snapshot = await jsonBody<StatusSnapshot>(response);
     expect(snapshot.service.state).toBe('ok');
     expect(snapshot.service.version).toBe('9.9.9');
     expect(snapshot.volumes.spool.totalBytes).toBeGreaterThan(0);
@@ -99,37 +115,39 @@ describe('status routes', () => {
       lastSuccessAt: null,
       nextRetryAt: 2,
     });
-    const snapshot: StatusSnapshot = JSON.parse(await (await app().request('/api/status')).text());
-    expect(snapshot.service.state).toBe('degraded');
+    expect(await (await app().request('/api/status')).json()).toMatchObject({
+      service: { state: 'degraded' },
+    });
   });
 
   it("represents one sink's status failure without failing the whole request", async () => {
     // Dispatcher.snapshotSinks() isolates a per-sink stat failure and is
-    // unit-tested directly in dispatcher-reconcile.test.ts. This test
-    // proves the ROUTE surfaces that isolation end to end: the response is
-    // still 200, the failing sink is represented as failed rather than
-    // omitted, and the failure never touches shared `metrics` -- which
-    // would otherwise leak into /readyz.
-    class FlakyDispatcher extends Dispatcher {
-      protected override async sinkStatusFor(
-        entry: SinkEntry,
-        counters: Record<string, SinkCounters>,
-      ): Promise<SinkStatus> {
-        if (entry.name === 'local') {
+    // unit-tested directly in dispatcher-reconcile.test.ts, via a Metrics
+    // subclass whose getSinkHealth() throws for one sink name -- the same
+    // seam snapshotSinks() already calls, no test-only method on
+    // Dispatcher required. This test proves the ROUTE surfaces that
+    // isolation end to end: the response is still 200, the failing sink is
+    // represented as failed rather than omitted, and the failure never
+    // touches shared `metrics` -- which would otherwise leak into
+    // /readyz.
+    class FlakyMetrics extends Metrics {
+      override getSinkHealth(sinkName: string): SinkHealth {
+        if (sinkName === 'local') {
           throw new Error('spool directory missing');
         }
-        return super.sinkStatusFor(entry, counters);
+        return super.getSinkHealth(sinkName);
       }
     }
 
-    const flaky = new FlakyDispatcher({ spoolRoot, logsRoot, metrics, log: silentLog });
+    const flakyMetrics = new FlakyMetrics();
+    const flaky = new Dispatcher({ spoolRoot, logsRoot, metrics: flakyMetrics, log: silentLog });
     try {
       await flaky.applyConfig(config);
 
       const deps = {
         getConfig: () => config,
         dispatcher: flaky,
-        metrics,
+        metrics: flakyMetrics,
         version: '9.9.9',
         configDir: spoolRoot,
         spoolDir: spoolRoot,
@@ -140,13 +158,22 @@ describe('status routes', () => {
       const response = await instance.request('/api/status');
       expect(response.status).toBe(200);
 
-      const snapshot: StatusSnapshot = JSON.parse(await response.text());
-      expect(snapshot.sinks[0]).toMatchObject({
-        name: 'local',
-        health: { state: 'failed', lastError: 'spool directory missing' },
-        queue: { files: 0, bytes: 0, oldestAgeSec: null },
+      expect(await response.json()).toMatchObject({
+        // isDegraded() reads through the same throwing getSinkHealth(), so
+        // a sink whose health cannot be read fails safe to "degraded"
+        // rather than silently reporting "ok".
+        service: { state: 'degraded' },
+        sinks: [
+          {
+            name: 'local',
+            health: { state: 'failed', lastError: 'spool directory missing' },
+            queue: { files: 0, bytes: 0, oldestAgeSec: null },
+          },
+        ],
       });
-      expect(metrics.getSinkHealth('local').state).toBe('ok');
+      // Read straight off the snapshot map, since getSinkHealth('local')
+      // on this instance throws by construction above.
+      expect(flakyMetrics.snapshot().sinkHealth['local']?.state).toBe('ok');
     } finally {
       await flaky.stop(500);
     }

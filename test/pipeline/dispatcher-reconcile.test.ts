@@ -10,7 +10,7 @@ import { SpoolQueue } from '../../src/pipeline/spool.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
 import { Metrics } from '../../src/status/metrics.js';
 import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
-import type { SinkCounters, SinkStatus } from '../../types/api.js';
+import type { SinkHealth } from '../../types/api.js';
 
 const silentLog = createLogger('silent', new Writable({ write: (_c, _e, cb) => cb() }));
 
@@ -252,25 +252,25 @@ describe('Dispatcher', () => {
   });
 
   it("isolates one sink's status failure from the rest of the snapshot", async () => {
-    // sinkStatusFor() is the seam snapshotSinks() calls per entry and
-    // wraps in try/catch. Overriding it in a subclass to throw for exactly
-    // one sink -- while delegating to the real implementation via `super`
-    // for the other -- exercises the actual production try/catch in
-    // snapshotSinks(), rather than asserting against a hand-built fixture
-    // that never touches that code path.
-    class FlakyDispatcher extends Dispatcher {
-      protected override async sinkStatusFor(
-        entry: SinkEntry,
-        counters: Record<string, SinkCounters>,
-      ): Promise<SinkStatus> {
-        if (entry.name === 'broken') {
+    // snapshotSinks() already calls metrics.getSinkHealth() inside its own
+    // try/catch, and `metrics` is an injected constructor dependency --
+    // no test-only seam on Dispatcher is needed to reach that failure.
+    // Overriding getSinkHealth() to throw for exactly one sink name, while
+    // delegating to the real implementation via `super` for the other,
+    // drives the actual production try/catch in snapshotSinks() rather
+    // than asserting against a hand-built fixture that never touches that
+    // code path.
+    class FlakyMetrics extends Metrics {
+      override getSinkHealth(sinkName: string): SinkHealth {
+        if (sinkName === 'broken') {
           throw new Error('stat failed: permission denied');
         }
-        return super.sinkStatusFor(entry, counters);
+        return super.getSinkHealth(sinkName);
       }
     }
 
-    const flaky = new FlakyDispatcher({ spoolRoot, logsRoot, metrics, log: silentLog });
+    const flakyMetrics = new FlakyMetrics();
+    const flaky = new Dispatcher({ spoolRoot, logsRoot, metrics: flakyMetrics, log: silentLog });
     try {
       await flaky.applyConfig(configWith([fileSink('healthy'), fileSink('broken')]));
       await flaky.enqueue([event('a')]);
@@ -287,9 +287,11 @@ describe('Dispatcher', () => {
       expect(broken?.queue).toEqual({ files: 0, bytes: 0, oldestAgeSec: null });
 
       // The synthesized failure must never leak into shared metrics: the
-      // status route this feeds is read-only, and readyz/isDegraded()
-      // must keep reflecting real sink health, not a transient stat error.
-      expect(metrics.getSinkHealth('broken').state).toBe('ok');
+      // status route this feeds is read-only, and readyz/isDegraded() must
+      // keep reflecting real sink health, not a transient stat error. Read
+      // straight off the snapshot map, since getSinkHealth('broken') on
+      // this instance throws by construction above.
+      expect(flakyMetrics.snapshot().sinkHealth['broken']?.state).toBe('ok');
     } finally {
       await flaky.stop(500);
     }
@@ -307,6 +309,36 @@ describe('Dispatcher', () => {
       nextRetryAt: 2,
     });
     expect(dispatcher.isDegraded()).toBe(true);
+  });
+
+  it('fails safe to degraded when a sink health cannot even be read', async () => {
+    // isDegraded() backs both /api/status's service.state and /readyz, so
+    // a getSinkHealth() that throws (the same seam the snapshotSinks()
+    // isolation test drives) must not crash it -- and reporting healthy
+    // when the health is literally unreadable would be a worse answer
+    // than reporting degraded.
+    class FlakyMetrics extends Metrics {
+      override getSinkHealth(sinkName: string): SinkHealth {
+        if (sinkName === 'unreadable') {
+          throw new Error('stat failed: permission denied');
+        }
+        return super.getSinkHealth(sinkName);
+      }
+    }
+
+    const flakyMetrics = new FlakyMetrics();
+    const flaky = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics: flakyMetrics,
+      log: silentLog,
+    });
+    try {
+      await flaky.applyConfig(configWith([fileSink('unreadable')]));
+      expect(flaky.isDegraded()).toBe(true);
+    } finally {
+      await flaky.stop(500);
+    }
   });
 
   it('forgets metrics for a sink once it leaves the config', async () => {

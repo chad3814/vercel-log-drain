@@ -13,7 +13,7 @@ import type { Logger } from '../log.js';
 import type { Metrics } from '../status/metrics.js';
 import type { FreeSpaceProbe, Sink } from '../sinks/types.js';
 import type { LogEvent } from '../vercel/event.js';
-import type { OrphanedSpool, SinkCounters, SinkHealth, SinkStatus } from '../../types/api.js';
+import type { OrphanedSpool, SinkHealth, SinkStatus } from '../../types/api.js';
 
 const FAILURE_THRESHOLD = 5;
 const IDLE_POLL_MS = 500;
@@ -486,8 +486,24 @@ export class Dispatcher {
     const statuses: SinkStatus[] = [];
 
     for (const entry of this.config?.sinks ?? []) {
+      // The try wraps only THIS entry's work, not the loop: wrapping the
+      // loop would lose every sink to one failure, which is the exact bug
+      // this isolation exists to avoid.
       try {
-        statuses.push(await this.sinkStatusFor(entry, counters));
+        const active = this.active.get(entry.name);
+        const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+        statuses.push({
+          name: entry.name,
+          type: entry.config.type,
+          enabled: entry.enabled,
+          health: this.options.metrics.getSinkHealth(entry.name),
+          queue: {
+            files: active?.queue.fileCount() ?? 0,
+            bytes: active?.queue.bytes() ?? 0,
+            oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+          },
+          counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
+        });
       } catch (error) {
         // One sink's stat call failing -- its spool directory removed, or a
         // permission change underneath it -- must not blank out every other
@@ -521,37 +537,20 @@ export class Dispatcher {
     return statuses;
   }
 
-  /**
-   * Computes one sink's status. Split out from snapshotSinks() so a single
-   * sink's failure (caught there) cannot take the rest of the list down
-   * with it. Protected rather than private so tests can override it to
-   * simulate exactly that failure for one sink while the others resolve
-   * normally through the real implementation via `super`.
-   */
-  protected async sinkStatusFor(
-    entry: SinkEntry,
-    counters: Record<string, SinkCounters>,
-  ): Promise<SinkStatus> {
-    const active = this.active.get(entry.name);
-    const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
-    return {
-      name: entry.name,
-      type: entry.config.type,
-      enabled: entry.enabled,
-      health: this.options.metrics.getSinkHealth(entry.name),
-      queue: {
-        files: active?.queue.fileCount() ?? 0,
-        bytes: active?.queue.bytes() ?? 0,
-        oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
-      },
-      counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
-    };
-  }
-
   isDegraded(): boolean {
     for (const entry of this.config?.sinks ?? []) {
       if (!entry.enabled) continue;
-      if (this.options.metrics.getSinkHealth(entry.name).state === 'failed') return true;
+      try {
+        if (this.options.metrics.getSinkHealth(entry.name).state === 'failed') return true;
+      } catch {
+        // Same reasoning as the try/catch in snapshotSinks(): isDegraded()
+        // backs both /api/status's `service.state` and /readyz, so a sink
+        // whose health cannot even be read must not crash either one.
+        // Failing safe to "degraded" here, rather than silently treating
+        // an unreadable sink as healthy, keeps that guarantee meaningful
+        // instead of merely non-crashing.
+        return true;
+      }
     }
     return false;
   }
