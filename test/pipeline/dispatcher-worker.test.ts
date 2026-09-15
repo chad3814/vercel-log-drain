@@ -165,6 +165,14 @@ describe('SinkWorker', () => {
 
     await worker.drainOnce();
     expect(metrics.snapshot().sinkCounters['poison']?.deadLettered).toBe(1);
+    // And onto the error ring the status page renders. A dead-letter is not
+    // a delivery failure -- health is untouched, since the queue advanced --
+    // so counters.deadLettered was the only trace of it, a number an
+    // operator would have to already be watching.
+    const errors = metrics.snapshot().recent.errors;
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.scope).toBe('poison');
+    expect(errors[0]?.message).toContain('dead-lettered');
 
     await worker.drainOnce();
     expect(sink.received[0]?.map((e) => e['id'])).toEqual(['good']);

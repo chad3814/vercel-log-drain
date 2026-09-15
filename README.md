@@ -301,6 +301,18 @@ not history.
   may still hold undelivered data. The Status page lists it with its file
   count and byte size; `DELETE /api/admin/orphans/<name>` removes it for
   good.
+- A **disabled** sink keeps its spool, and `/api/status` reports that spool's
+  real file count and byte size — a disabled sink is not an orphan (it is
+  still configured, and a one-click discard must not be offered for it), but
+  its backlog is still on the volume and still counts against the spool
+  free-space floor, so it is reported rather than shown as zero.
+- **Dead-letter size** is reported per sink and per orphan as `dead.files` /
+  `dead.bytes`, separately from `queue.*`. It is deliberately outside
+  `maxSpoolBytes`: `dead/` is terminal storage, and the budget reclaims space
+  by deleting, which is the one thing nothing may do to a dead letter. So it
+  only ever grows until you clear it by hand — watch it, because a large
+  `dead/` is what takes the whole spool volume below its floor, at which
+  point new events are dropped.
 
 ## Troubleshooting
 

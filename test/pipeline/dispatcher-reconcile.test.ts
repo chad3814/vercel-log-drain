@@ -147,6 +147,61 @@ describe('Dispatcher', () => {
     expect(await filesFor('keeper')).toBe(1);
   });
 
+  it("reports a disabled sink's undelivered backlog instead of zeroes", async () => {
+    // Measured before this: queue {files: 0, bytes: 0}, orphanedSpools [],
+    // and 1 file / 73 B sitting on disk -- an operator "pausing" a sink with
+    // a large backlog saw nothing anywhere reporting it, while those bytes
+    // still counted against the spool volume and so against the free-space
+    // floor. A disabled sink has no SpoolQueue, so the figures have to come
+    // off disk.
+    await dispatcher.applyConfig(configWith([fileSink('paused')]));
+    await dispatcher.enqueue([event('a')]);
+    const enabled = (await dispatcher.snapshotSinks()).find((sink) => sink.name === 'paused');
+    expect(enabled?.queue.files).toBe(1);
+    expect(enabled?.queue.bytes).toBeGreaterThan(0);
+
+    await dispatcher.applyConfig(configWith([fileSink('paused', { enabled: false })]));
+
+    const disabled = (await dispatcher.snapshotSinks()).find((sink) => sink.name === 'paused');
+    expect(disabled?.enabled).toBe(false);
+    expect(disabled?.queue.files).toBe(1);
+    expect(disabled?.queue.bytes).toBe(enabled?.queue.bytes);
+    expect(disabled?.queue.oldestAgeSec).not.toBeNull();
+  });
+
+  it('reports dead-letter files and bytes per sink and per orphan', async () => {
+    // `dead/` appeared in no byte figure: not in queue.bytes, not in
+    // orphanedSpools[].bytes, and not against maxSpoolBytes -- so an
+    // operator could not see it growing at all, which is what turns a
+    // misconfigured sink into the spool volume crossing its floor.
+    await dispatcher.applyConfig(configWith([fileSink('letters')]));
+    await dispatcher.enqueue([event('a')]);
+
+    // Planted out of band on purpose: no worker is started in these tests,
+    // and what is under test here is that the status snapshot READS dead/,
+    // not how a batch gets there -- that is covered in spool.test.ts and
+    // dispatcher-worker.test.ts.
+    const queue = await SpoolQueue.open(join(spoolRoot, 'letters'), {
+      maxSpoolBytes: 1_048_576,
+      freeSpaceFloorBytes: 0,
+    });
+    const batch = await queue.nextBatch(1000, 1_048_576);
+    await queue.deadLetter(batch!);
+
+    const sink = (await dispatcher.snapshotSinks()).find((entry) => entry.name === 'letters');
+    expect(sink?.dead.files).toBe(1);
+    expect(sink?.dead.bytes).toBeGreaterThan(0);
+
+    // And once the sink leaves the config, the same bytes are still visible
+    // on the orphan the discard button would destroy.
+    await dispatcher.applyConfig(configWith([]));
+    const orphan = (await dispatcher.listOrphanedSpools()).find(
+      (entry) => entry.name === 'letters',
+    );
+    expect(orphan?.dead.files).toBe(1);
+    expect(orphan?.dead.bytes).toBe(sink?.dead.bytes);
+  });
+
   it('keeps previously spooled data when an enabled sink is reconfigured', async () => {
     // Unlike the toggle test above, this sink is enabled throughout and
     // already has undelivered data on disk before its settings (not its

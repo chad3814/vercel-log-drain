@@ -51,6 +51,55 @@ export type EnqueueResult = {
 
 type Entry = { name: string; bytes: number };
 
+export type DeadStats = { files: number; bytes: number };
+export type SpoolDirStats = {
+  files: number;
+  bytes: number;
+  oldestMtimeMs: number | null;
+  dead: DeadStats;
+};
+
+async function statDir(dir: string, matches: (name: string) => boolean): Promise<SpoolDirStats> {
+  const stats: SpoolDirStats = {
+    files: 0,
+    bytes: 0,
+    oldestMtimeMs: null,
+    dead: { files: 0, bytes: 0 },
+  };
+  for (const name of await readdir(dir).catch(() => [])) {
+    if (!matches(name)) continue;
+    const entry = await stat(join(dir, name)).catch(() => null);
+    if (entry === null || !entry.isFile()) continue;
+    stats.files += 1;
+    stats.bytes += entry.size;
+    if (stats.oldestMtimeMs === null || entry.mtimeMs < stats.oldestMtimeMs) {
+      stats.oldestMtimeMs = entry.mtimeMs;
+    }
+  }
+  return stats;
+}
+
+/**
+ * What is on disk in a spool directory, read without opening a `SpoolQueue`.
+ *
+ * Needed because a queue exists only for a RUNNING sink, so the only figures
+ * available for a disabled sink or an abandoned directory were the zeroes an
+ * absent queue reports -- which is how a disabled sink's undelivered backlog
+ * came to be reported as `0 files / 0 B` while it sat on disk, and how
+ * `dead/` came to appear in no byte figure anywhere. Read-only by
+ * construction: the status route that consumes this is polled every two
+ * seconds and must not mutate anything.
+ *
+ * `dead/` is counted separately rather than folded into `bytes`, because the
+ * two mean different things to an operator: live bytes will drain on their
+ * own, dead bytes never will and are what they have to go and clear by hand.
+ */
+export async function readSpoolDirStats(dir: string): Promise<SpoolDirStats> {
+  const live = await statDir(dir, (name) => BATCH_NAME.test(name));
+  const dead = await statDir(join(dir, DEAD_DIR), () => true);
+  return { ...live, dead: { files: dead.files, bytes: dead.bytes } };
+}
+
 function serialize(events: LogEvent[]): Buffer {
   return Buffer.from(`${events.map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8');
 }
@@ -344,6 +393,20 @@ export class SpoolQueue {
     // the queue and be redelivered forever, which is worse than the byte
     // undercount — and the failure is now logged rather than swallowed.
     this.untrack(names);
+  }
+
+  /**
+   * Files and bytes in `dead/`. Not tracked in memory like the live entries,
+   * because nothing in the running service reads it on a hot path and a
+   * counter would drift from the directory an operator is actually clearing
+   * by hand. Deliberately NOT counted against `maxSpoolBytes`: `makeRoom`
+   * evicts by unlinking, and `dead/` is terminal storage that nothing the
+   * service does may remove (spec §3.4). Visibility is the fix here, not
+   * eviction.
+   */
+  async deadStats(): Promise<DeadStats> {
+    const stats = await statDir(join(this.dir, DEAD_DIR), () => true);
+    return { files: stats.files, bytes: stats.bytes };
   }
 
   async oldestMtimeMs(): Promise<number | null> {

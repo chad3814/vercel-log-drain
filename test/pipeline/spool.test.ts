@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SpoolQueue } from '../../src/pipeline/spool.js';
+import { readSpoolDirStats, SpoolQueue } from '../../src/pipeline/spool.js';
 
 const BIG = 1_048_576;
 
@@ -165,6 +165,10 @@ describe('SpoolQueue', () => {
     for (let index = 0; index < 8; index += 1) {
       const result = await queue.enqueue([event(`b${String(index)}`)]);
       dropped += result.droppedEvents;
+      // Evicting to stay inside a sink's own budget is not a volume-level
+      // loss, and must not be reported as one: the incoming batch was
+      // written.
+      expect(result.floorDrop).toBeNull();
     }
 
     expect(dropped).toBeGreaterThan(0);
@@ -188,6 +192,10 @@ describe('SpoolQueue', () => {
     expect(result.droppedEvents).toBe(2);
     expect(result.writtenBytes).toBe(0);
     expect(queue.fileCount()).toBe(0);
+    // The caller degrades the service on THIS, not on droppedEvents, which a
+    // routine overflow eviction also moves -- see the assertion in the
+    // overflow test above that floorDrop stays null there.
+    expect(result.floorDrop).toEqual({ freeBytes: 500, floorBytes: 1_000_000 });
   });
 
   it('writes normally when free space is above the floor', async () => {
@@ -262,6 +270,60 @@ describe('SpoolQueue', () => {
     const mtime = await queue.oldestMtimeMs();
     expect(mtime).not.toBeNull();
     expect(Date.now() - (mtime ?? 0)).toBeLessThan(10_000);
+  });
+
+  it('reports dead-letter files and bytes, which no other figure includes', async () => {
+    // `dead/` sits outside maxSpoolBytes by design (it is terminal storage
+    // and makeRoom evicts by unlinking), and it was also excluded from
+    // queue.bytes and from orphanedSpools[].bytes -- so it could grow
+    // without bound with `counters.deadLettered`, an event count, as the only
+    // trace. That is the chain that takes the spool volume below its floor.
+    const queue = await SpoolQueue.open(dir, options());
+    expect(await queue.deadStats()).toEqual({ files: 0, bytes: 0 });
+
+    await queue.enqueue([event('a')]);
+    const batch = await queue.nextBatch(1000, BIG);
+    await queue.deadLetter(batch!);
+
+    const dead = await queue.deadStats();
+    expect(dead.files).toBe(1);
+    expect(dead.bytes).toBe(batch?.bytes);
+    // And the live figures still exclude them, so the two are not confused.
+    expect(queue.fileCount()).toBe(0);
+    expect(queue.bytes()).toBe(0);
+  });
+
+  it('reads live and dead figures off a spool directory with no queue open', async () => {
+    // What a DISABLED sink's status is built from: there is no SpoolQueue for
+    // one, so its whole backlog used to be reported as zero.
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('doomed')]);
+    const batch = await queue.nextBatch(1000, BIG);
+    await queue.deadLetter(batch!);
+    await queue.enqueue([event('waiting')]);
+    const liveBytes = queue.bytes();
+
+    const stats = await readSpoolDirStats(dir);
+
+    expect(stats.files).toBe(1);
+    expect(stats.bytes).toBe(liveBytes);
+    expect(stats.dead.files).toBe(1);
+    expect(stats.dead.bytes).toBeGreaterThan(0);
+    expect(stats.oldestMtimeMs).not.toBeNull();
+  });
+
+  it('ignores names that are not batch files when reading a directory', async () => {
+    // The live count must match what the queue itself tracks: a stray
+    // README, a .tmp left by a crash, and the dead/ directory entry are all
+    // things a naive readdir would count as undelivered batches.
+    await writeFile(join(dir, 'README.txt'), 'not a batch');
+    await writeFile(join(dir, '000000000009.jsonl.tmp'), 'not a batch either');
+    const queue = await SpoolQueue.open(dir, options());
+    await queue.enqueue([event('real')]);
+
+    const stats = await readSpoolDirStats(dir);
+    expect(stats.files).toBe(1);
+    expect(stats.bytes).toBe(queue.bytes());
   });
 
   it('discards everything including dead letters', async () => {

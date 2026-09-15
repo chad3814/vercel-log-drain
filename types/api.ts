@@ -34,13 +34,39 @@ export type SinkStatus = {
   type: string;
   enabled: boolean;
   health: SinkHealth;
+  /**
+   * Undelivered batches on disk. Reported for a DISABLED sink too, read
+   * straight from its spool directory: a disabled sink has no running queue,
+   * and reporting the absent queue's zeroes hid an operator's entire backlog
+   * -- measured as `{files: 0, bytes: 0}` with 1 file and 73 B on disk, and
+   * with the sink absent from `orphanedSpools` as well, so nothing anywhere
+   * reported it.
+   */
   queue: { files: number; bytes: number; oldestAgeSec: number | null };
+  /**
+   * Dead-lettered batches, i.e. `spool/<name>/dead/`. Terminal storage that
+   * nothing removes automatically and that no byte figure used to include,
+   * so it could grow without bound -- outside `maxSpoolBytes`, invisible in
+   * `queue.bytes` -- until it took the whole spool volume below its
+   * free-space floor and every later delivery was dropped.
+   */
+  dead: { files: number; bytes: number };
   counters: SinkCounters;
 };
 
 export type VolumeStatus = { path: string; freeBytes: number; totalBytes: number };
 
-export type OrphanedSpool = { name: string; files: number; bytes: number };
+/**
+ * `files`/`bytes` are the live, still-deliverable batches; `dead` is the
+ * directory's `dead/` contents, which a discard destroys along with
+ * everything else but which will never drain on its own.
+ */
+export type OrphanedSpool = {
+  name: string;
+  files: number;
+  bytes: number;
+  dead: { files: number; bytes: number };
+};
 
 export type RejectRecord = { drainId: string; index: number; reason: string; snippet: string };
 

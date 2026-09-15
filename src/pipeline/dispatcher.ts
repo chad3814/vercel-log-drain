@@ -1,19 +1,24 @@
 import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { compileFilter } from './filter.js';
-import { SpoolQueue } from './spool.js';
+import { readSpoolDirStats, SpoolQueue } from './spool.js';
 import { createSink } from '../sinks/registry.js';
 import { resolveLogsDirectory } from '../sinks/file.js';
 import { SINK_NAME_PATTERN } from '../config/schema.js';
 import { EscalatingDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
 import { initialSinkHealth } from '../status/metrics.js';
 import type { AppConfig, SinkEntry } from '../config/schema.js';
+import type { DeadStats } from './spool.js';
 import type { EventPredicate } from './filter.js';
 import type { Logger } from '../log.js';
 import type { Metrics } from '../status/metrics.js';
 import type { FreeSpaceProbe, Sink } from '../sinks/types.js';
 import type { LogEvent } from '../vercel/event.js';
 import type { OrphanedSpool, SinkHealth, SinkStatus } from '../../types/api.js';
+
+function emptyDeadStats(): DeadStats {
+  return { files: 0, bytes: 0 };
+}
 
 const FAILURE_THRESHOLD = 5;
 const IDLE_POLL_MS = 500;
@@ -139,6 +144,15 @@ export class SinkWorker {
       if (failure instanceof PermanentDeliveryError) {
         await this.options.queue.deadLetter(batch);
         this.options.metrics.recordDeadLettered(this.options.sink.name, batch.events.length);
+        // Also onto the error ring, so a sink quietly dead-lettering every
+        // batch shows up on the status page. A dead-letter is not a delivery
+        // FAILURE -- health stays as it was, because the queue did advance --
+        // so before this the only surface was `counters.deadLettered`, a
+        // number an operator would have to already be watching.
+        this.options.metrics.recordError(
+          this.options.sink.name,
+          `batch dead-lettered to dead/: ${failure.message}`,
+        );
         this.options.log.error(
           { sink: this.options.sink.name, files: batch.files.length, err: failure.message },
           'batch dead-lettered',
@@ -552,16 +566,16 @@ export class Dispatcher {
       const stats = await stat(dir).catch(() => null);
       if (stats === null || !stats.isDirectory()) continue;
 
-      let files = 0;
-      let bytes = 0;
-      for (const entry of await readdir(dir).catch(() => [])) {
-        if (!entry.endsWith('.jsonl')) continue;
-        const fileStats = await stat(join(dir, entry)).catch(() => null);
-        if (fileStats === null) continue;
-        files += 1;
-        bytes += fileStats.size;
-      }
-      orphans.push({ name, files, bytes });
+      // Includes `dead/`, separately: a discard deletes the directory whole,
+      // so reporting only the live batches understated what the button on
+      // the status page destroys.
+      const contents = await readSpoolDirStats(dir);
+      orphans.push({
+        name,
+        files: contents.files,
+        bytes: contents.bytes,
+        dead: contents.dead,
+      });
     }
     return orphans;
   }
@@ -617,17 +631,42 @@ export class Dispatcher {
       // this isolation exists to avoid.
       try {
         const active = this.active.get(entry.name);
-        const oldest = active === undefined ? null : await active.queue.oldestMtimeMs();
+        // A disabled (or otherwise not-running) sink has no SpoolQueue, and
+        // reporting the absent queue's zeroes made its entire undelivered
+        // backlog disappear from every surface at once: `queue {files: 0,
+        // bytes: 0}` here, and filtered out of `listOrphanedSpools` because
+        // it is still configured. An operator "pausing" a sink with 400 MB
+        // spooled saw nothing, anywhere, reporting those 400 MB -- while
+        // they still counted against the spool volume and so against the
+        // free-space floor. Read them off disk instead.
+        //
+        // Spec §8.3 says such a directory "appear[s] as orphanedSpools on
+        // the status page"; it deliberately does not here. An orphan is
+        // offered to `discardOrphan`, and one click must not be able to
+        // throw away a configured sink's queued data. See the report
+        // accompanying this change: the spec's wording is the thing that
+        // needs reconciling, not this behaviour.
+        const onDisk =
+          active === undefined ? await readSpoolDirStats(this.spoolDirFor(entry.name)) : null;
+        const oldest =
+          active === undefined ? onDisk?.oldestMtimeMs : await active.queue.oldestMtimeMs();
         statuses.push({
           name: entry.name,
           type: entry.config.type,
           enabled: entry.enabled,
           health: this.options.metrics.getSinkHealth(entry.name),
           queue: {
-            files: active?.queue.fileCount() ?? 0,
-            bytes: active?.queue.bytes() ?? 0,
-            oldestAgeSec: oldest === null ? null : Math.floor((Date.now() - oldest) / 1000),
+            files: active?.queue.fileCount() ?? onDisk?.files ?? 0,
+            bytes: active?.queue.bytes() ?? onDisk?.bytes ?? 0,
+            oldestAgeSec:
+              oldest === null || oldest === undefined
+                ? null
+                : Math.floor((Date.now() - oldest) / 1000),
           },
+          dead:
+            active === undefined
+              ? (onDisk?.dead ?? emptyDeadStats())
+              : await active.queue.deadStats(),
           counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
         });
       } catch (error: unknown) {
@@ -657,6 +696,7 @@ export class Dispatcher {
             nextRetryAt: null,
           },
           queue: { files: 0, bytes: 0, oldestAgeSec: null },
+          dead: emptyDeadStats(),
           counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
         });
       }
