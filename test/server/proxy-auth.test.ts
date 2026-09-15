@@ -2,7 +2,12 @@ import type { AddressInfo } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
-import { nodePeerResolver, parseAuthConfig, proxyAuth } from '../../src/server/middleware/proxy-auth.js';
+import {
+  nodePeerResolver,
+  parseAuthConfig,
+  proxyAuth,
+  stripIdentityHeader,
+} from '../../src/server/middleware/proxy-auth.js';
 import type { AuthConfig } from '../../src/server/middleware/proxy-auth.js';
 import type { AppEnv } from '../../src/server/types.js';
 
@@ -83,6 +88,19 @@ describe('parseAuthConfig', () => {
         AUTH_ALLOWED_USERS: '   ,  ',
       }),
     ).toThrow('AUTH_ALLOWED_USERS was set but lists no users');
+  });
+
+  it('rejects a user header that names a header the service depends on', () => {
+    // AUTH_USER_HEADER=x-vercel-signature would strip the signature from
+    // every inbound delivery, failing HMAC on all of them: total, silent log
+    // loss from one plausible-looking misconfiguration.
+    expect(() =>
+      parseAuthConfig({
+        AUTH_MODE: 'proxy',
+        AUTH_TRUSTED_PROXIES: '10.0.0.0/8',
+        AUTH_USER_HEADER: 'X-Vercel-Signature',
+      }),
+    ).toThrow('AUTH_USER_HEADER must not name a reserved header');
   });
 
   it('rejects a user header that is not a valid header name', () => {
@@ -291,5 +309,31 @@ describe('proxyAuth', () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ user: 'chad@example.com', rawHeader: null });
+  });
+
+  it('stripIdentityHeader removes the header before any handler runs', async () => {
+    // Mounted app-wide by buildApp, so it has to work on routes that no auth
+    // middleware covers -- the drain route above all. Tested here with a
+    // handler that reports what it was given, which is the only way to
+    // observe the strip at all: nothing in the real app echoes its headers.
+    const app = new Hono<AppEnv>();
+    app.use('*', stripIdentityHeader('X-Forwarded-User'));
+    app.get('/anything', (c) => c.json({ seen: c.req.header('x-forwarded-user') ?? null }));
+
+    const response = await app.request('/anything', {
+      headers: { 'x-forwarded-user': 'attacker@example.com' },
+    });
+    expect(await response.json()).toEqual({ seen: null });
+  });
+
+  it('stripIdentityHeader leaves every other header alone', async () => {
+    const app = new Hono<AppEnv>();
+    app.use('*', stripIdentityHeader('x-forwarded-user'));
+    app.get('/anything', (c) => c.json({ sig: c.req.header('x-vercel-signature') ?? null }));
+
+    const response = await app.request('/anything', {
+      headers: { 'x-vercel-signature': 'abc123', 'x-forwarded-user': 'a@b.c' },
+    });
+    expect(await response.json()).toEqual({ sig: 'abc123' });
   });
 });

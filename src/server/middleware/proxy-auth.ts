@@ -44,6 +44,23 @@ function splitList(value: string | undefined): string[] | null {
 // says nothing about the misconfigured variable.
 const HEADER_NAME = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
+// The identity header is stripped from every inbound request app-wide, so
+// naming a header the service itself depends on would quietly break that
+// mechanism. `x-vercel-signature` is the dangerous one: stripping it fails
+// HMAC verification on every delivery, which is total and silent log loss.
+// The others are either request-critical or would strip a credential the
+// service is not meant to touch.
+const RESERVED_HEADERS = new Set([
+  'authorization',
+  'connection',
+  'content-length',
+  'content-type',
+  'cookie',
+  'host',
+  'transfer-encoding',
+  'x-vercel-signature',
+]);
+
 type ParsedCidr = { address: string; prefix: number; family: 'ipv4' | 'ipv6' };
 
 // Validated once, at config-parse time, so a typo in AUTH_TRUSTED_PROXIES
@@ -90,6 +107,9 @@ export function parseAuthConfig(env: Record<string, string | undefined>): AuthCo
   if (!HEADER_NAME.test(userHeader)) {
     throw new Error(`AUTH_USER_HEADER is not a valid HTTP header name: "${userHeader}"`);
   }
+  if (RESERVED_HEADERS.has(userHeader.toLowerCase())) {
+    throw new Error(`AUTH_USER_HEADER must not name a reserved header: "${userHeader}"`);
+  }
 
   // Present-but-empty is a configuration mistake, not "no allowlist".
   // Treating it as no allowlist hands admin to every identity the proxy
@@ -116,6 +136,21 @@ function buildBlockList(cidrs: string[]): BlockList {
     list.addSubnet(address, prefix, family);
   }
   return list;
+}
+
+/**
+ * Removes an inbound identity header from every request it sees, whatever the
+ * auth mode. Mounted ahead of the route table by `buildApp`, because
+ * `proxyAuth` only strips on the routes it guards and the drain route is
+ * deliberately outside the guard. This authenticates nothing; it only removes
+ * a value no inbound request is ever allowed to assert.
+ */
+export function stripIdentityHeader(headerName: string): MiddlewareHandler<AppEnv> {
+  const name = headerName.toLowerCase();
+  return async (c, next) => {
+    c.req.raw.headers.delete(name);
+    return next();
+  };
 }
 
 export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
