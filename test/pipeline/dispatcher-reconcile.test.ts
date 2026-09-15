@@ -428,6 +428,102 @@ describe('Dispatcher', () => {
     await floored.stop(500);
   });
 
+  it('reports degraded and records an error when the spool floor drops a batch', async () => {
+    // The Critical this fix exists for: with the floor above actual free
+    // space the batch is discarded, the drain route has already answered
+    // 200, and before this every surface an operator reads said `ok` --
+    // service.state, sink health, /readyz and recent.errors alike, with only
+    // counters.dropped moving. Assert all three of the signals that must now
+    // move, since the drop counter alone was never enough to notice.
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: noFreeSpace,
+    });
+    const config = configWith([fileSink('floored')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    try {
+      await floored.applyConfig(config);
+      expect(floored.isDegraded()).toBe(false);
+
+      await floored.enqueue([event('a'), event('b')]);
+
+      // Nothing reached disk, and the service says so.
+      expect((await floored.snapshotSinks()).find((s) => s.name === 'floored')?.queue.files).toBe(
+        0,
+      );
+      expect(floored.isDegraded()).toBe(true);
+      expect(metrics.snapshot().sinkCounters['floored']?.dropped).toBe(2);
+      const errors = metrics.snapshot().recent.errors;
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.scope).toBe('floored');
+      expect(errors[0]?.message).toContain('free-space floor');
+    } finally {
+      await floored.stop(500);
+    }
+  });
+
+  it('stops reporting degraded once the spool volume recovers', async () => {
+    // The other direction of the same guard. A latch that only ever sets
+    // leaves the service `degraded` for the rest of the process's life after
+    // one transient dip below the floor, and /readyz never comes back --
+    // which is how a correct-looking degraded signal becomes one nobody
+    // trusts. Asserting only the set direction cannot tell those apart.
+    let freeBytes = 0;
+    const flapping = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: () => Promise.resolve(freeBytes),
+    });
+    const config = configWith([fileSink('flapping')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    try {
+      await flapping.applyConfig(config);
+      await flapping.enqueue([event('a')]);
+      expect(flapping.isDegraded()).toBe(true);
+
+      freeBytes = 50_000_000;
+      await flapping.enqueue([event('b')]);
+
+      expect(flapping.isDegraded()).toBe(false);
+      expect((await flapping.snapshotSinks()).find((s) => s.name === 'flapping')?.queue.files).toBe(
+        1,
+      );
+    } finally {
+      await flapping.stop(500);
+    }
+  });
+
+  it('reports degraded while no sink is enabled to store anything', async () => {
+    // Same silent-loss shape as the floor drop, one step earlier: with no
+    // enabled sink the drain route answers 200 for events that are stored
+    // nowhere and not even counted as dropped. The first-boot window -- a
+    // drain created before any sink -- is exactly this state.
+    expect(dispatcher.isDegraded()).toBe(true);
+
+    await dispatcher.applyConfig(configWith([fileSink('only')]));
+    expect(dispatcher.isDegraded()).toBe(false);
+
+    await dispatcher.applyConfig(configWith([fileSink('only', { enabled: false })]));
+    expect(dispatcher.isDegraded()).toBe(true);
+  });
+
+  it('records an error when a delivery arrives with nowhere to store it', async () => {
+    await dispatcher.applyConfig(configWith([]));
+    await dispatcher.enqueue([event('a'), event('b')]);
+
+    const errors = metrics.snapshot().recent.errors;
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.scope).toBe('ingest');
+    expect(errors[0]?.message).toContain('no sink is enabled');
+  });
+
   it('waits for an in-flight delivery to finish before removing a sink', async () => {
     // The other reconciliation tests never call dispatcher.start(), so their
     // workers never run a loop iteration — stop() succeeds trivially whether

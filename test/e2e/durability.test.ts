@@ -172,6 +172,42 @@ describe('end-to-end durability', () => {
     );
   }
 
+  /**
+   * One file sink, and a spool free-space floor far above any real volume's
+   * free space -- the reviewer's reproduction of the silent-drop defect,
+   * driven through the real `statfs` rather than an injected probe, because
+   * the defect was that nothing ANYWHERE reported it and only the real boot
+   * path wires all of those surfaces together.
+   */
+  async function writeUnwritableSpoolConfig(): Promise<void> {
+    const base = defaultAppConfig();
+    await new ConfigStore(configDir).save(
+      {
+        ...base,
+        drains: [{ id: 'e2e-drain', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 }],
+        sinks: [
+          {
+            name: 'local',
+            enabled: true,
+            filter: {},
+            maxSpoolBytes: 1_048_576,
+            maxBatchEvents: 1000,
+            maxBatchBytes: 1_048_576,
+            config: {
+              type: 'file',
+              directory: join(logsRoot, 'local'),
+              filePrefix: 'events',
+              retentionDays: 0,
+              freeSpaceFloorBytes: 0,
+            },
+          },
+        ],
+        server: { ...base.server, spoolFreeSpaceFloorBytes: 1_000_000_000_000_000 },
+      },
+      null,
+    );
+  }
+
   function bootService(): Promise<Booted> {
     return boot({
       env: {
@@ -300,6 +336,50 @@ describe('end-to-end durability', () => {
 
       await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
       expect(await readdir(join(spool, 'dead')).catch(() => [])).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
+  it('reports a spool-floor drop on every status surface, not just the drop counter', async () => {
+    // The design's one permitted loss point, end to end through the real
+    // HTTP surface. Before this fix the measured behaviour was: 200
+    // {"accepted":1}, nothing on disk, service.state ok, sink health ok,
+    // /readyz 200, recent.errors empty -- Vercel never retries, so the data
+    // was gone with no signal anywhere an operator looks.
+    await writeUnwritableSpoolConfig();
+    const booted = await bootService();
+
+    try {
+      // Still acknowledged: that is the documented trade, and this test is
+      // about the signals, not the status code.
+      const response = await post(booted, [event('dropped-1')]);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ received: 1, accepted: 1, rejected: 0 });
+
+      // Nothing reached disk.
+      const spooled = (await readdir(join(spoolDir, 'local')).catch(() => [])).filter((f) =>
+        f.endsWith('.jsonl'),
+      );
+      expect(spooled).toEqual([]);
+
+      const snapshot = await jsonBody<{
+        service: { state: string };
+        sinks: { name: string; counters: { dropped: number } }[];
+        recent: { errors: { scope: string; message: string }[] };
+      }>(await booted.app.request('/api/status'));
+
+      expect(snapshot.service.state).toBe('degraded');
+      expect(snapshot.sinks.find((sink) => sink.name === 'local')?.counters.dropped).toBe(1);
+      const errors = snapshot.recent.errors;
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.scope).toBe('local');
+      expect(errors[0]?.message).toContain('free-space floor');
+
+      expect((await booted.app.request('/readyz')).status).toBe(503);
+      // Liveness is still unconditional: a full spool volume must not get the
+      // container killed and restarted into the same full volume.
+      expect((await booted.app.request('/healthz')).status).toBe(200);
     } finally {
       await booted.shutdown();
     }

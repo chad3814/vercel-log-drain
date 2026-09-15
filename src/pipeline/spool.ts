@@ -31,7 +31,23 @@ export type SpoolOptions = {
 };
 
 export type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number };
-export type EnqueueResult = { writtenBytes: number; droppedEvents: number };
+export type EnqueueResult = {
+  writtenBytes: number;
+  droppedEvents: number;
+  /**
+   * Non-null only when the WHOLE batch was discarded because the spool volume
+   * sits below its free-space floor -- the single loss point the design allows
+   * (spec §4), and the one the caller must report as `degraded`.
+   *
+   * Deliberately distinct from a drop-oldest overflow eviction, which also
+   * moves `droppedEvents` but is a budgeted trade inside one sink that still
+   * commits the incoming batch. Collapsing the two into one number is what
+   * made the floor drop invisible: `counters.dropped` climbed for both, so no
+   * caller could tell "this sink is over its budget" from "nothing is
+   * reaching disk at all".
+   */
+  floorDrop: { freeBytes: number; floorBytes: number } | null;
+};
 
 type Entry = { name: string; bytes: number };
 
@@ -132,12 +148,16 @@ export class SpoolQueue {
   }
 
   async enqueue(events: LogEvent[]): Promise<EnqueueResult> {
-    if (events.length === 0) return { writtenBytes: 0, droppedEvents: 0 };
+    if (events.length === 0) return { writtenBytes: 0, droppedEvents: 0, floorDrop: null };
 
     if (this.options.freeSpaceFloorBytes > 0) {
       const available = await this.freeSpace(this.dir);
       if (available < this.options.freeSpaceFloorBytes) {
-        return { writtenBytes: 0, droppedEvents: events.length };
+        return {
+          writtenBytes: 0,
+          droppedEvents: events.length,
+          floorDrop: { freeBytes: available, floorBytes: this.options.freeSpaceFloorBytes },
+        };
       }
     }
 
@@ -186,7 +206,7 @@ export class SpoolQueue {
 
     this.entries.push({ name, bytes: payload.byteLength });
     this.totalBytes += payload.byteLength;
-    return { writtenBytes: payload.byteLength, droppedEvents };
+    return { writtenBytes: payload.byteLength, droppedEvents, floorDrop: null };
   }
 
   private async makeRoom(incoming: number): Promise<number> {

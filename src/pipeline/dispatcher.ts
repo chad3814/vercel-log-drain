@@ -315,6 +315,15 @@ export class Dispatcher {
   private reconcileChain: Promise<void> = Promise.resolve();
   /** Set by `stop()`; makes any later or still-queued reconcile a no-op. */
   private stopped = false;
+  /**
+   * Sinks whose last enqueue was discarded because the spool volume is below
+   * `spoolFreeSpaceFloorBytes`. Held here rather than in sink HEALTH, which
+   * describes delivery: a sink at the floor may be delivering perfectly, and
+   * conflating the two would report "the sink is broken" for a problem that
+   * is the volume's. `isDegraded()` reads it, so /readyz and
+   * `service.state` react to a full spool volume as spec §10 requires.
+   */
+  private belowFloor = new Set<string>();
 
   constructor(private readonly options: DispatcherOptions) {}
 
@@ -373,6 +382,11 @@ export class Dispatcher {
       if (unchanged) continue;
       await current.worker.stop(5000);
       this.active.delete(name);
+      // Dropped with the queue that observed it. The flag describes a live
+      // queue's last enqueue, so keeping it across a teardown would report a
+      // sink as dropping at the floor when it no longer exists (or has been
+      // reopened); the next enqueue re-detects a volume that is still full.
+      this.belowFloor.delete(name);
       if (next === undefined) {
         // Deliberately leaves the spool directory on disk.
         this.options.metrics.forgetSink(name);
@@ -431,6 +445,20 @@ export class Dispatcher {
 
   async enqueue(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
+
+    // Nowhere to put them. The drain route has already decided to answer 200
+    // by the time this resolves, so the events are gone: say so, loudly,
+    // rather than letting the status page report `ok` for a service that can
+    // deliver to nothing. `isDegraded()` reports this state independently of
+    // whether any delivery has arrived, so a first-boot deployment with no
+    // sink yet is visible before the first batch is lost rather than after.
+    if (this.enabledSinkCount() === 0) {
+      const message = `${String(events.length)} events were accepted but no sink is enabled to store them`;
+      this.options.metrics.recordError('ingest', message);
+      this.options.log.error({ events: events.length }, message);
+      return;
+    }
+
     for (const active of this.active.values()) {
       if (!active.entry.enabled) continue;
       const matching = events.filter((event) => active.predicate(event));
@@ -438,12 +466,52 @@ export class Dispatcher {
       const result = await active.queue.enqueue(matching);
       if (result.droppedEvents > 0) {
         this.options.metrics.recordDropped(active.entry.name, result.droppedEvents);
-        this.options.log.warn(
-          { sink: active.entry.name, dropped: result.droppedEvents },
-          'spool overflow dropped oldest batches',
-        );
       }
+      if (result.floorDrop === null) {
+        // A write got through, so whatever the volume looked like last time,
+        // it is not refusing this sink now. Cleared in both directions on
+        // purpose: a latch that only ever sets leaves the service reporting
+        // `degraded` for the rest of the process's life after one transient
+        // dip below the floor.
+        this.belowFloor.delete(active.entry.name);
+        if (result.droppedEvents > 0) {
+          this.options.log.warn(
+            { sink: active.entry.name, dropped: result.droppedEvents },
+            'spool overflow dropped oldest batches',
+          );
+        }
+        continue;
+      }
+
+      // The design's one permitted loss point (spec §4), and the only place
+      // where a delivery this service has ALREADY acknowledged with 200 is
+      // discarded. Three separate surfaces have to move, because an operator
+      // reading any one of them must see it: `degraded` (and therefore
+      // /readyz 503, spec §10), a recent-errors entry on the status page, and
+      // the dropped counter. Recorded per drop rather than per transition:
+      // each one is an independent, irreversible loss, and while this
+      // condition holds it deserves to crowd the error ring -- there is no
+      // worse state for this service to be in.
+      this.belowFloor.add(active.entry.name);
+      const message =
+        `spool volume is below its free-space floor ` +
+        `(${String(result.floorDrop.freeBytes)} B free, floor ${String(result.floorDrop.floorBytes)} B): ` +
+        `dropped ${String(result.droppedEvents)} already-acknowledged events`;
+      this.options.metrics.recordError(active.entry.name, message);
+      this.options.log.error(
+        {
+          sink: active.entry.name,
+          dropped: result.droppedEvents,
+          freeBytes: result.floorDrop.freeBytes,
+          floorBytes: result.floorDrop.floorBytes,
+        },
+        message,
+      );
     }
+  }
+
+  private enabledSinkCount(): number {
+    return (this.config?.sinks ?? []).filter((entry) => entry.enabled).length;
   }
 
   start(): void {
@@ -596,6 +664,16 @@ export class Dispatcher {
   }
 
   isDegraded(): boolean {
+    // A service with nowhere to put a delivery is not healthy, whatever the
+    // per-sink health says: the drain route answers 200 and the events are
+    // stored nowhere. This also covers the never-configured dispatcher, and
+    // the first-boot window where a drain exists before any sink does.
+    if (this.enabledSinkCount() === 0) return true;
+
+    // The spool volume is refusing writes for at least one sink, so
+    // acknowledged deliveries are being discarded (spec §4, §10).
+    if (this.belowFloor.size > 0) return true;
+
     for (const entry of this.config?.sinks ?? []) {
       if (!entry.enabled) continue;
       try {

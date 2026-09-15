@@ -152,6 +152,17 @@ budget independently evicts the _oldest_ on-disk batches to make room for new
 ones. Collapsing all three mounts into one would tie a logs-volume outage
 directly to ingest, which is exactly what keeping them apart avoids.
 
+Dropping at the spool floor is the **one loss point in the design**, so it is
+reported on every surface an operator might be looking at: `service.state`
+becomes `degraded`, `/readyz` answers `503`, each drop appends an entry to
+`recent.errors` naming the sink and the bytes free, and `counters.dropped`
+climbs. Vercel is still answered `200` for a batch dropped this way, which is
+what the design chose: Vercel retries only a few times, and each retry would
+arrive at the same full volume, so the honest signal is local rather than a
+`500` that loses the data a few seconds later anyway. That makes these
+signals the only warning you get — treat a `degraded` service with a climbing
+`dropped` count as data loss in progress, not as a slow sink.
+
 On a Linux host, a **bind mount** of a pre-existing host directory (as
 opposed to a named volume) does not carry the right ownership: the container
 runs as uid/gid `10001`, and Docker does not chown a bind-mounted directory
@@ -267,7 +278,10 @@ not history.
   failures), and `failed` (five or more consecutive failures, or a single
   authentication failure — a `401`/`403`/`404` from Loki escalates straight
   to `failed` rather than waiting out several backoff rounds to say so).
-  `/readyz` answers `503` while any _enabled_ sink is `failed`. Retry backoff
+  `/readyz` answers `503` while any _enabled_ sink is `failed`, while the
+  spool volume is below its free-space floor (events are being dropped), or
+  while **no** sink is enabled at all — a service with nowhere to put a
+  delivery is not ready, even though ingest still answers `200`. Retry backoff
   doubles from `RETRY_BASE_MS` (default `1000`) up to `RETRY_MAX_MS` (default
   `60000`), plus up to 30% jitter — so the real ceiling on any single wait is
   about 1.3× `RETRY_MAX_MS`, not `RETRY_MAX_MS` itself.

@@ -116,15 +116,21 @@ export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
  * GET /readyz -- readiness. Unlike liveness, readiness is ALLOWED to
  * report not-ready: it answers whether the service can actually accept and
  * durably persist a delivery right now, not merely whether the process
- * exists. It reports 503 while `dispatcher.isDegraded()` -- i.e. while some
- * enabled sink has hit its consecutive-failure threshold -- because a
- * sink stuck retrying is a real, actionable signal: an operator should
- * look at it, and a load balancer is entitled to take this instance out of
- * rotation for it, even though the drain route would still accept and
- * spool new events during that time. Readiness is deliberately narrow: it
- * does not probe the filesystem itself (that is `/api/status`'s job, and
- * duplicating it here would make readyz slow and disk-dependent, which is
- * exactly what liveness above is not allowed to be either).
+ * exists. It reports 503 while `dispatcher.isDegraded()`, which is true in
+ * three cases: some enabled sink has hit its consecutive-failure threshold;
+ * the spool volume is below its free-space floor, so acknowledged
+ * deliveries are being discarded (spec §4 and §10, which names "a full
+ * spool volume" explicitly); or no sink is enabled at all, so a delivery
+ * would be answered 200 and stored nowhere. The first is a sink stuck
+ * retrying -- an operator should look at it, and a load balancer is
+ * entitled to take this instance out of rotation, even though the drain
+ * route would still accept and spool new events. The other two are active
+ * data loss, which is the strongest reason this endpoint has to say no.
+ *
+ * Readiness still does not probe the filesystem itself (that is
+ * `/api/status`'s job, and duplicating it here would make readyz slow and
+ * disk-dependent, which is exactly what liveness above is not allowed to
+ * be either) -- it reports what the last enqueue actually observed.
  */
 export function healthRoutes(deps: StatusDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
