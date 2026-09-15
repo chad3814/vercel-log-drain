@@ -7,6 +7,7 @@ import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
 import { adminRoutes } from '../../src/server/routes/admin.js';
 import { ConfigStore } from '../../src/config/store.js';
+import type { LoadedConfig } from '../../src/config/store.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
 import { SpoolQueue } from '../../src/pipeline/spool.js';
 import { Metrics } from '../../src/status/metrics.js';
@@ -297,6 +298,19 @@ describe('admin routes', () => {
     expect(response.status).toBe(404);
   });
 
+  it('returns 400 for a syntactically invalid orphan name', async () => {
+    // Separate from the 404 above on purpose. Both guards -- the orphan-list
+    // membership check and SINK_NAME_PATTERN in spoolDirFor -- reject a
+    // traversal name, so while both answered 404 no test could tell which
+    // one fired, and removing either left the other covering for it. Two
+    // distinct status codes pin them individually.
+    const response = await app().request('/api/admin/orphans/Not_A_Valid_Name', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
+  });
+
   it('rejects a path-traversal name instead of touching anything outside the spool root', async () => {
     // `:name` is a single Hono path segment, but a client that percent-encodes
     // its slashes (`..%2F..%2Fetc`) gets them decoded back into literal `../`
@@ -305,15 +319,17 @@ describe('admin routes', () => {
     // would otherwise catch this does not apply to a raw `app.request()`
     // call. Sink names are a security boundary precisely because a name
     // becomes a directory under the spool root, so this must be rejected the
-    // same as any other name that isn't a real orphan -- not 500, and
-    // certainly not a successful delete of something outside spoolRoot.
+    // same as any other syntactically invalid name -- not 500, and certainly
+    // not a successful delete of something outside spoolRoot. Expects 400
+    // (InvalidSinkNameError from spoolDirFor's pattern check), not 404: the
+    // canary-survival assertion is the important half and is unchanged.
     const target = join(spoolRoot, '..', 'traversal-canary');
     await mkdir(target, { recursive: true });
     try {
       const response = await app().request('/api/admin/orphans/..%2Ftraversal-canary', {
         method: 'DELETE',
       });
-      expect(response.status).toBe(404);
+      expect(response.status).toBe(400);
       const survived = await stat(target).then(
         () => true,
         () => false,
@@ -321,6 +337,35 @@ describe('admin routes', () => {
       expect(survived).toBe(true);
     } finally {
       await rm(target, { recursive: true, force: true });
+    }
+  });
+
+  it('answers 507 only when the config volume is full, and 500 otherwise', async () => {
+    // The spec reserves 507 for one case, a full config volume. Sending it
+    // for every save failure sends an operator to free disk space that was
+    // never the problem, so the two are pinned apart here.
+    // `app()` reads `store` when it is called, so swapping the binding is
+    // enough to inject a failure -- no change to the route's dependencies.
+    class FailingStore extends ConfigStore {
+      constructor(private readonly failure: Error) {
+        super(configDir);
+      }
+      override save(): Promise<LoadedConfig> {
+        return Promise.reject(this.failure);
+      }
+    }
+
+    const real = store;
+    try {
+      store = new FailingStore(
+        Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }),
+      );
+      expect((await put({ config: current, etag })).status).toBe(507);
+
+      store = new FailingStore(new Error('permission denied'));
+      expect((await put({ config: current, etag })).status).toBe(500);
+    } finally {
+      store = real;
     }
   });
 });

@@ -4,6 +4,7 @@ import { EtagMismatchError } from '../../config/store.js';
 import { redactConfig, restoreSecrets, SecretRestoreError } from '../../config/redact.js';
 import { newDrainId, newDrainSecret } from '../../config/schema.js';
 import { warningsFor } from '../../sinks/registry.js';
+import { InvalidSinkNameError } from '../../pipeline/dispatcher.js';
 import type { ConfigStore } from '../../config/store.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { Dispatcher } from '../../pipeline/dispatcher.js';
@@ -101,7 +102,12 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
       const failure = error instanceof Error ? error : new Error(String(error));
       deps.log.error({ err: failure.message }, 'failed to persist config');
       await deps.dispatcher.applyConfig(deps.getConfig());
-      return c.json({ code: 'save_failed', error: failure.message }, 507);
+      // The spec reserves 507 for one case: a full config volume. Everything
+      // else -- a permission change, a failed rename, an unexpected throw --
+      // is a plain 500. Answering 507 for those sends an operator to go free
+      // disk space that was never the problem.
+      const status: 500 | 507 = 'code' in failure && failure.code === 'ENOSPC' ? 507 : 500;
+      return c.json({ code: 'save_failed', error: failure.message }, status);
     }
 
     deps.setConfig(saved.config, saved.etag);
@@ -146,6 +152,13 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
       await deps.dispatcher.discardOrphan(c.req.param('name'));
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
+      // Two distinct rejections, kept distinct. A name that could never be
+      // valid is a bad request; a well-formed name that is not an orphan is a
+      // miss. Collapsing both into 404 also collapsed the two guards into one
+      // observable outcome, so no test could pin either individually.
+      if (failure instanceof InvalidSinkNameError) {
+        return c.json({ code: 'bad_request', error: failure.message }, 400);
+      }
       return c.json({ code: 'not_found', error: failure.message }, 404);
     }
     return c.json({ ok: true });

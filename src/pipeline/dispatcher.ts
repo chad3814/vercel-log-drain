@@ -249,6 +249,21 @@ export class SinkWorker {
 
 export type TestSinkResult = { ok: boolean; detail: string };
 
+/**
+ * Thrown by `spoolDirFor` for a name that does not match `SINK_NAME_PATTERN`
+ * -- syntactically invalid, never a real sink or orphan regardless of what
+ * exists on disk. Kept distinct from "not an orphan" (a plain `Error` from
+ * `discardOrphan`) so a caller like the admin route can answer 400 for one
+ * and 404 for the other, rather than collapsing both guards into one
+ * observable outcome.
+ */
+export class InvalidSinkNameError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidSinkNameError';
+  }
+}
+
 export type DispatcherOptions = {
   spoolRoot: string;
   logsRoot: string;
@@ -291,7 +306,7 @@ export class Dispatcher {
 
   private spoolDirFor(name: string): string {
     if (!SINK_NAME_PATTERN.test(name)) {
-      throw new Error(`invalid sink name "${name}"`);
+      throw new InvalidSinkNameError(`invalid sink name "${name}"`);
     }
     return join(this.options.spoolRoot, name);
   }
@@ -447,11 +462,17 @@ export class Dispatcher {
   }
 
   async discardOrphan(name: string): Promise<void> {
+    // Pattern-checked before the orphan-membership lookup, and unconditionally
+    // -- not only when a matching directory happens to exist -- so a
+    // syntactically invalid name (InvalidSinkNameError, 400) and a
+    // well-formed name that simply is not an orphan (plain Error, 404) stay
+    // distinguishable outcomes rather than both collapsing into "not found".
+    const dir = this.spoolDirFor(name);
     const orphans = await this.listOrphanedSpools();
     if (!orphans.some((orphan) => orphan.name === name)) {
       throw new Error(`"${name}" is not an orphaned spool directory`);
     }
-    await rm(this.spoolDirFor(name), { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true });
   }
 
   async testSink(name: string): Promise<TestSinkResult> {
