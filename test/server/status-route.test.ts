@@ -166,7 +166,7 @@ describe('status routes', () => {
         sinks: [
           {
             name: 'local',
-            health: { state: 'failed', lastError: 'spool directory missing' },
+            health: { state: 'failed', lastError: 'status unavailable: spool directory missing' },
             queue: { files: 0, bytes: 0, oldestAgeSec: null },
           },
         ],
@@ -179,7 +179,28 @@ describe('status routes', () => {
     }
   });
 
-  it('always answers healthz with 200', async () => {
+  it('always answers healthz with 200, even when the service is degraded', async () => {
+    // Asserting 200 against a HEALTHY dispatcher cannot tell "unconditional"
+    // from "currently agrees with a healthy dispatcher": wiring /healthz to
+    // isDegraded() leaves that assertion green. Liveness must not depend on
+    // anything that can fail -- a 503 here makes the orchestrator kill a
+    // process that is still accepting and spooling deliveries, which is the
+    // outage liveness exists to prevent. So degrade the service first and
+    // assert it still answers 200.
+    expect((await app().request('/healthz')).status).toBe(200);
+
+    metrics.setSinkHealth('local', {
+      state: 'failed',
+      consecutiveFailures: 9,
+      lastError: 'loki unreachable',
+      lastErrorAt: Date.now(),
+      lastSuccessAt: null,
+      nextRetryAt: null,
+    });
+    expect(dispatcher.isDegraded()).toBe(true);
+
+    // Readiness is allowed to say no here; liveness is not.
+    expect((await app().request('/readyz')).status).toBe(503);
     expect((await app().request('/healthz')).status).toBe(200);
   });
 

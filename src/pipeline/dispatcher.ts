@@ -504,7 +504,7 @@ export class Dispatcher {
           },
           counters: counters[entry.name] ?? { delivered: 0, dropped: 0, deadLettered: 0 },
         });
-      } catch (error) {
+      } catch (error: unknown) {
         // One sink's stat call failing -- its spool directory removed, or a
         // permission change underneath it -- must not blank out every other
         // sink's status in the same response. This synthesized entry
@@ -512,7 +512,7 @@ export class Dispatcher {
         // to `metrics`, because the status route this feeds is read-only
         // and must not mutate shared state as a side effect of being
         // polled.
-        const message = error instanceof Error ? error.message : String(error);
+        const message = error instanceof Error ? error.message : 'unknown error';
         this.options.log.warn({ sink: entry.name, err: message }, 'sink status snapshot failed');
         statuses.push({
           name: entry.name,
@@ -520,8 +520,12 @@ export class Dispatcher {
           enabled: entry.enabled,
           health: {
             state: 'failed',
+            // Zero, because no delivery attempt failed -- the sink's status
+            // could not be READ. The prefix on lastError says so, since
+            // `failed` with no consecutive failures would otherwise read to
+            // an operator as "just started failing".
             consecutiveFailures: 0,
-            lastError: message,
+            lastError: `status unavailable: ${message}`,
             lastErrorAt: Date.now(),
             lastSuccessAt: null,
             nextRetryAt: null,

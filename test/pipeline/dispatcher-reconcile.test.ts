@@ -281,7 +281,7 @@ describe('Dispatcher', () => {
 
       const broken = statuses.find((s) => s.name === 'broken');
       expect(broken?.health.state).toBe('failed');
-      expect(broken?.health.lastError).toBe('stat failed: permission denied');
+      expect(broken?.health.lastError).toBe('status unavailable: stat failed: permission denied');
       expect(broken?.queue).toEqual({ files: 0, bytes: 0, oldestAgeSec: null });
 
       // The synthesized failure must never leak into shared metrics: the
