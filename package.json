@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "scripts": {
     "lint": "oxlint --type-aware",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "build": "npm run build:server && npm run build:web",
