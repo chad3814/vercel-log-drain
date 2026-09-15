@@ -315,6 +315,26 @@ describe('Dispatcher', () => {
     expect(await batchCount()).toBe(before);
   });
 
+  it('ignores a config apply that arrives after shutdown has finished', async () => {
+    // Distinct from the racing test above, and it pins a different guard.
+    // The chain await covers a reconcile queued or in flight AT the moment
+    // stop() runs; this covers one arriving AFTER stop() has returned, which
+    // only the `stopped` flag rejects. Without the flag a post-shutdown
+    // apply -- an admin PUT landing as SIGTERM is handled -- starts workers
+    // on a dispatcher that has already shut down.
+    const batchCount = async (): Promise<number> => {
+      const entries = await readdir(spoolRoot, { recursive: true });
+      return entries.filter((entry) => entry.endsWith('.jsonl')).length;
+    };
+
+    await dispatcher.stop(500);
+    await dispatcher.applyConfig(configWith([fileSink('too-late')]));
+
+    const before = await batchCount();
+    await dispatcher.enqueue([event('a')]);
+    expect(await batchCount()).toBe(before);
+  });
+
   it('reports degraded when a sink health is failed', async () => {
     await dispatcher.applyConfig(configWith([fileSink('ok-sink')]));
     expect(dispatcher.isDegraded()).toBe(false);
