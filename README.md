@@ -42,11 +42,10 @@ cannot be used to reach the admin UI at all**, for two separate reasons:
    docker run --rm caddy:2-alpine caddy hash-password --plaintext '<a password>'
    ```
 
-2. Independent of that: **`AUTH_MODE=proxy`, the mode the example stack uses,
-   does not currently authenticate any request at all.** This is a verified
-   defect, not a configuration problem — see "Known defect" under
-   Authentication. Until it is fixed, the direct `docker run` flow above,
-   with `AUTH_MODE=disabled`, is the only way to reach the admin UI.
+2. `AUTH_MODE=proxy` is the mode to deploy with. The `docker run` line above
+   uses `AUTH_MODE=disabled` only because it has no proxy in front of it;
+   that mode leaves the admin API open to anyone who can reach the port, so
+   use it for a local look and nothing else.
 
 ## Configuring the Vercel side
 
@@ -106,28 +105,29 @@ a guessed default. If a container is crash-looping, `docker logs` will show
 the boot error, and that error names the exact variable and value it
 rejected — that's the first place to look.
 
-### Known defect: `AUTH_MODE=proxy` does not currently authenticate anyone
+### Why the identity header is stripped per-route, not globally
 
-Verified against this build on 2026-09-15, with a real Caddy container
-running `examples/Caddyfile` (after replacing the placeholder password hash)
-in front of the service, `AUTH_TRUSTED_PROXIES` covering Caddy's actual
-address, and `AUTH_USER_HEADER` matching the header Caddy sets: **every**
-request to the admin API, `/api/status`, or the SPA is refused with
-`403 forbidden: AUTH_USER_HEADER was not supplied by the proxy`, regardless
-of how correct the configuration is.
+Worth knowing before changing `buildApp`, because the obvious simplification
+breaks authentication completely.
 
-The cause is in `src/server/app.ts`: `buildApp` mounts a header-stripping
-middleware (`app.use('*', stripIdentityHeader(...))`) ahead of the entire
-route table, including the routes the proxy-auth guard protects. That
-middleware deletes the configured identity header from every request before
-the guard — mounted afterward, on `/api/admin/*` and `/api/status` — ever
-gets a chance to read it. The guard therefore always sees a missing header
-and always denies, even when the reverse proxy set it correctly.
+An inbound copy of `AUTH_USER_HEADER` must never reach a handler, so that a
+client cannot assert its own identity. Two things enforce that: `proxyAuth`
+strips the header itself on every route it guards, and `buildApp` mounts a
+strip on the routes the guard does _not_ cover — `/healthz`, `/readyz` and
+`/api/drain/*`.
 
-This is a reproduced code defect, not a documentation gap or a configuration
-mistake. As things stand, there is no `AUTH_MODE` that both authenticates an
-operator through a reverse proxy **and** leaves ingest working — `disabled`
-is the only mode under which the admin UI is reachable at all.
+Mounting that strip globally with `app.use('*', ...)` looks safer and is
+catastrophic: `proxyAuth` **reads** that header to establish identity, so a
+global strip registered ahead of the route table deletes it first and every
+admin request is refused with `403 forbidden: AUTH_USER_HEADER was not
+supplied by the proxy` — on a header the proxy did set. That was a real
+defect in this codebase, and it survived 355 passing tests because no
+in-process test can reach it: under Hono's `app.request()` there is no
+socket, so the peer resolver returns `undefined` and a request is refused at
+the peer check before the header is ever read. The regression test for it
+uses a real listener for exactly that reason.
+
+If you add a route the guard does not cover, add it to that strip list.
 
 ## Volumes
 
@@ -285,17 +285,18 @@ not history.
 
 ## Troubleshooting
 
-| Symptom                                                                                                                                | Cause                                                                                                                            | Fix                                                                                                                   |
-| -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Vercel reports delivery failures; drain answers `403 invalid_signature`                                                                | The secret configured in Vercel doesn't match the drain's                                                                        | Re-copy the secret from drain creation, or rotate: delete the drain and create a new one                              |
-| Vercel reports delivery failures; drain answers `404`                                                                                  | The drain id in the Vercel destination URL doesn't match any configured drain                                                    | Check the id in the URL against the **Drains** tab                                                                    |
-| Admin UI / `/api/status` answers `503`                                                                                                 | `AUTH_MODE` is unset                                                                                                             | Set `AUTH_MODE=proxy` (with `AUTH_TRUSTED_PROXIES`/`AUTH_USER_HEADER`), or `AUTH_MODE=disabled` for local development |
-| Admin UI answers `403 forbidden: request did not arrive from a trusted proxy`                                                          | The proxy's real peer address isn't covered by `AUTH_TRUSTED_PROXIES`                                                            | Correct or widen the CIDR list; trust is based on the TCP peer, never a header                                        |
-| Admin UI answers `403 forbidden: AUTH_USER_HEADER was not supplied by the proxy`                                                       | The known `AUTH_MODE=proxy` defect above — this happens even when the proxy is configured correctly                              | See "Known defect" under Authentication; there is currently no fix short of `AUTH_MODE=disabled`                      |
-| A Loki sink's health is `failed`, last error mentions `401`/`403`/`404`                                                                | Bad Loki credentials, tenant, or URL                                                                                             | Fix the sink's `auth`/`url`/`tenantId` and save; the worker resumes on its own once the credential is valid           |
-| A Loki sink is dead-lettering batches, last error mentions `400`                                                                       | Batch timestamps are older than Loki's `reject_old_samples_max_age`, typically because the sink was down longer than that window | Raise `reject_old_samples_max_age` on the Loki side, or accept that outages longer than it will dead-letter           |
-| Container exits immediately, message mentions `chown`                                                                                  | A bind-mounted volume isn't owned by uid/gid `10001`                                                                             | `chown -R 10001:10001` the host directory (see Volumes)                                                               |
-| Container exits immediately, message names `AUTH_MODE`, `AUTH_TRUSTED_PROXIES`, `AUTH_USER_HEADER`, `RETRY_BASE_MS`, or `RETRY_MAX_MS` | That variable is malformed                                                                                                       | The boot error names the variable and the rejected value — fix it and restart                                         |
+| Symptom                                                                                                                                | Cause                                                                                                                            | Fix                                                                                                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Vercel reports delivery failures; drain answers `403 invalid_signature`                                                                | The secret configured in Vercel doesn't match the drain's                                                                        | Re-copy the secret from drain creation, or rotate: delete the drain and create a new one                                     |
+| Vercel reports delivery failures; drain answers `404`                                                                                  | The drain id in the Vercel destination URL doesn't match any configured drain                                                    | Check the id in the URL against the **Drains** tab                                                                           |
+| Admin UI / `/api/status` answers `503`                                                                                                 | `AUTH_MODE` is unset                                                                                                             | Set `AUTH_MODE=proxy` (with `AUTH_TRUSTED_PROXIES`/`AUTH_USER_HEADER`), or `AUTH_MODE=disabled` for local development        |
+| Admin UI answers `403 forbidden: request did not arrive from a trusted proxy`                                                          | The proxy's real peer address isn't covered by `AUTH_TRUSTED_PROXIES`                                                            | Correct or widen the CIDR list; trust is based on the TCP peer, never a header                                               |
+| Admin UI answers `403 forbidden: AUTH_USER_HEADER was not supplied by the proxy`                                                       | The proxy is not setting the header named by `AUTH_USER_HEADER`, or is setting a different one                                   | Compare the header your proxy sets against `AUTH_USER_HEADER`; both are case-insensitive but the name must otherwise match   |
+| Admin UI answers `403 forbidden: request did not arrive from a trusted proxy`                                                          | The socket peer is outside `AUTH_TRUSTED_PROXIES`. Trust is decided from the connecting address, never from `X-Forwarded-For`    | Set `AUTH_TRUSTED_PROXIES` to the CIDR the proxy actually connects from — on Docker that is the bridge network, not the host |
+| A Loki sink's health is `failed`, last error mentions `401`/`403`/`404`                                                                | Bad Loki credentials, tenant, or URL                                                                                             | Fix the sink's `auth`/`url`/`tenantId` and save; the worker resumes on its own once the credential is valid                  |
+| A Loki sink is dead-lettering batches, last error mentions `400`                                                                       | Batch timestamps are older than Loki's `reject_old_samples_max_age`, typically because the sink was down longer than that window | Raise `reject_old_samples_max_age` on the Loki side, or accept that outages longer than it will dead-letter                  |
+| Container exits immediately, message mentions `chown`                                                                                  | A bind-mounted volume isn't owned by uid/gid `10001`                                                                             | `chown -R 10001:10001` the host directory (see Volumes)                                                                      |
+| Container exits immediately, message names `AUTH_MODE`, `AUTH_TRUSTED_PROXIES`, `AUTH_USER_HEADER`, `RETRY_BASE_MS`, or `RETRY_MAX_MS` | That variable is malformed                                                                                                       | The boot error names the variable and the rejected value — fix it and restart                                                |
 
 ## Development
 
