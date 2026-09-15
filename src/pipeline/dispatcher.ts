@@ -513,10 +513,7 @@ export class Dispatcher {
         // and must not mutate shared state as a side effect of being
         // polled.
         const message = error instanceof Error ? error.message : String(error);
-        this.options.log.warn(
-          { sink: entry.name, err: message },
-          'sink status snapshot failed',
-        );
+        this.options.log.warn({ sink: entry.name, err: message }, 'sink status snapshot failed');
         statuses.push({
           name: entry.name,
           type: entry.config.type,

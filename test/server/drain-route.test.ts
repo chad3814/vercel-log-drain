@@ -142,7 +142,9 @@ describe('drain route', () => {
 
   it('rejects a bad signature with 403 and spools nothing', async () => {
     const body = JSON.stringify([event('a')]);
-    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': 'f'.repeat(40) });
+    const response = await post('/api/drain/drain1', body, {
+      'x-vercel-signature': 'f'.repeat(40),
+    });
 
     expect(response.status).toBe(403);
     expect((await dispatcher.snapshotSinks())[0]?.queue.files).toBe(0);

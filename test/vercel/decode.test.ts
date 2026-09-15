@@ -31,7 +31,10 @@ describe('decodeBody', () => {
   });
 
   it('ignores blank lines in NDJSON', async () => {
-    const raw = Buffer.from(`${JSON.stringify(eventA)}\n\n   \n${JSON.stringify(eventB)}\n`, 'utf8');
+    const raw = Buffer.from(
+      `${JSON.stringify(eventA)}\n\n   \n${JSON.stringify(eventB)}\n`,
+      'utf8',
+    );
     const result = await decodeBody(raw, options);
     expect(result.events).toHaveLength(2);
     expect(result.rejected).toEqual([]);

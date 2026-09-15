@@ -157,9 +157,7 @@ describe('Dispatcher', () => {
     let statuses = await dispatcher.snapshotSinks();
     expect(statuses.find((s) => s.name === 'reconfigured')?.queue.files).toBe(1);
 
-    await dispatcher.applyConfig(
-      configWith([fileSink('reconfigured', { maxBatchEvents: 42 })]),
-    );
+    await dispatcher.applyConfig(configWith([fileSink('reconfigured', { maxBatchEvents: 42 })]));
 
     statuses = await dispatcher.snapshotSinks();
     expect(statuses.find((s) => s.name === 'reconfigured')?.queue.files).toBe(1);

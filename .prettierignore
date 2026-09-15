@@ -1,0 +1,9 @@
+# Generated and scratch artifacts.
+node_modules/
+dist/
+.superpowers/
+
+# Design docs and the implementation plan. Prettier reformats fenced code
+# blocks inside markdown, which would rewrite the plan's TypeScript samples
+# and produce enormous diffs on a document that is reviewed by humans.
+docs/

@@ -96,8 +96,14 @@ describe('ConfigStore', () => {
     const initial = await store.load();
 
     const results = await Promise.allSettled([
-      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 1111 } }, initial.etag),
-      store.save({ ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2222 } }, initial.etag),
+      store.save(
+        { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 1111 } },
+        initial.etag,
+      ),
+      store.save(
+        { ...initial.config, server: { ...initial.config.server, maxBodyBytes: 2222 } },
+        initial.etag,
+      ),
     ]);
 
     // Exactly one wins; the loser gets a meaningful conflict, never a raw

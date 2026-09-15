@@ -137,9 +137,13 @@ describe('loki sink delivery', () => {
   it('sends a bearer token', async () => {
     const captured: Captured[] = [];
     const url = await startServer(204, '', captured);
-    const sink = lokiSinkType.create('loki', config(url, { auth: { kind: 'bearer', token: 'tk' } }), {
-      log: silentLog,
-    });
+    const sink = lokiSinkType.create(
+      'loki',
+      config(url, { auth: { kind: 'bearer', token: 'tk' } }),
+      {
+        log: silentLog,
+      },
+    );
     await sink.deliver([event]);
     expect(captured[0]?.headers['authorization']).toBe('Bearer tk');
   });

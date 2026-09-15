@@ -61,14 +61,24 @@ const incomingSchema = z.object({
       createdAt: z.number(),
     }),
   ),
-  sinks: z.array(z.record(z.string(), z.custom<JsonValue>(() => true))),
-  server: z.record(z.string(), z.custom<JsonValue>(() => true)),
+  sinks: z.array(
+    z.record(
+      z.string(),
+      z.custom<JsonValue>(() => true),
+    ),
+  ),
+  server: z.record(
+    z.string(),
+    z.custom<JsonValue>(() => true),
+  ),
 });
 
 export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConfig {
   const parsed = incomingSchema.safeParse(incoming);
   if (!parsed.success) {
-    throw new SecretRestoreError(`malformed configuration payload:\n${z.prettifyError(parsed.error)}`);
+    throw new SecretRestoreError(
+      `malformed configuration payload:\n${z.prettifyError(parsed.error)}`,
+    );
   }
 
   const drainsById = new Map(current.drains.map((drain) => [drain.id, drain]));
@@ -95,9 +105,7 @@ export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConf
   const candidate = { version: 1 as const, drains, sinks, server: parsed.data.server };
   const validated = appConfigSchema.safeParse(candidate);
   if (!validated.success) {
-    throw new SecretRestoreError(
-      `configuration is invalid:\n${z.prettifyError(validated.error)}`,
-    );
+    throw new SecretRestoreError(`configuration is invalid:\n${z.prettifyError(validated.error)}`);
   }
   return validated.data;
 }

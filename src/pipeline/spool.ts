@@ -233,7 +233,8 @@ export class SpoolQueue {
       }
       const parsed = parseLines(text);
 
-      const wouldExceed = events.length + parsed.length > maxEvents || bytes + entry.bytes > maxBytes;
+      const wouldExceed =
+        events.length + parsed.length > maxEvents || bytes + entry.bytes > maxBytes;
       if (files.length > 0 && wouldExceed) break;
 
       files.push(entry.name);

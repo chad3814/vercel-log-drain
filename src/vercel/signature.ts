@@ -1,10 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-export function verifySignature(
-  raw: Buffer,
-  header: string | undefined,
-  secret: string,
-): boolean {
+export function verifySignature(raw: Buffer, header: string | undefined, secret: string): boolean {
   if (header === undefined || header.length === 0) return false;
   const expected = createHmac('sha1', secret).update(raw).digest('hex');
   const headerBuffer = Buffer.from(header, 'utf8');

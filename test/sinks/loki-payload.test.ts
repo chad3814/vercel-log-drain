@@ -144,9 +144,7 @@ describe('buildPushPayload', () => {
 
   it('serializes the complete event as the log line, including label fields', () => {
     const payload = buildPushPayload([event()], labels);
-    const line: Record<string, unknown> = JSON.parse(
-      payload.streams[0]?.values[0]?.[1] ?? '{}',
-    );
+    const line: Record<string, unknown> = JSON.parse(payload.streams[0]?.values[0]?.[1] ?? '{}');
     expect(line).toMatchObject({ id: 'e1', projectName: 'my-app', message: 'hello' });
   });
 
@@ -157,12 +155,10 @@ describe('buildPushPayload', () => {
       ids.map((id) => event({ id, timestamp: 5000 })),
       labels,
     );
-    const order = (payload.streams[0]?.values ?? []).map(
-      ([, line]) => {
-        const entry: { id: string } = JSON.parse(line);
-        return entry.id;
-      },
-    );
+    const order = (payload.streams[0]?.values ?? []).map(([, line]) => {
+      const entry: { id: string } = JSON.parse(line);
+      return entry.id;
+    });
     expect(order).toEqual(ids);
   });
 

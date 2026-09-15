@@ -218,7 +218,9 @@ describe('SpoolQueue', () => {
   it('skips unparseable lines rather than looping forever', async () => {
     const queue = await SpoolQueue.open(dir, options());
     await queue.enqueue([event('a')]);
-    const [name] = await readdir(dir).then((entries) => entries.filter((e) => e.endsWith('.jsonl')));
+    const [name] = await readdir(dir).then((entries) =>
+      entries.filter((e) => e.endsWith('.jsonl')),
+    );
     await writeFile(join(dir, name ?? ''), 'this is not json\n');
 
     const batch = await queue.nextBatch(1000, BIG);

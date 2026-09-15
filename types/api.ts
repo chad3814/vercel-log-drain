@@ -1,4 +1,4 @@
-export type DrainOutcome = 'ok' | 'badSignature' | 'disabled' | 'malformedBody';  // notFound is aggregated, not per-drain
+export type DrainOutcome = 'ok' | 'badSignature' | 'disabled' | 'malformedBody'; // notFound is aggregated, not per-drain
 
 export type SinkHealthState = 'ok' | 'retrying' | 'failed';
 

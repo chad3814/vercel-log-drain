@@ -153,7 +153,10 @@ export function stripIdentityHeader(headerName: string): MiddlewareHandler<AppEn
   };
 }
 
-export function proxyAuth(config: AuthConfig, resolvePeer: PeerResolver): MiddlewareHandler<AppEnv> {
+export function proxyAuth(
+  config: AuthConfig,
+  resolvePeer: PeerResolver,
+): MiddlewareHandler<AppEnv> {
   // Narrow by early return rather than carrying a `blockList === null` check
   // into the request path: a null check standing in for "this cannot happen"
   // is a branch nobody can reason about and no test can reach.

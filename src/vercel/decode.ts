@@ -55,7 +55,9 @@ function validateEntry(candidate: unknown, index: number, into: DecodeResult): v
   }
   into.rejected.push({
     index,
-    reason: parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; '),
+    reason: parsed.error.issues
+      .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
+      .join('; '),
     snippet: snippet(JSON.stringify(candidate)),
   });
 }
@@ -124,7 +126,11 @@ export async function decodeBody(raw: Buffer, options: DecodeOptions): Promise<D
       return result;
     }
     if (!Array.isArray(entries)) {
-      result.rejected.push({ index: WHOLE_BODY_INDEX, reason: 'body is not an array', snippet: snippet(text) });
+      result.rejected.push({
+        index: WHOLE_BODY_INDEX,
+        reason: 'body is not an array',
+        snippet: snippet(text),
+      });
       return result;
     }
     entries.forEach((entry, index) => {

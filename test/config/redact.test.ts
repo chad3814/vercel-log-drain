@@ -6,9 +6,7 @@ import type { AppConfig } from '../../src/config/schema.js';
 function configWithSecrets(): AppConfig {
   return {
     ...defaultAppConfig(),
-    drains: [
-      { id: 'drain001', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 },
-    ],
+    drains: [{ id: 'drain001', name: 'prod', secret: 'x'.repeat(32), enabled: true, createdAt: 1 }],
     sinks: [
       {
         name: 'loki',

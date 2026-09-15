@@ -13,7 +13,10 @@ import type { AppEnv } from '../../src/server/types.js';
 
 function appWith(config: AuthConfig, peer: string | undefined) {
   const app = new Hono<AppEnv>();
-  app.use('/admin/*', proxyAuth(config, () => peer));
+  app.use(
+    '/admin/*',
+    proxyAuth(config, () => peer),
+  );
   app.get('/admin/thing', (c) => c.json({ user: c.get('user') }));
   app.get('/open', (c) => c.text('public'));
   return app;
@@ -121,7 +124,11 @@ describe('parseAuthConfig', () => {
 
   it('throws on an empty AUTH_TRUSTED_PROXIES rather than trusting nothing silently', () => {
     expect(() =>
-      parseAuthConfig({ AUTH_MODE: 'proxy', AUTH_TRUSTED_PROXIES: '   ,  ', AUTH_USER_HEADER: 'x-user' }),
+      parseAuthConfig({
+        AUTH_MODE: 'proxy',
+        AUTH_TRUSTED_PROXIES: '   ,  ',
+        AUTH_USER_HEADER: 'x-user',
+      }),
     ).toThrow(/AUTH_TRUSTED_PROXIES/);
   });
 
@@ -245,7 +252,10 @@ describe('proxyAuth', () => {
 
   it('sets user to null in disabled mode', async () => {
     const app = new Hono<AppEnv>();
-    app.use('*', proxyAuth({ mode: 'disabled' }, () => undefined));
+    app.use(
+      '*',
+      proxyAuth({ mode: 'disabled' }, () => undefined),
+    );
     app.get('/thing', (c) => c.json({ user: c.get('user') }));
     const response = await app.request('/thing');
     expect(await response.text()).toBe('{"user":null}');
@@ -300,7 +310,10 @@ describe('proxyAuth', () => {
 
   it('strips any inbound copy of the user header so only c.get("user") can carry identity', async () => {
     const app = new Hono<AppEnv>();
-    app.use('/admin/*', proxyAuth(proxyMode, () => '10.2.3.4'));
+    app.use(
+      '/admin/*',
+      proxyAuth(proxyMode, () => '10.2.3.4'),
+    );
     app.get('/admin/thing', (c) =>
       c.json({ user: c.get('user'), rawHeader: c.req.header('x-forwarded-user') ?? null }),
     );

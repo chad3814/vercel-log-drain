@@ -94,9 +94,9 @@ describe('sinkEntrySchema', () => {
   });
 
   it('rejects an unknown minLevel', () => {
-    expect(
-      sinkEntrySchema.safeParse({ ...validSink, filter: { minLevel: 'trace' } }).success,
-    ).toBe(false);
+    expect(sinkEntrySchema.safeParse({ ...validSink, filter: { minLevel: 'trace' } }).success).toBe(
+      false,
+    );
   });
 });
 
