@@ -40,6 +40,26 @@ async function assertWritable(label: string, dir: string): Promise<void> {
 }
 
 /**
+ * Reads a positive-integer env var, or throws. Deliberately not tolerant: a
+ * typo silently falling back to the default is how a deployment ends up
+ * retrying on a cadence nobody chose, and boot already fails loudly for every
+ * other malformed variable.
+ */
+function positiveIntEnv(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const raw = env[name]?.trim();
+  if (raw === undefined || raw.length === 0) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isInteger(value) || value <= 0 || String(value) !== raw) {
+    throw new Error(`${name} must be a positive integer, received "${raw}"`);
+  }
+  return value;
+}
+
+/**
  * Boots the service without starting a listener, so tests can drive
  * `booted.app.request(...)` directly. `parseAuthConfig` runs before any
  * directory is touched: a bad `AUTH_MODE` or an invalid
@@ -87,7 +107,14 @@ export async function boot(options: BootOptions): Promise<Booted> {
   let config: AppConfig = loaded.config;
   let etag = loaded.etag;
 
-  const dispatcher = new Dispatcher({ spoolRoot: spoolDir, logsRoot, metrics, log });
+  const dispatcher = new Dispatcher({
+    spoolRoot: spoolDir,
+    logsRoot,
+    metrics,
+    log,
+    baseBackoffMs: positiveIntEnv(env, 'RETRY_BASE_MS', 1000),
+    maxBackoffMs: positiveIntEnv(env, 'RETRY_MAX_MS', 60_000),
+  });
   await dispatcher.applyConfig(config);
   dispatcher.start();
 

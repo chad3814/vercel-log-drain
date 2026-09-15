@@ -112,11 +112,27 @@ describe('end-to-end durability', () => {
     await new Promise<void>((resolve) => instance.listen(port, '127.0.0.1', resolve));
   }
 
+  /** A Loki that rejects every push with 401, as a wrong password would. */
+  async function startUnauthorizedLoki(port: number): Promise<void> {
+    const instance = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(401);
+        res.end('unauthorized');
+      });
+    });
+    lokiServer = instance;
+    await new Promise<void>((resolve) => instance.listen(port, '127.0.0.1', resolve));
+  }
+
   async function writeConfig(lokiPort: number): Promise<void> {
     const base = defaultAppConfig();
     await new ConfigStore(configDir).save(
       {
         ...base,
+        // `id` must satisfy drainEntrySchema's min(8); 'e2e' threw before
+        // boot() ever ran, and this is the first test to save config
+        // through the real ConfigStore, so nothing caught it earlier.
         drains: [{ id: 'e2e-drain', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 }],
         sinks: [
           {
@@ -164,6 +180,12 @@ describe('end-to-end durability', () => {
         LOGS_ROOT: logsRoot,
         LOG_LEVEL: 'silent',
         AUTH_MODE: 'disabled',
+        // Production defaults make five jittered backoffs take ~18s, which
+        // was 18s of a 19s suite -- the surest way to get a durability test
+        // skipped. The cadence is not what these tests assert; what they
+        // assert is that nothing is lost while it retries.
+        RETRY_BASE_MS: '5',
+        RETRY_MAX_MS: '20',
       },
       webRoot: null,
     });
@@ -233,6 +255,56 @@ describe('end-to-end durability', () => {
     }
   }, 30_000);
 
+  it('never dead-letters an auth failure, across a restart', async () => {
+    // The scenario this whole classification exists for: an operator fat-
+    // fingers a Loki password. 401/403/404 are RETRYABLE, never permanent,
+    // because dead-lettering them would destroy logs that a credential fix
+    // would have delivered. Health still escalates so the operator is told.
+    //
+    // Driven end to end rather than at the worker level, and across a
+    // restart, because that is the shape that hid a real data-destroying bug
+    // earlier in this project: nine single-lifetime durability tests passed
+    // while a dead-letter overwrite went unnoticed.
+    const port = 45_411;
+    await startUnauthorizedLoki(port);
+    await writeConfig(port);
+
+    let booted = await bootService();
+    try {
+      expect((await post(booted, [event('auth-1')])).status).toBe(200);
+
+      // Precondition, asserted rather than assumed: the batch really is on
+      // disk before anything claims it survived.
+      const spool = join(spoolDir, 'loki');
+      await waitFor(async () => (await readdir(spool)).some((f) => f.endsWith('.jsonl')));
+      const beforeNames = (await readdir(spool)).filter((f) => f.endsWith('.jsonl'));
+      expect(beforeNames).toHaveLength(1);
+      const beforeBody = await readFile(join(spool, beforeNames[0]!), 'utf8');
+      expect(beforeBody).toContain('auth-1');
+
+      // Let it retry enough times to escalate. Retryable, so the batch stays.
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
+      expect(await readdir(join(spool, 'dead')).catch(() => [])).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+
+    // Restart with the same volumes. The batch must still be there, byte for
+    // byte, and still not dead-lettered.
+    booted = await bootService();
+    try {
+      const spool = join(spoolDir, 'loki');
+      const afterNames = (await readdir(spool)).filter((f) => f.endsWith('.jsonl'));
+      expect(afterNames).toHaveLength(1);
+      expect(await readFile(join(spool, afterNames[0]!), 'utf8')).toContain('auth-1');
+
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
+      expect(await readdir(join(spool, 'dead')).catch(() => [])).toEqual([]);
+    } finally {
+      await booted.shutdown();
+    }
+  });
+
   it('keeps accepting deliveries while a sink is wedged, and reports degraded', async () => {
     const lokiPort = 45_232;
     await writeConfig(lokiPort);
@@ -241,14 +313,7 @@ describe('end-to-end durability', () => {
     try {
       expect((await post(booted, [event('b1')])).status).toBe(200);
 
-      // The dispatcher only reports "failed" (not merely "retrying") after
-      // FAILURE_THRESHOLD (5) consecutive failures, and the worker's default
-      // exponential backoff between attempts is base=1000ms doubling each
-      // time (1s, 2s, 4s, 8s, uncapped by maxBackoffMs=60s at this scale),
-      // so reaching the 5th attempt can take ~15-20s of real wall-clock time
-      // even with jitter working in our favor. The default waitFor() timeout
-      // of 8s is not enough to observe this transition; see task-24-report.md.
-      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()), 25_000);
+      await waitFor(() => Promise.resolve(booted.dispatcher.isDegraded()));
 
       const status = await booted.app.request('/api/status');
       const snapshot = await jsonBody<{
@@ -265,5 +330,5 @@ describe('end-to-end durability', () => {
     } finally {
       await booted.shutdown();
     }
-  }, 35_000);
+  }, 30_000);
 });

@@ -270,6 +270,18 @@ export type DispatcherOptions = {
   metrics: Metrics;
   log: Logger;
   freeSpace?: FreeSpaceProbe;
+  /**
+   * Retry cadence for every worker this dispatcher starts. Operational, not
+   * merely a test seam: how hard to retry a sink that has been down for
+   * hours is a deployment decision, and the defaults (1s doubling to 60s)
+   * suit a brief outage rather than a long one. Threading them through also
+   * lets the end-to-end durability test reach a `failed` sink in
+   * milliseconds instead of the ~18s five jittered backoffs take at the
+   * production defaults -- that one test otherwise accounted for 18s of a
+   * 19s suite, which is how a durability test ends up skipped.
+   */
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
 };
 
 type ActiveSink = {
@@ -390,6 +402,9 @@ export class Dispatcher {
       ...(this.options.freeSpace === undefined ? {} : { freeSpace: this.options.freeSpace }),
     });
 
+    // Conditional spread, not `baseBackoffMs: this.options.baseBackoffMs`:
+    // `exactOptionalPropertyTypes` is on, so an explicit `undefined` is not
+    // assignable to an optional property.
     const worker = new SinkWorker({
       sink,
       queue,
@@ -397,6 +412,12 @@ export class Dispatcher {
       log: this.options.log,
       maxBatchEvents: entry.maxBatchEvents,
       maxBatchBytes: entry.maxBatchBytes,
+      ...(this.options.baseBackoffMs === undefined
+        ? {}
+        : { baseBackoffMs: this.options.baseBackoffMs }),
+      ...(this.options.maxBackoffMs === undefined
+        ? {}
+        : { maxBackoffMs: this.options.maxBackoffMs }),
     });
 
     this.active.set(entry.name, {
