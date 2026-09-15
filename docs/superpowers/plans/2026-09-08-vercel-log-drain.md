@@ -2527,18 +2527,11 @@ export const DEFAULT_LABEL_CONFIG: LokiLabelConfig = {
   fromFields: ['projectName', 'environment', 'source', 'level'],
 };
 
-export const HIGH_CARDINALITY_FIELDS: readonly string[] = [
-  'id',
-  'requestId',
-  'deploymentId',
-  'path',
-  'host',
-  'traceId',
-  'spanId',
-  'buildId',
-  'trace.id',
-  'span.id',
-];
+// Imported AND re-exported: `labelWarnings` below uses it in this module,
+// which a bare `export ... from` would not bind locally, and existing
+// callers import it from here.
+import { HIGH_CARDINALITY_FIELDS } from '../../types/api.js';
+export { HIGH_CARDINALITY_FIELDS };
 
 export function sanitizeLabelName(name: string): string {
   const replaced = name.replace(/[^a-zA-Z0-9_]/g, '_');
@@ -4680,6 +4673,30 @@ export type DrainStatus = {
   lastEventAt: number | null;
   requests: DrainRequestCounters;
 };
+
+/**
+ * Label fields whose values are effectively unbounded, so promoting one to a
+ * Loki label creates a stream per distinct value. The server warns on these
+ * when validating a config and the Sinks view previews the same warning
+ * before saving, so both must read THIS list -- a hand-copied second copy in
+ * the view had already drifted three entries out of date.
+ *
+ * A value rather than a type in an otherwise type-only module: the rule here
+ * is zero IMPORTS, so that the browser bundle never pulls in server code, and
+ * a bare string array does not violate it.
+ */
+export const HIGH_CARDINALITY_FIELDS: readonly string[] = [
+  'id',
+  'requestId',
+  'deploymentId',
+  'path',
+  'host',
+  'traceId',
+  'spanId',
+  'buildId',
+  'trace.id',
+  'span.id',
+];
 
 export type SinkCounters = { delivered: number; dropped: number; deadLettered: number };
 
@@ -10347,10 +10364,19 @@ stay assignable from the zod-inferred server types."
 - Create: `web/src/views/Drains.tsx`, `web/src/views/Sinks.tsx`
 - Create: `web/src/useConfig.ts`
 - Modify: `web/src/App.tsx` (add the Drains and Sinks tabs)
+- Modify: `types/api.ts` (move `HIGH_CARDINALITY_FIELDS` here as the single source of truth) and `src/sinks/loki-payload.ts` (re-export it from there)
+
+The Sinks view previews the same high-cardinality warning the server returns
+on save, so both must read ONE list. They did not: the view carried a
+hand-copied subset missing `buildId`, `trace.id` and `span.id`, so adding
+`buildId` to `fromFields` produced no preview and then a server warning after
+saving. `types/api.ts` is the only module both sides may import, and the rule
+on it is zero *imports* rather than types-only, so the constant lives there
+and `src/sinks/loki-payload.ts` re-exports it for its existing callers.
 
 **Interfaces:**
 - Consumes: `fetchConfig`, `saveConfig`, `createDrain`, `testSink`, `ApiError` from `web/src/api.ts`; the DTOs from `@shared/api`.
-- Produces: `useConfig()` hook returning `{ config, etag, warnings, error, notice, reload, save, mutate }`.
+- Produces: `useConfig()` hook returning `{ config, etag, warnings, error, notice, reload, save }`, where `save` resolves to `boolean` — `false` on a 409 or 400, so a caller can keep the operator's draft rather than clearing it.
 
 - [ ] **Step 1: Add the two tabs to `web/src/App.tsx`**
 
@@ -10591,11 +10617,10 @@ export function Drains(): React.JSX.Element {
 import { useState } from 'react';
 import { testSink } from '../api.ts';
 import { useConfig } from '../useConfig.ts';
+import { HIGH_CARDINALITY_FIELDS } from '@shared/api';
 import type { RedactedConfigDto, SinkEntryDto } from '@shared/api';
 
 const MIB = 1_048_576;
-
-const HIGH_CARDINALITY = ['id', 'requestId', 'deploymentId', 'path', 'host', 'traceId', 'spanId'];
 
 function newFileSink(index: number): SinkEntryDto {
   return {
@@ -10931,7 +10956,7 @@ export function Sinks(): React.JSX.Element {
                   }
                 />
               </label>
-              {sink.config.labels.fromFields.some((field) => HIGH_CARDINALITY.includes(field)) ? (
+              {sink.config.labels.fromFields.some((field) => HIGH_CARDINALITY_FIELDS.includes(field)) ? (
                 <p className="warn">
                   One or more of these fields is high-cardinality. Every distinct value creates a new
                   Loki stream; prefer filtering them from the log line with <code>| json</code>.
