@@ -100,6 +100,43 @@ describe('classifyLokiStatus', () => {
   });
 });
 
+describe('LokiSink construction', () => {
+  it('refuses to start with no usable labels, saying what is wrong and how to fix it', () => {
+    // The safety net for a config already on disk in this shape: the schema
+    // ConfigStore.load() parses stays tolerant of it (issue #9's migration
+    // hazard), so this constructor throw is what isolates the sink instead
+    // -- reconcileNow catches it, marks this sink `failed`, and every other
+    // sink keeps running.
+    expect(() =>
+      lokiSinkType.create(
+        'loki-empty-labels',
+        config('http://127.0.0.1:1', { labels: { static: {}, fromFields: [] } }),
+        { log: silentLog },
+      ),
+    ).toThrow(/no usable labels/);
+  });
+
+  it('refuses to start when the only static value is blank', () => {
+    expect(() =>
+      lokiSinkType.create(
+        'loki-blank-static',
+        config('http://127.0.0.1:1', { labels: { static: { job: '' }, fromFields: [] } }),
+        { log: silentLog },
+      ),
+    ).toThrow(/no usable labels/);
+  });
+
+  it('starts fine with only a static label', () => {
+    expect(() =>
+      lokiSinkType.create(
+        'loki-static-only',
+        config('http://127.0.0.1:1', { labels: { static: { job: 'vercel' }, fromFields: [] } }),
+        { log: silentLog },
+      ),
+    ).not.toThrow();
+  });
+});
+
 describe('loki sink delivery', () => {
   it('posts a gzipped push payload to the push path', async () => {
     const captured: Captured[] = [];

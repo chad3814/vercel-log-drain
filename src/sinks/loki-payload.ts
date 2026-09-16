@@ -89,6 +89,28 @@ export function buildPushPayload(events: LogEvent[], config: LokiLabelConfig): L
   return { streams };
 }
 
+/**
+ * True when this label config can never produce a non-empty label set: no
+ * `static` entry carries a non-empty value (resolveLabels above skips
+ * empty-string values) and no `fromFields` entry is a non-empty field name.
+ * A sink stuck in this state resolves every event to `stream: {}`, and Loki
+ * answers a labelless stream with a permanent 400 that dead-letters the
+ * whole batch (issue #9).
+ *
+ * Single source of truth for that condition, shared by two call sites that
+ * must never drift apart: the admin-write schema check
+ * (`appConfigWriteSchema` in src/config/schema.ts, which refuses to SAVE
+ * this shape) and `LokiSink`'s constructor (src/sinks/loki.ts, which
+ * refuses to START with it -- the safety net for a config already on disk
+ * in this shape, which the schema that `ConfigStore.load()` parses
+ * deliberately still accepts).
+ */
+export function hasNoUsableLabels(config: LokiLabelConfig): boolean {
+  const hasStatic = Object.values(config.static).some((value) => value.length > 0);
+  const hasFromFields = config.fromFields.some((field) => field.length > 0);
+  return !hasStatic && !hasFromFields;
+}
+
 export function labelWarnings(config: LokiLabelConfig): string[] {
   const risky = config.fromFields.filter((field) => HIGH_CARDINALITY_FIELDS.includes(field));
   if (risky.length === 0) return [];

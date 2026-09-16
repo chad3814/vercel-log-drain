@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildPushPayload,
+  hasNoUsableLabels,
   labelWarnings,
   normalizePushUrl,
   resolveLabels,
@@ -176,6 +177,30 @@ describe('labelWarnings', () => {
 
   it('returns nothing for a safe label set', () => {
     expect(labelWarnings(labels)).toEqual([]);
+  });
+});
+
+describe('hasNoUsableLabels', () => {
+  it('is true for no static entries and no fromFields', () => {
+    expect(hasNoUsableLabels({ static: {}, fromFields: [] })).toBe(true);
+  });
+
+  it('is true when the only static value is blank', () => {
+    // resolveLabels skips empty-string values, so a key with a blank value
+    // is structurally "an entry" but resolves to no label at all.
+    expect(hasNoUsableLabels({ static: { job: '' }, fromFields: [] })).toBe(true);
+  });
+
+  it('is true when the only fromFields entry is a blank field name', () => {
+    expect(hasNoUsableLabels({ static: {}, fromFields: [''] })).toBe(true);
+  });
+
+  it('is false with one non-empty static value', () => {
+    expect(hasNoUsableLabels({ static: { job: 'vercel' }, fromFields: [] })).toBe(false);
+  });
+
+  it('is false with one non-empty fromFields entry', () => {
+    expect(hasNoUsableLabels({ static: {}, fromFields: ['environment'] })).toBe(false);
   });
 });
 

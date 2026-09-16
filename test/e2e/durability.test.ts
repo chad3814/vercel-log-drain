@@ -208,6 +208,57 @@ describe('end-to-end durability', () => {
     );
   }
 
+  /**
+   * A file sink alongside a loki sink whose labels are structurally empty
+   * (`static: {}, fromFields: []`) -- issue #9's dead-lettering shape.
+   * Saved directly through `ConfigStore`, bypassing the admin route's
+   * strict `appConfigWriteSchema`, exactly the way a hand-edited
+   * config.json would arrive on disk.
+   */
+  async function writeConfigWithEmptyLokiLabels(): Promise<void> {
+    const base = defaultAppConfig();
+    await new ConfigStore(configDir).save(
+      {
+        ...base,
+        drains: [{ id: 'e2e-drain', name: 'e2e', secret: SECRET, enabled: true, createdAt: 1 }],
+        sinks: [
+          {
+            name: 'local',
+            enabled: true,
+            filter: {},
+            maxSpoolBytes: 1_048_576,
+            maxBatchEvents: 1000,
+            maxBatchBytes: 1_048_576,
+            config: {
+              type: 'file',
+              directory: join(logsRoot, 'local'),
+              filePrefix: 'events',
+              retentionDays: 0,
+              freeSpaceFloorBytes: 0,
+            },
+          },
+          {
+            name: 'loki-empty-labels',
+            enabled: true,
+            filter: {},
+            maxSpoolBytes: 1_048_576,
+            maxBatchEvents: 1000,
+            maxBatchBytes: 1_048_576,
+            config: {
+              type: 'loki',
+              url: 'http://127.0.0.1:1',
+              auth: { kind: 'none' },
+              tenantId: null,
+              labels: { static: {}, fromFields: [] },
+              timeoutMs: 1000,
+            },
+          },
+        ],
+      },
+      null,
+    );
+  }
+
   function bootService(): Promise<Booted> {
     return boot({
       env: {
@@ -434,4 +485,42 @@ describe('end-to-end durability', () => {
       await booted.shutdown();
     }
   }, 30_000);
+
+  it('boots with a pre-existing empty-label loki sink failed, and every other sink and drain running', async () => {
+    // The regression this test exists to pin (issue #9's migration hazard):
+    // tightening the loki-labels check at the level ConfigStore.load()
+    // parses would make a config.json ALREADY on disk in this shape
+    // crash-loop the whole container on restart, taking the working file
+    // sink and every drain down with it -- with no way back in through the
+    // (now-unreachable) admin UI to fix it. That check lives only at the
+    // admin-write boundary (appConfigWriteSchema, via restoreSecrets);
+    // load() stays tolerant, and LokiSink's constructor refuses to start
+    // instead, so reconcileNow isolates just this one sink.
+    await writeConfigWithEmptyLokiLabels();
+
+    // load() did not throw -- boot() got this far at all.
+    const booted = await bootService();
+    try {
+      // Ingest, and the healthy file sink, both keep working.
+      expect((await post(booted, [event('c1')])).status).toBe(200);
+      await waitFor(async () => {
+        const files = await readdir(join(logsRoot, 'local')).catch(() => []);
+        return files.length > 0;
+      });
+
+      const snapshot = await jsonBody<{
+        service: { state: string };
+        sinks: { name: string; health: { state: string; lastError: string | null } }[];
+      }>(await booted.app.request('/api/status'));
+
+      expect(snapshot.service.state).toBe('degraded');
+      const local = snapshot.sinks.find((sink) => sink.name === 'local');
+      expect(local?.health.state).toBe('ok');
+      const loki = snapshot.sinks.find((sink) => sink.name === 'loki-empty-labels');
+      expect(loki?.health.state).toBe('failed');
+      expect(loki?.health.lastError).toMatch(/label/i);
+    } finally {
+      await booted.shutdown();
+    }
+  });
 });

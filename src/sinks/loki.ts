@@ -1,7 +1,12 @@
 import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { z } from 'zod';
-import { buildPushPayload, labelWarnings, normalizePushUrl } from './loki-payload.js';
+import {
+  buildPushPayload,
+  hasNoUsableLabels,
+  labelWarnings,
+  normalizePushUrl,
+} from './loki-payload.js';
 import {
   AuthDeliveryError,
   ConfigDeliveryError,
@@ -31,15 +36,17 @@ export const lokiSinkConfigSchema = z.object({
   url: z.url(),
   auth: lokiAuthSchema,
   tenantId: z.string().min(1).nullable(),
-  // Values/entries are required to be non-empty so that "has a key" and "has
-  // a usable label" mean the same thing: `static: { job: '' }` would
-  // otherwise satisfy "at least one static entry" (the check lives on
-  // sinkEntrySchema in src/config/schema.ts, which is the level that knows
-  // the sink's name) while still resolving to no label at all, because
-  // resolveLabels in loki-payload.ts skips empty-string values.
+  // Purely structural: any record and any array of strings, including empty
+  // ones, are valid here. Whether the *content* adds up to a usable label
+  // is a semantic question (see hasNoUsableLabels in loki-payload.ts), and
+  // deliberately is not enforced by this schema, because ConfigStore.load()
+  // parses every sink through it and must stay tolerant of a config.json
+  // already on disk with no usable labels -- see the constructor below and
+  // appConfigWriteSchema in src/config/schema.ts for where that content
+  // check actually lives.
   labels: z.object({
-    static: z.record(z.string(), z.string().min(1)),
-    fromFields: z.array(z.string().min(1)),
+    static: z.record(z.string(), z.string()),
+    fromFields: z.array(z.string()),
   }),
   timeoutMs: z.number().int().min(100).max(120_000),
 });
@@ -87,6 +94,23 @@ class LokiSink implements Sink {
     private readonly config: LokiSinkConfig,
     private readonly ctx: SinkContext,
   ) {
+    // The safety net for a config already on disk with no usable labels:
+    // lokiSinkConfigSchema (deliberately) lets it load, so this is the
+    // first point that can still refuse it. Thrown from the constructor,
+    // this surfaces through createSink() -> startSink() -> reconcileNow(),
+    // which already isolates a sink that cannot start -- it reports
+    // `failed`, logs, and records the error, while every other sink and
+    // drain keeps running. That isolation is what stands between this
+    // throw and a repeat of the crash-loop `/readyz` used to cause.
+    if (hasNoUsableLabels(config.labels)) {
+      throw new Error(
+        'loki sink has no usable labels: static has no non-empty values and fromFields has no ' +
+          'entries, so every event would resolve to stream {} and Loki rejects a labelless ' +
+          'stream with a permanent 400 that dead-letters the whole batch. Add a static label ' +
+          '(e.g. { job: "vercel" }) or a fromFields entry (e.g. "environment") and save the ' +
+          'sink again.',
+      );
+    }
     this.pushUrl = normalizePushUrl(config.url);
   }
 
