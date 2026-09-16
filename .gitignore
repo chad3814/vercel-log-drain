@@ -9,3 +9,8 @@ coverage/
 .playwright-state/
 test-results/
 playwright-report/
+
+# Local run state, created by the Development instructions in the README.
+# Ignored rather than merely untracked because .local/config/config.json
+# holds drain secrets, so a `git add -A` here would commit a credential.
+.local/
