@@ -337,7 +337,15 @@ export function Sinks(): React.JSX.Element {
       {testResult !== null ? <p className="muted">{testResult}</p> : null}
 
       {working.sinks.map((sink, index) => (
-        <div className="card" key={`${sink.name}-${String(index)}`}>
+        // Keyed by position, NOT by name. `name` is edited in the input
+        // below, so including it here changed the key on every keystroke,
+        // which made React unmount the whole card and mount a fresh one --
+        // the focused input went with it, so typing a name lost focus after
+        // every single character. Position is safe because nothing in this
+        // card holds local state: every field is controlled from
+        // `working.sinks[index]`, so React has no per-card state to
+        // mis-associate when a sink is added or removed.
+        <div className="card" key={index}>
           <div className="row">
             <label>
               Name
