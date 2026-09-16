@@ -139,7 +139,19 @@ export async function pruneRetention(
   // The prefix is operator-supplied and the schema permits '.', a regex
   // metacharacter. Unescaped, a prefix of `events.log` would also match
   // `eventsXlog-2020-01-01.jsonl` and delete an unrelated file.
-  const pattern = new RegExp(`^${escapeForRegExp(prefix)}-(\\d{4}-\\d{2}-\\d{2})\\.jsonl$`);
+  //
+  // Two shapes are matched: the ordinary `YYYY-MM-DD` key, and the
+  // expanded-year key `utcDateKey` produces once a timestamp's year no
+  // longer fits in four digits (`toISOString` then switches to `+YYYYYY-MM`,
+  // per ISO 8601's expanded year form -- see `utcDateKey` in this file). A
+  // negative expanded year (`-YYYYYY-MM`) can't reach this sink: the event
+  // schema floors `timestamp` at 0, and every non-negative epoch millisecond
+  // lands at year 1970 or later.
+  const normalDate = '\\d{4}-\\d{2}-\\d{2}';
+  const expandedYearDate = '\\+\\d{6}-\\d{2}';
+  const pattern = new RegExp(
+    `^${escapeForRegExp(prefix)}-(${normalDate}|${expandedYearDate})\\.jsonl$`,
+  );
   const cutoff = nowMs - retentionDays * DAY_MS;
   const deleted: string[] = [];
 
@@ -149,13 +161,24 @@ export async function pruneRetention(
     const dateKey = match[1];
     if (dateKey === undefined) continue;
 
-    const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
-    if (Number.isNaN(fileMs)) continue;
-    // Date.parse rolls an impossible date over rather than failing:
-    // 2026-02-30 becomes 2026-03-02. Round-trip it so only a real calendar
-    // date is ever compared against the cutoff.
-    if (new Date(fileMs).toISOString().slice(0, 10) !== dateKey) continue;
-    if (fileMs >= cutoff) continue;
+    if (dateKey.startsWith('+')) {
+      // Expanded-year names have no day-of-month to parse (`utcDateKey`
+      // slices to 10 characters, which an expanded year fills with just
+      // `+YYYYYY-MM`) and, being year 10000 or later, would always sit
+      // beyond any real-world retention cutoff -- so a name-based freshness
+      // check would protect the file forever, which is the bug this branch
+      // exists to fix. There's nothing meaningful to compare, so fall
+      // straight through to the protected-date and mtime checks below, which
+      // let the file age out like any other once it stops being written to.
+    } else {
+      const fileMs = Date.parse(`${dateKey}T00:00:00.000Z`);
+      if (Number.isNaN(fileMs)) continue;
+      // Date.parse rolls an impossible date over rather than failing:
+      // 2026-02-30 becomes 2026-03-02. Round-trip it so only a real calendar
+      // date is ever compared against the cutoff.
+      if (new Date(fileMs).toISOString().slice(0, 10) !== dateKey) continue;
+      if (fileMs >= cutoff) continue;
+    }
 
     // A date we hold a handle for is being written to right now.
     if (protectedDates.has(dateKey)) continue;

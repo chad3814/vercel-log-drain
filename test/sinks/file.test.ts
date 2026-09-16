@@ -32,6 +32,24 @@ describe('utcDateKey', () => {
     // 2020-01-01T00:30:00Z is still 2019-12-31 in US timezones.
     expect(utcDateKey(Date.UTC(2020, 0, 1, 0, 30, 0))).toBe('2020-01-01');
   });
+
+  // Issue #8: `toISOString` switches to ISO 8601's expanded-year form
+  // (`+YYYYYY-...`) once the year no longer fits in four digits, and the
+  // 10-character slice then lands on `+YYYYYY-MM` instead of `YYYY-MM-DD`.
+  // `pruneRetention`'s filename pattern has to recognize exactly this shape,
+  // so the boundary matters to the millisecond: one side must still be the
+  // four-digit form, the other must already be expanded.
+  it.each([
+    ['the last four-digit-year instant', 253_402_300_799_999, '9999-12-31'],
+    ['a mid-range far-future instant', 1e15, '+033658-09'],
+  ])('formats %s as %s', (_label, timestamp, expected) => {
+    expect(utcDateKey(timestamp)).toBe(expected);
+  });
+
+  it('switches to expanded-year notation one millisecond after the last four-digit year', () => {
+    expect(utcDateKey(253_402_300_799_999)).toBe('9999-12-31');
+    expect(utcDateKey(253_402_300_800_000)).toBe('+010000-01');
+  });
 });
 
 describe('dailyFileName', () => {
