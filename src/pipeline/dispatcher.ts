@@ -402,6 +402,23 @@ export class Dispatcher {
     const normalized = await Promise.all(config.sinks.map((entry) => this.normalize(entry)));
     const desired = new Map(normalized.map((entry) => [entry.name, entry]));
 
+    // `spoolFreeSpaceFloorBytes` lives on `server`, not on a sink entry, so
+    // it is invisible to the per-sink `unchanged` check below -- a sink
+    // entry can be byte-identical while the floor its queue was OPENED with
+    // (SpoolQueue.open reads it once, not per enqueue; see startSink) is
+    // stale. Recording the change here, before `this.config` is overwritten,
+    // is what makes every active sink recreate below even though nothing in
+    // ITS entry moved. Read per-enqueue instead was the other option; kept
+    // the floor read at open, on the hot path, to widen "changed" instead --
+    // deliberately, and only for this field. `maxBodyBytes` and
+    // `maxDecompressedBytes` also live on `server` but affect ingest, not a
+    // running SpoolQueue, so tying recreation to the whole `server` block
+    // would restart every sink -- dropping the in-flight batch, per
+    // SinkWorker.stop's own wording -- over settings that do not touch it.
+    const floorChanged =
+      this.config !== null &&
+      this.config.server.spoolFreeSpaceFloorBytes !== config.server.spoolFreeSpaceFloorBytes;
+
     // Committed to applying from here on: `normalize()` above is the only
     // step that can reject the whole config, and it already has. Setting
     // `this.config` now — before any worker is stopped or started — means
@@ -414,7 +431,9 @@ export class Dispatcher {
     for (const [name, current] of this.active) {
       const next = desired.get(name);
       const unchanged =
-        next !== undefined && JSON.stringify(next) === JSON.stringify(current.entry);
+        !floorChanged &&
+        next !== undefined &&
+        JSON.stringify(next) === JSON.stringify(current.entry);
       if (unchanged) continue;
       await current.worker.stop(5000);
       this.active.delete(name);

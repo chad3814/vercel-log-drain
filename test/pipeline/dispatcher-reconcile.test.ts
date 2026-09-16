@@ -665,6 +665,48 @@ describe('Dispatcher', () => {
     }
   });
 
+  it('reaches a running sink when only spoolFreeSpaceFloorBytes changes', async () => {
+    // Issue #5: `spoolFreeSpaceFloorBytes` lives on `server`, not on a sink
+    // entry, so the per-sink "unchanged" check in reconcileNow never sees it
+    // move -- and SpoolQueue.open reads the floor once, at open, not per
+    // enqueue. A PUT /config that changes only the floor left every running
+    // queue on the old value. Here the sink entry is byte-identical across
+    // both applyConfig calls; only the floor moves. Without the fix, the
+    // second enqueue still succeeds (old floor of 0, or the queue never
+    // reopened) and SpoolQueue.open is called only once.
+    let freeBytes = 500_000;
+    const live = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: () => Promise.resolve(freeBytes),
+    });
+    const config = configWith([fileSink('floor-live')]);
+    config.server.spoolFreeSpaceFloorBytes = 0;
+
+    const openSpy = vi.spyOn(SpoolQueue, 'open');
+    try {
+      await live.applyConfig(config);
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      await live.enqueue([event('a')]);
+      expect(live.spoolBelowFloor()).toBe(false);
+
+      // Same sink entry, unchanged; only the server-wide floor moves, above
+      // the free space the probe reports.
+      const raised = configWith([fileSink('floor-live')]);
+      raised.server.spoolFreeSpaceFloorBytes = 1_000_000;
+      await live.applyConfig(raised);
+
+      expect(openSpy).toHaveBeenCalledTimes(2);
+      await expect(live.enqueue([event('b')])).rejects.toThrow(SpoolFloorError);
+      expect(live.spoolBelowFloor()).toBe(true);
+    } finally {
+      openSpy.mockRestore();
+      await live.stop(500);
+    }
+  });
+
   it.each([
     ['removed', (): SinkEntry[] => []],
     ['disabled', (): SinkEntry[] => [fileSink('going-away', { enabled: false })]],
