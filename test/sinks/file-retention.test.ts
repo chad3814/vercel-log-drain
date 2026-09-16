@@ -109,6 +109,42 @@ describe('pruneRetention', () => {
     expect(deleted).toEqual([]);
   });
 
+  // Issue #8: a far-future timestamp (e.g. `1e15` ms, year 33658) makes
+  // `utcDateKey` produce an ISO 8601 expanded-year key like `+033658-09`,
+  // which the original pattern -- `\d{4}-\d{2}-\d{2}` only -- never matched.
+  // That file was invisible to retention and accumulated forever.
+  it('prunes a stale expanded-year filename once it stops being written to', async () => {
+    await agedFile('events-+033658-09.jsonl', 2000);
+
+    const deleted = await pruneRetention(dir, 'events', 1, now);
+
+    expect(deleted).toEqual(['events-+033658-09.jsonl']);
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it('spares a fresh expanded-year filename despite its far-future name', async () => {
+    // Its encoded "date" is always further in the future than any real
+    // cutoff, which is exactly the bug: a name-based freshness check alone
+    // would keep this file forever. Mtime is what must govern it, and here
+    // the file was just written, so it must still be spared -- the replay
+    // protection has to keep working for this shape too.
+    await agedFile('events-+033658-09.jsonl', 0);
+
+    const deleted = await pruneRetention(dir, 'events', 1, now);
+
+    expect(deleted).toEqual([]);
+    expect(await readdir(dir)).toEqual(['events-+033658-09.jsonl']);
+  });
+
+  it('spares an expanded-year date that is currently held open', async () => {
+    await agedFile('events-+033658-09.jsonl', 2000);
+
+    const deleted = await pruneRetention(dir, 'events', 1, now, new Set(['+033658-09']));
+
+    expect(deleted).toEqual([]);
+    expect(await readdir(dir)).toEqual(['events-+033658-09.jsonl']);
+  });
+
   it('deletes nothing when retentionDays is 0, meaning keep forever', async () => {
     await writeFile(join(dir, 'events-2001-01-01.jsonl'), '');
     expect(await pruneRetention(dir, 'events', 0, now)).toEqual([]);
