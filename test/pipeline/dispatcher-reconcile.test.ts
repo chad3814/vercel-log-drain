@@ -279,7 +279,7 @@ describe('Dispatcher', () => {
             url: 'http://127.0.0.1:1',
             auth: { kind: 'none' },
             tenantId: null,
-            labels: { static: {}, fromFields: [] },
+            labels: { static: { job: 'vercel' }, fromFields: [] },
             timeoutMs: 200,
           },
         },
@@ -847,7 +847,7 @@ describe('Dispatcher', () => {
         url: `http://127.0.0.1:${String(port)}`,
         auth: { kind: 'none' },
         tenantId: null,
-        labels: { static: {}, fromFields: [] },
+        labels: { static: { job: 'vercel' }, fromFields: [] },
         timeoutMs: 5000,
       },
     };

@@ -179,7 +179,7 @@ describe('admin routes', () => {
         url: 'http://loki:3100',
         auth: { kind: 'basic', username: 'operator', password: secretValue },
         tenantId: null,
-        labels: { static: {}, fromFields: [] },
+        labels: { static: { job: 'vercel' }, fromFields: [] },
         timeoutMs: 5000,
       },
     };
@@ -268,7 +268,7 @@ describe('admin routes', () => {
         url: 'http://loki:3100',
         auth: { kind: 'basic', username: 'u', password: '' },
         tenantId: null,
-        labels: { static: {}, fromFields: [] },
+        labels: { static: { job: 'vercel' }, fromFields: [] },
         timeoutMs: 5000,
       },
     };
