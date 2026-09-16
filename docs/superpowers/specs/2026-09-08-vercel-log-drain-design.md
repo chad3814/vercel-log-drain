@@ -179,13 +179,15 @@ Three independent mounts, each checked against its own filesystem with
 | Mount | Default | Contents | Behavior on low free space |
 |---|---|---|---|
 | config | `/config` | `config.json`, `config.json.bak` | Writes are tiny. A full volume fails the admin save with `507` and a clear message; the running config is unaffected because it is held in memory. |
-| spool | `/spool` | `<sink>/*.jsonl`, `<sink>/dead/` | `statfs(SPOOL_DIR)` before enqueue. Below the floor: discard the incoming batch, increment `droppedEvents`, mark the service `degraded`, and record it in `recent.errors`. **See the open question below.** |
+| spool | `/spool` | `<sink>/*.jsonl`, `<sink>/dead/` | `statfs(SPOOL_DIR)` before enqueue. Below the floor: **refuse the delivery.** `SpoolQueue.enqueue` throws `SpoolFloorError`, `Dispatcher.enqueue` latches the sink and records it in `recent.errors`, then rethrows, and the drain route answers `500 {"code":"spool_below_floor"}` so Vercel redelivers. The service reports `degraded` and `/readyz` answers 503. Nothing is discarded, so `droppedEvents` does not move. **See the decision below.** |
 | logs | `/logs` | `events-YYYY-MM-DD.jsonl` | `statfs` on the file sink's own directory before appending. Below the floor: `deliver()` throws a **retryable** error. |
 
 Because the logs volume is separate, a full logs volume loses nothing: the
 batch stays in the spool and backs off exactly as it would during a Loki
-outage. Events are dropped only when the **spool** volume hits its floor —
-a single, clearly defined loss point.
+outage. A full **spool** volume loses nothing either, because the service
+refuses the delivery rather than acknowledging it — so there is no loss point
+in the design at all. What a full spool volume costs instead is availability:
+ingest stops for every sink until space is freed. See the decision below.
 
 **Path containment.** The file sink's `directory` is editable from the browser,
 so the server resolves it with `realpath` and rejects anything that does not
@@ -223,13 +225,17 @@ pointing a sink at `/config` or `/spool` and corrupting them.
    buffer, but does **not** fail the request — one bad line must not cause
    Vercel to redeliver the other 999 good ones.
 7. For each enabled sink, apply its compiled filter and enqueue the surviving
-   events into that sink's spool.
+   events into that sink's spool. If no sink is *enabled*, or the spool volume
+   is below its free-space floor, the delivery cannot be stored and is refused
+   with a `500` (§4) rather than acknowledged. A sink whose *filter* matches
+   nothing is simply skipped — that is the operator's intent, not a failure.
 8. Respond `200 {"received":n,"accepted":n,"rejected":n}` only after every
    spool write has been fsynced.
 
-**Delivery semantics: at-least-once, by design.** If any spool write fails, the
-response is `500` so Vercel redelivers the entire batch, which may duplicate
-events into sinks that already succeeded. For logs this is the correct trade —
+**Delivery semantics: at-least-once, by design.** If any spool write fails, or
+is refused because the volume is below its floor, the response is `500` so
+Vercel redelivers the entire batch, which may duplicate events into sinks that
+already succeeded. For logs this is the correct trade —
 duplication is recoverable, loss is not — and Loki collapses identical
 `(labels, timestamp, line)` entries on its own. This is documented behavior,
 not a deduplication cache.
@@ -241,26 +247,53 @@ sequence, so lexicographic order is FIFO order. Content is one JSON event per
 line; batch metadata is carried by the filename and directory, keeping the file
 itself pure JSONL.
 
-**Open question — what the spool free-space floor should do.** An earlier draft
-of the table above said "drop oldest within that sink's budget". That is wrong
-for this condition and has been corrected to describe what the code does:
-dropping one sink's oldest batch cannot free a volume that some other sink, or
-something outside the service entirely, has filled. Two defensible behaviours
-remain, and the choice is an operational trade rather than a technical one:
+**Decision — the spool free-space floor applies backpressure.** An earlier
+draft of the table above said "drop oldest within that sink's budget". That is
+wrong for this condition: dropping one sink's oldest batch cannot free a volume
+that some other sink, or something outside the service entirely, has filled. It
+was corrected to shedding — discard the incoming batch, count it, report
+`degraded` — and the choice between shedding and backpressure was left open as
+an operational trade rather than a technical one. **The owner has chosen
+backpressure**, and the table above now describes it.
 
-- **Shed (current).** Discard the incoming batch, count it, report `degraded`,
-  and record it in `recent.errors`. Ingest stays up for every sink, including
-  healthy ones, and a full volume costs the newest events.
-- **Backpressure.** Refuse the delivery so Vercel retries. This makes "no
-  acknowledged delivery is ever lost" true without qualification — the service
-  never acknowledges what it cannot store — at the cost of coupling ingest to
-  disk pressure: one stuck sink filling the volume would stop deliveries that a
-  healthy sink could have taken.
+Below the floor the service refuses the delivery: `enqueue` throws, the drain
+route answers 500, and Vercel redelivers. The headline claim — *no acknowledged
+delivery is ever lost* — therefore holds without qualification, because the
+service never acknowledges what it cannot store. Vercel's redelivery on a 500
+is what makes refusing safe rather than merely honest. It also makes the two
+volumes consistent: the logs volume already applies backpressure (its
+`deliver()` throws a retryable error and the batch stays in the spool), and
+having the spool volume shed while the logs volume held was the strongest
+argument for changing it.
 
-The logs volume already uses backpressure (§4), so the two volumes are
-currently inconsistent, which is the strongest argument for changing this. It
-is deliberately unresolved pending the operator's judgement; the current
-behaviour is at least honest and visible, which the original was not.
+**The accepted cost, stated plainly rather than hidden: a full spool volume
+stops ingest for every sink, including healthy ones.** One noisy sink, or one
+`dead/` directory nobody cleared, filling the volume refuses deliveries that a
+healthy sink could have taken, and `/readyz` answers 503 throughout. This is
+deliberate. Availability is recoverable by freeing or resizing the volume;
+logs Vercel has already discarded are not. The operator's warning is the same
+as before — `degraded`, 503, and a `recent.errors` entry naming the sink and
+the bytes free — plus, now, Vercel's own delivery-failure reporting.
+
+Two things follow that a later reader should not "fix":
+
+- **Partial fan-out is acceptable.** `Dispatcher.enqueue` writes to each
+  matching sink in turn, so if sink A commits and sink B is below the floor,
+  the error is thrown with A's copy already on disk and the redelivery gives A
+  a duplicate. That is correct: delivery is at-least-once (§5), duplicates are
+  recoverable and loss is not. Catching the error to answer 200 would trade a
+  duplicate in A for silent loss in B.
+- **`maxSpoolBytes` overflow still sheds.** Drop-oldest inside one sink's byte
+  budget is a bounded buffer doing its job, not a full disk, and the sink can
+  genuinely free that space itself. Only the volume free-space floor applies
+  backpressure.
+
+The status stays **500**, not 503: 500 is the status §5 and the tests pin as
+the one Vercel redelivers on, and nothing here has established that Vercel
+treats 503 the same way. A config with no enabled sink refuses on the same
+reasoning (§5, step 7) — nothing can ever store that batch — while a delivery
+that no sink's *filter* matches is the operator's intent and is still answered
+200.
 
 **Write protocol.** `<name>.tmp` → `fsync` → `rename()` → fsync the directory.
 `rename` is atomic, so a crash mid-write can never expose a partial batch.

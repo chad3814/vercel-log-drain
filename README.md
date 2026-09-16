@@ -144,24 +144,48 @@ They are kept separate on purpose. A full **logs** volume makes a file
 sink's write fail, but that failure is backpressure, not loss: the batch
 stays in `/spool` and is retried, `/api/drain/*` keeps accepting new
 deliveries, and nothing is dropped until space is freed or the sink's
-`freeSpaceFloorBytes` is raised. A full **spool** volume is different: once
-free space on it drops below the server-wide floor
-(`spoolFreeSpaceFloorBytes`, default 256 MiB), newly enqueued events for a
-sink are dropped outright rather than written, and a per-sink `maxSpoolBytes`
-budget independently evicts the _oldest_ on-disk batches to make room for new
-ones. Collapsing all three mounts into one would tie a logs-volume outage
-directly to ingest, which is exactly what keeping them apart avoids.
+`freeSpaceFloorBytes` is raised. A full **spool** volume is backpressure too,
+one step further out: once free space on it drops below the server-wide floor
+(`spoolFreeSpaceFloorBytes`, default 256 MiB) the service stops accepting
+deliveries rather than accepting events it cannot store — see below.
+Collapsing all three mounts into one would tie a logs-volume outage directly
+to ingest, which is exactly what keeping them apart avoids.
 
-Dropping at the spool floor is the **one loss point in the design**, so it is
-reported on every surface an operator might be looking at: `service.state`
-becomes `degraded`, `/readyz` answers `503`, each drop appends an entry to
-`recent.errors` naming the sink and the bytes free, and `counters.dropped`
-climbs. Vercel is still answered `200` for a batch dropped this way, which is
-what the design chose: Vercel retries only a few times, and each retry would
-arrive at the same full volume, so the honest signal is local rather than a
-`500` that loses the data a few seconds later anyway. That makes these
-signals the only warning you get — treat a `degraded` service with a climbing
-`dropped` count as data loss in progress, not as a slow sink.
+Separately from the volume floor, each sink has a `maxSpoolBytes` budget, and
+exceeding it evicts the _oldest_ on-disk batches for that sink to make room
+for the newest. That is a bounded buffer doing its job — the sink can free
+that space itself, and `counters.dropped` is what climbs — and it is the only
+place this service discards anything.
+
+### A full spool volume stops ingest
+
+Below the floor, `/api/drain/*` answers `500 {"code":"spool_below_floor"}` and
+does not write the batch. Vercel treats a `500` as a failed delivery and
+retries it, so the events stay at Vercel rather than being thrown away here.
+That is what makes the durability claim unqualified: **nothing this service
+acknowledges with a `200` is ever lost, because it never acknowledges what it
+could not store.** `counters.dropped` does _not_ move, because nothing was
+dropped.
+
+The cost is deliberate and worth being clear about: **a full spool volume
+stops ingest for every sink, including healthy ones.** One noisy sink, or one
+`dead/` directory nobody cleared, can fill the volume and refuse deliveries
+that a healthy sink would have taken. The trade is that a volume is something
+you can fix — free it, raise it, resize it — and logs Vercel has already
+given up on are not.
+
+It is reported on every surface an operator might be looking at:
+`service.state` becomes `degraded`, `/readyz` answers `503`, each refused
+delivery appends an entry to `recent.errors` naming the sink and the bytes
+free, and Vercel's own dashboard shows the delivery failures. Treat a
+`degraded` service with a `503` on `/readyz` as ingest being down, not as a
+slow sink.
+
+One consequence to expect rather than be surprised by: sinks are written one
+at a time, so if one sink takes the batch and a later one is below the floor,
+the response is still `500` and Vercel's retry gives the first sink a
+duplicate. Delivery is at-least-once by design (see **Delivery semantics**),
+and a duplicate is recoverable where a loss is not.
 
 On a Linux host, a **bind mount** of a pre-existing host directory (as
 opposed to a named volume) does not carry the right ownership: the container
@@ -251,9 +275,11 @@ token, or anything else sensitive in a static label — use the sink's own
 Delivery is at-least-once, both from Vercel into this service and from this
 service out to each sink. The drain route only acknowledges Vercel — with a
 `200` — after the batch has been durably written to `/spool`; if that write
-fails, the route answers `500`, and Vercel retries the same delivery. That
-retry can duplicate events into a sink that already received and delivered
-the earlier attempt. A consumer of these events needs to tolerate duplicates:
+fails, or is refused because the spool volume is below its free-space floor,
+or there is no enabled sink to write it to, the route answers `500` and Vercel
+retries the same delivery. There is no path on which this service answers
+`200` for events it did not write. That retry can duplicate events into a sink
+that already received and delivered the earlier attempt. A consumer of these events needs to tolerate duplicates:
 Loki collapses identical entries (same labels, same timestamp, same line)
 into one, but the file sink writes exactly what it's given and does not
 deduplicate.
@@ -300,8 +326,8 @@ not history.
 
 `service.state` on `/api/status` is `degraded` in three cases: an enabled sink
 is `failed`, the spool volume is below its free-space floor, or **no** sink is
-enabled at all (a service with nowhere to put a delivery is not healthy, even
-though ingest still answers `200`).
+enabled at all. In the last two, ingest is refusing deliveries with a `500` —
+a service with nowhere to put a delivery does not pretend to have taken it.
 
 `/readyz` is deliberately narrower and answers `503` for **only** the middle
 one — the spool volume below its floor. The reason is that an orchestrator
@@ -335,8 +361,8 @@ So: watch `service.state` for "something needs attention", and `/readyz` for
   `dead/` is terminal storage, and the budget reclaims space by deleting,
   which is the one thing nothing may do to a dead letter. So it only ever
   grows until you clear it by hand — watch it, because a large `dead/` is
-  what takes the whole spool volume below its floor, at which point new
-  events are dropped.
+  what takes the whole spool volume below its floor, at which point ingest
+  stops for every sink until you free space.
 
   Clearing it by hand means deleting files inside `/spool/<sink>/dead/`, not
   the directory itself, and leaving it readable by uid `10001`. A `dead/`
@@ -347,19 +373,21 @@ So: watch `service.state` for "something needs attention", and `/readyz` for
 
 ## Troubleshooting
 
-| Symptom                                                                                                                                | Cause                                                                                                                                                                                                                                     | Fix                                                                                                                                |
-| -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| Vercel reports delivery failures; drain answers `403 invalid_signature`                                                                | The secret configured in Vercel doesn't match the drain's                                                                                                                                                                                 | Re-copy the secret from drain creation, or rotate: delete the drain and create a new one                                           |
-| Vercel reports delivery failures; drain answers `404`                                                                                  | The drain id in the Vercel destination URL doesn't match any configured drain                                                                                                                                                             | Check the id in the URL against the **Drains** tab                                                                                 |
-| Admin UI / `/api/status` answers `503`                                                                                                 | `AUTH_MODE` is unset                                                                                                                                                                                                                      | Set `AUTH_MODE=proxy` (with `AUTH_TRUSTED_PROXIES`/`AUTH_USER_HEADER`), or `AUTH_MODE=disabled` for local development              |
-| Admin UI answers `403 forbidden: AUTH_USER_HEADER was not supplied by the proxy`                                                       | The proxy is not setting the header named by `AUTH_USER_HEADER`, or is setting a different one                                                                                                                                            | Compare the header your proxy sets against `AUTH_USER_HEADER`; both are case-insensitive but the name must otherwise match         |
-| Admin UI answers `403 forbidden: request did not arrive from a trusted proxy`                                                          | The socket peer is outside `AUTH_TRUSTED_PROXIES`. Trust is decided from the connecting address, never from `X-Forwarded-For`                                                                                                             | Set `AUTH_TRUSTED_PROXIES` to the CIDR the proxy actually connects from — on Docker that is the bridge network, not the host       |
-| A Loki sink's health is `failed`, last error mentions `401`/`403`/`404`                                                                | Bad Loki credentials, tenant, or URL                                                                                                                                                                                                      | Fix the sink's `auth`/`url`/`tenantId` and save; the worker resumes on its own once the credential is valid                        |
-| A Loki sink is dead-lettering batches, last error mentions `400`                                                                       | Batch timestamps are older than Loki's `reject_old_samples_max_age`, typically because the sink was down longer than that window                                                                                                          | Raise `reject_old_samples_max_age` on the Loki side, or accept that outages longer than it will dead-letter                        |
-| A Loki sink's health is `failed`, last error mentions `413`                                                                            | Something in front of Loki has a body-size limit below the sink's `maxBatchBytes` (nginx defaults to `client_max_body_size 1m`; the sink defaults to 4 MiB)                                                                               | Lower the sink's `maxBatchBytes` or raise the proxy's limit; the batches are still on disk and delivery resumes on its own         |
-| Container exits immediately, message mentions `chown`                                                                                  | A bind-mounted volume isn't owned by uid/gid `10001`                                                                                                                                                                                      | `chown -R 10001:10001` the host directory (see Volumes)                                                                            |
-| A sink's health is `failed`, last error mentions `EACCES` and a `/spool/<sink>/dead` path                                              | That sink's dead-letter directory cannot be read, so batch sequence numbers cannot be kept monotonic across it — the sink refuses to start rather than risk overwriting an already-failed batch. Every other sink and drain keeps running | Fix the permissions on the spool volume (`chown -R 10001:10001`) and save the config again, or restart; nothing in `dead/` is lost |
-| Container exits immediately, message names `AUTH_MODE`, `AUTH_TRUSTED_PROXIES`, `AUTH_USER_HEADER`, `RETRY_BASE_MS`, or `RETRY_MAX_MS` | That variable is malformed                                                                                                                                                                                                                | The boot error names the variable and the rejected value — fix it and restart                                                      |
+| Symptom                                                                                                                                | Cause                                                                                                                                                                                                                                                      | Fix                                                                                                                                                                                                                                                |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Vercel reports delivery failures; drain answers `403 invalid_signature`                                                                | The secret configured in Vercel doesn't match the drain's                                                                                                                                                                                                  | Re-copy the secret from drain creation, or rotate: delete the drain and create a new one                                                                                                                                                           |
+| Vercel reports delivery failures; drain answers `404`                                                                                  | The drain id in the Vercel destination URL doesn't match any configured drain                                                                                                                                                                              | Check the id in the URL against the **Drains** tab                                                                                                                                                                                                 |
+| Admin UI / `/api/status` answers `503`                                                                                                 | `AUTH_MODE` is unset                                                                                                                                                                                                                                       | Set `AUTH_MODE=proxy` (with `AUTH_TRUSTED_PROXIES`/`AUTH_USER_HEADER`), or `AUTH_MODE=disabled` for local development                                                                                                                              |
+| Admin UI answers `403 forbidden: AUTH_USER_HEADER was not supplied by the proxy`                                                       | The proxy is not setting the header named by `AUTH_USER_HEADER`, or is setting a different one                                                                                                                                                             | Compare the header your proxy sets against `AUTH_USER_HEADER`; both are case-insensitive but the name must otherwise match                                                                                                                         |
+| Admin UI answers `403 forbidden: request did not arrive from a trusted proxy`                                                          | The socket peer is outside `AUTH_TRUSTED_PROXIES`. Trust is decided from the connecting address, never from `X-Forwarded-For`                                                                                                                              | Set `AUTH_TRUSTED_PROXIES` to the CIDR the proxy actually connects from — on Docker that is the bridge network, not the host                                                                                                                       |
+| A Loki sink's health is `failed`, last error mentions `401`/`403`/`404`                                                                | Bad Loki credentials, tenant, or URL                                                                                                                                                                                                                       | Fix the sink's `auth`/`url`/`tenantId` and save; the worker resumes on its own once the credential is valid                                                                                                                                        |
+| A Loki sink is dead-lettering batches, last error mentions `400`                                                                       | Batch timestamps are older than Loki's `reject_old_samples_max_age`, typically because the sink was down longer than that window                                                                                                                           | Raise `reject_old_samples_max_age` on the Loki side, or accept that outages longer than it will dead-letter                                                                                                                                        |
+| A Loki sink's health is `failed`, last error mentions `413`                                                                            | Something in front of Loki has a body-size limit below the sink's `maxBatchBytes` (nginx defaults to `client_max_body_size 1m`; the sink defaults to 4 MiB)                                                                                                | Lower the sink's `maxBatchBytes` or raise the proxy's limit; the batches are still on disk and delivery resumes on its own                                                                                                                         |
+| Vercel reports delivery failures; drain answers `500 spool_below_floor`, `/readyz` answers `503`                                       | Free space on the **spool** volume is below `spoolFreeSpaceFloorBytes` (default 256 MiB), so deliveries are refused rather than accepted and discarded. Ingest is stopped for every sink, healthy ones included; Vercel is holding the events and retrying | Free space on `/spool` — clear each sink's `dead/` by hand, and check `dead.bytes` and `queue.bytes` per sink on the Status page — or resize the volume, or lower `spoolFreeSpaceFloorBytes`. Ingest resumes on the next delivery, with no restart |
+| Vercel reports delivery failures; drain answers `500 spool_failed`, status page says no sink is enabled                                | There is no **enabled** sink, so nothing could store the delivery. This is the state a fresh deployment starts in, since the default config ships with no sinks                                                                                            | Add and enable a sink on the **Sinks** tab. A sink whose _filter_ matches nothing is not this case — that is answered `200` and is the filter working as configured                                                                                |
+| Container exits immediately, message mentions `chown`                                                                                  | A bind-mounted volume isn't owned by uid/gid `10001`                                                                                                                                                                                                       | `chown -R 10001:10001` the host directory (see Volumes)                                                                                                                                                                                            |
+| A sink's health is `failed`, last error mentions `EACCES` and a `/spool/<sink>/dead` path                                              | That sink's dead-letter directory cannot be read, so batch sequence numbers cannot be kept monotonic across it — the sink refuses to start rather than risk overwriting an already-failed batch. Every other sink and drain keeps running                  | Fix the permissions on the spool volume (`chown -R 10001:10001`) and save the config again, or restart; nothing in `dead/` is lost                                                                                                                 |
+| Container exits immediately, message names `AUTH_MODE`, `AUTH_TRUSTED_PROXIES`, `AUTH_USER_HEADER`, `RETRY_BASE_MS`, or `RETRY_MAX_MS` | That variable is malformed                                                                                                                                                                                                                                 | The boot error names the variable and the rejected value — fix it and restart                                                                                                                                                                      |
 
 ## Development
 
