@@ -7,3 +7,8 @@ dist/
 # blocks inside markdown, which would rewrite the plan's TypeScript samples
 # and produce enormous diffs on a document that is reviewed by humans.
 docs/
+
+# Editor-local configuration. Untracked, so the repo does not own its
+# formatting -- but prettier still walks it, which made `format:check` fail
+# on a developer's machine while passing in CI, where no .vscode/ exists.
+.vscode/
