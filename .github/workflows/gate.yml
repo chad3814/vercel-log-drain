@@ -1,0 +1,29 @@
+# The verification gate, in one place so it cannot drift.
+#
+# Called by both ci.yml (on every push and PR) and release.yml (before
+# publishing). Duplicating these steps into the release workflow was the
+# obvious alternative and the wrong one: this project has twice shipped a bug
+# where two copies of the same list drifted apart, and once shipped a CI
+# workflow running a weaker gate than a developer's laptop. A release that
+# publishes an image the gate never checked is the same mistake with a worse
+# blast radius.
+name: Gate
+
+on:
+  workflow_call:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

@@ -6,20 +6,11 @@ on:
   pull_request:
 
 jobs:
+  # Note this does NOT run on tag pushes: `push.branches` does not match a
+  # tag ref. That is why release.yml calls the same gate itself rather than
+  # assuming CI already covered the commit being released.
   verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '24'
-          cache: npm
-      - run: npm ci
-      - run: npm run format:check
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+    uses: ./.github/workflows/gate.yml
 
   smoke:
     runs-on: ubuntu-latest

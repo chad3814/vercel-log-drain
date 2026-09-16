@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="vercel-log-drain:smoke"
+# Build our own image by default, or smoke one that already exists when
+# SMOKE_IMAGE is set. The release workflow needs the second form: it builds
+# the artifact once, smokes THAT image, and pushes the same bytes -- smoking
+# a separately-built image would prove nothing about what gets published.
+IMAGE="${SMOKE_IMAGE:-vercel-log-drain:smoke}"
 NAME="vld-smoke-$$"
 PORT="18080"
 
@@ -11,7 +15,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> building image"
-docker build --build-arg APP_VERSION=smoke -t "$IMAGE" .
+if [ -n "${SMOKE_IMAGE:-}" ]; then
+  echo "smoking pre-built image: $IMAGE"
+else
+  docker build --build-arg APP_VERSION=smoke -t "$IMAGE" .
+fi
 
 echo "==> starting container"
 docker run -d --name "$NAME" \
