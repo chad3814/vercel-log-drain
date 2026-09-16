@@ -97,7 +97,7 @@ describe('restoreSecrets', () => {
             url: 'http://loki:3100',
             auth: { kind: 'bearer', token: 'tok-abcdefghij' },
             tenantId: null,
-            labels: { static: {}, fromFields: [] },
+            labels: { static: { job: 'vercel' }, fromFields: [] },
             timeoutMs: 5000,
           },
         },

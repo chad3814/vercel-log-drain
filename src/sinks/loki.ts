@@ -31,9 +31,15 @@ export const lokiSinkConfigSchema = z.object({
   url: z.url(),
   auth: lokiAuthSchema,
   tenantId: z.string().min(1).nullable(),
+  // Values/entries are required to be non-empty so that "has a key" and "has
+  // a usable label" mean the same thing: `static: { job: '' }` would
+  // otherwise satisfy "at least one static entry" (the check lives on
+  // sinkEntrySchema in src/config/schema.ts, which is the level that knows
+  // the sink's name) while still resolving to no label at all, because
+  // resolveLabels in loki-payload.ts skips empty-string values.
   labels: z.object({
-    static: z.record(z.string(), z.string()),
-    fromFields: z.array(z.string()),
+    static: z.record(z.string(), z.string().min(1)),
+    fromFields: z.array(z.string().min(1)),
   }),
   timeoutMs: z.number().int().min(100).max(120_000),
 });

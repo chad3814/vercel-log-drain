@@ -53,6 +53,44 @@ export const sinkEntrySchema = z
   .refine((entry) => entry.maxBatchBytes <= entry.maxSpoolBytes, {
     message: 'maxBatchBytes must not exceed maxSpoolBytes',
     path: ['maxBatchBytes'],
+  })
+  // `labels: { static: {}, fromFields: [] }` is valid at the level of
+  // lokiSinkConfigSchema alone -- an empty record and an empty array are
+  // both fine zod values -- but it resolves every event to `stream: {}`.
+  // Loki answers a labelless stream with 400, classifyLokiStatus treats 400
+  // as permanent, and PermanentDeliveryError dead-letters the whole batch.
+  // The sink looks configured (no error at save time, nothing surfaced by
+  // /readyz) while silently delivering nothing forever (issue #9).
+  //
+  // This check lives here, on the entry, rather than inside
+  // lokiSinkConfigSchema itself, because only the entry carries `name` --
+  // and the point of rejecting this is to tell an operator WHICH sink is
+  // broken, not just that "the config" is invalid.
+  //
+  // Trade accepted: ConfigStore.load() parses every sink through this same
+  // sinkEntrySchema, so a config.json already on disk with this shape will
+  // now fail to load, crash-looping the service on restart rather than
+  // continuing to run the sink that was silently dead-lettering everything.
+  // That mirrors this file's other invariants (unique sink names,
+  // maxBatchBytes <= maxSpoolBytes above) and the project's documented boot
+  // philosophy (README: "a malformed value throws ... rather than a service
+  // that limps along on a guessed default"): the sink was never delivering
+  // anything, so failing loudly at boot -- with a message naming the sink
+  // and the fix -- trades a silent no-op for an actionable crash, instead of
+  // leaving the loader tolerant of a state the write path now refuses.
+  .superRefine((entry, ctx) => {
+    if (entry.config.type !== 'loki') return;
+    const { static: staticLabels, fromFields } = entry.config.labels;
+    if (Object.keys(staticLabels).length > 0 || fromFields.length > 0) return;
+    ctx.addIssue({
+      code: 'custom',
+      path: ['config', 'labels'],
+      message:
+        `sink "${entry.name}": loki labels are empty (no static entries and no fromFields), ` +
+        'so every event resolves to stream {} and Loki rejects it with a permanent 400 that ' +
+        'dead-letters the whole batch. Add at least one static label (e.g. ' +
+        'static: { job: "vercel" }) or one fromFields entry (e.g. fromFields: ["environment"]).',
+    });
   });
 
 export type SinkEntry = z.infer<typeof sinkEntrySchema>;
