@@ -12,12 +12,20 @@ that's for development — see Development below.)
 ## Quick start
 
 ```
-docker build -t vercel-log-drain .
 docker run -d --name vercel-log-drain -p 8080:8080 \
   -e AUTH_MODE=disabled \
   -v vld-config:/config -v vld-spool:/spool -v vld-logs:/logs \
-  vercel-log-drain
+  ghcr.io/chad3814/vercel-log-drain:latest
 ```
+
+The image is published to GHCR on each release and is publicly pullable, so
+no login or local build is needed. Every release is also tagged with its
+version — `ghcr.io/chad3814/vercel-log-drain:1.0.0` — and a real deployment
+should pin one of those rather than tracking `:latest`, so that restarting a
+container cannot quietly change the version it runs. `linux/amd64` only.
+
+To build it yourself instead — the right path when you are changing the code —
+see Development at the end of this file.
 
 `AUTH_MODE=disabled` leaves the admin API and UI open with **no**
 authentication. It exists for exactly this kind of local evaluation and for
@@ -395,6 +403,7 @@ Requires Node.js 24+ (see `engines` in `package.json`).
 
 ```
 npm ci
+npm run format:check # prettier; part of the gate CI runs, so check it here
 npm run lint        # oxlint, type-aware
 npm run typecheck   # tsc for the server, then separately for the web project
 npm test            # vitest run, includes test/e2e/durability.test.ts
@@ -402,6 +411,17 @@ npm run test:watch  # vitest in watch mode
 npm run build       # server -> dist/src/index.js, web -> web/dist/index.html
 npm run smoke       # builds the Docker image and exercises it end to end; needs Docker running
 ```
+
+To build the image yourself rather than pulling the published one — which is
+what you want when you are changing the code:
+
+```
+docker build --build-arg APP_VERSION=dev -t vercel-log-drain .
+```
+
+`APP_VERSION` is what `/api/status` reports; it defaults to `dev` and the
+release workflow sets it from the git tag. Then substitute
+`vercel-log-drain` for the `ghcr.io/...` image in the Quick start command.
 
 There is no `npm run dev`. To run the built service locally against local
 directories instead of `/config`, `/spool`, `/logs`:
