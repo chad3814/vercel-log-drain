@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { discardOrphan, fetchStatus } from '../api.ts';
-import type { StatusSnapshot } from '@shared/api';
+import type { OrphanedSpool, StatusSnapshot } from '@shared/api';
 
 const POLL_MS = 2000;
 
@@ -48,6 +48,25 @@ export function Status(): React.JSX.Element {
       clearInterval(timer);
     };
   }, []);
+
+  const handleDiscard = (orphan: OrphanedSpool): void => {
+    if (
+      !window.confirm(
+        `Discard orphaned spool "${orphan.name}"? This permanently destroys ` +
+          `${String(orphan.files)} file(s) / ${bytes(orphan.bytes)} of undelivered log batches. ` +
+          'This cannot be undone.',
+      )
+    ) {
+      return;
+    }
+    void (async () => {
+      try {
+        await discardOrphan(orphan.name);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+  };
 
   if (error !== null) return <p className="err">{error}</p>;
   if (snapshot === null) return <p className="muted">Loading…</p>;
@@ -156,12 +175,7 @@ export function Status(): React.JSX.Element {
                     {String(orphan.files)} files / {bytes(orphan.bytes)}
                   </td>
                   <td>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void discardOrphan(orphan.name);
-                      }}
-                    >
+                    <button type="button" onClick={() => handleDiscard(orphan)}>
                       Discard
                     </button>
                   </td>
