@@ -409,9 +409,18 @@ npm run format:check # prettier; part of the gate CI runs, so check it here
 npm run lint        # oxlint, type-aware
 npm run typecheck   # tsc for the server, then separately for the web project
 npm test            # vitest run, includes test/e2e/durability.test.ts
+npm run test:browser # playwright, drives the SPA in a real browser
 npm run test:watch  # vitest in watch mode
 npm run build       # server -> dist/src/index.js, web -> web/dist/index.html
 npm run smoke       # builds the Docker image and exercises it end to end; needs Docker running
+```
+
+Browser tests live in `browser/` and are run by Playwright, not vitest — vitest
+owns `test/` and runs with `environment: 'node'`. They need a browser
+downloaded once:
+
+```
+npx playwright install chromium
 ```
 
 To build the image yourself rather than pulling the published one — which is

@@ -6,6 +6,7 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "playwright test",
     "build": "npm run build:server && npm run build:web",
     "build:server": "tsc -p tsconfig.build.json",
     "build:web": "vite build",
@@ -28,6 +29,7 @@
     "zod": "4.5.4"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@types/node": "24.13.4",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",

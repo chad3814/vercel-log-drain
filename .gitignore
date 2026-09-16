@@ -4,3 +4,8 @@ web/dist/
 coverage/
 *.log
 .DS_Store
+
+# Playwright: throwaway server state and run artifacts.
+.playwright-state/
+test-results/
+playwright-report/
