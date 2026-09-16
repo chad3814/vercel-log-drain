@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { sinkConfigSchema } from '../sinks/registry.js';
+import { hasNoUsableLabels } from '../sinks/loki-payload.js';
 
 export const SINK_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
@@ -53,44 +54,6 @@ export const sinkEntrySchema = z
   .refine((entry) => entry.maxBatchBytes <= entry.maxSpoolBytes, {
     message: 'maxBatchBytes must not exceed maxSpoolBytes',
     path: ['maxBatchBytes'],
-  })
-  // `labels: { static: {}, fromFields: [] }` is valid at the level of
-  // lokiSinkConfigSchema alone -- an empty record and an empty array are
-  // both fine zod values -- but it resolves every event to `stream: {}`.
-  // Loki answers a labelless stream with 400, classifyLokiStatus treats 400
-  // as permanent, and PermanentDeliveryError dead-letters the whole batch.
-  // The sink looks configured (no error at save time, nothing surfaced by
-  // /readyz) while silently delivering nothing forever (issue #9).
-  //
-  // This check lives here, on the entry, rather than inside
-  // lokiSinkConfigSchema itself, because only the entry carries `name` --
-  // and the point of rejecting this is to tell an operator WHICH sink is
-  // broken, not just that "the config" is invalid.
-  //
-  // Trade accepted: ConfigStore.load() parses every sink through this same
-  // sinkEntrySchema, so a config.json already on disk with this shape will
-  // now fail to load, crash-looping the service on restart rather than
-  // continuing to run the sink that was silently dead-lettering everything.
-  // That mirrors this file's other invariants (unique sink names,
-  // maxBatchBytes <= maxSpoolBytes above) and the project's documented boot
-  // philosophy (README: "a malformed value throws ... rather than a service
-  // that limps along on a guessed default"): the sink was never delivering
-  // anything, so failing loudly at boot -- with a message naming the sink
-  // and the fix -- trades a silent no-op for an actionable crash, instead of
-  // leaving the loader tolerant of a state the write path now refuses.
-  .superRefine((entry, ctx) => {
-    if (entry.config.type !== 'loki') return;
-    const { static: staticLabels, fromFields } = entry.config.labels;
-    if (Object.keys(staticLabels).length > 0 || fromFields.length > 0) return;
-    ctx.addIssue({
-      code: 'custom',
-      path: ['config', 'labels'],
-      message:
-        `sink "${entry.name}": loki labels are empty (no static entries and no fromFields), ` +
-        'so every event resolves to stream {} and Loki rejects it with a permanent 400 that ' +
-        'dead-letters the whole batch. Add at least one static label (e.g. ' +
-        'static: { job: "vercel" }) or one fromFields entry (e.g. fromFields: ["environment"]).',
-    });
   });
 
 export type SinkEntry = z.infer<typeof sinkEntrySchema>;
@@ -124,6 +87,50 @@ export const appConfigSchema = z
   });
 
 export type AppConfig = z.infer<typeof appConfigSchema>;
+
+/**
+ * `appConfigSchema`, plus one extra check: reject a loki sink whose labels
+ * can never resolve to anything (see hasNoUsableLabels in
+ * src/sinks/loki-payload.ts) -- `labels: { static: {}, fromFields: [] }`
+ * resolves every event to `stream: {}`, which Loki answers with a
+ * permanent 400 that dead-letters the whole batch (issue #9).
+ *
+ * Deliberately a SEPARATE schema from `appConfigSchema`, not folded into
+ * it. `ConfigStore.load()` parses every config.json through
+ * `appConfigSchema` and must stay tolerant of a pre-existing file in this
+ * shape: refusing to load would crash-loop the whole container over one
+ * misconfigured sink, taking every other sink and drain down with it, with
+ * no way back in through the (now-unreachable) admin UI to fix it -- the
+ * same deadlock `/readyz` used to cause and was deliberately changed to
+ * avoid. `LokiSink`'s constructor (src/sinks/loki.ts) throws for this same
+ * condition, and `reconcileNow` already isolates a sink that fails to
+ * start, so a config already on disk in this shape boots with that one
+ * sink `failed` and every other sink and drain running.
+ *
+ * `appConfigWriteSchema` is for the one path that can still afford to be
+ * strict: `restoreSecrets` in src/config/redact.ts, which validates the
+ * body of `PUT /api/admin/config` before anything is persisted. An operator
+ * saving this shape gets a 400 naming the sink, and the state becomes
+ * unrepresentable going forward.
+ *
+ * Do not merge this back into `appConfigSchema` "for simplicity" -- that
+ * reintroduces the crash-loop this split exists to avoid.
+ */
+export const appConfigWriteSchema = appConfigSchema.superRefine((config, ctx) => {
+  config.sinks.forEach((entry, index) => {
+    if (entry.config.type !== 'loki') return;
+    if (!hasNoUsableLabels(entry.config.labels)) return;
+    ctx.addIssue({
+      code: 'custom',
+      path: ['sinks', index, 'config', 'labels'],
+      message:
+        `sink "${entry.name}": loki labels are empty (no static entry has a value, and ` +
+        'fromFields has no entries), so every event resolves to stream {} and Loki rejects it ' +
+        'with a permanent 400 that dead-letters the whole batch. Add at least one static label ' +
+        '(e.g. static: { job: "vercel" }) or one fromFields entry (e.g. fromFields: ["environment"]).',
+    });
+  });
+});
 
 export function newDrainId(): string {
   return randomUUID().replace(/-/g, '');

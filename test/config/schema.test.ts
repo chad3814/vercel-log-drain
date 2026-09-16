@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   appConfigSchema,
+  appConfigWriteSchema,
   defaultAppConfig,
   newDrainId,
   newDrainSecret,
@@ -41,6 +42,10 @@ function lokiSink(labels: { static: Record<string, string>; fromFields: string[]
       timeoutMs: 5000,
     },
   };
+}
+
+function configWithLokiSink(sink: ReturnType<typeof lokiSink>) {
+  return { ...defaultAppConfig(), sinks: [sink] };
 }
 
 describe('SINK_NAME_PATTERN', () => {
@@ -118,49 +123,12 @@ describe('sinkEntrySchema', () => {
     );
   });
 
-  it('rejects a loki sink with no static labels and no fromFields, naming the sink and the fix', () => {
-    // Issue #9: labels: { static: {}, fromFields: [] } is schema-valid at
-    // the bare lokiSinkConfigSchema level and resolves every event to
-    // `stream: {}`, which Loki answers with a permanent 400 that
-    // dead-letters the whole batch forever. The rejection has to name the
-    // sink (an operator identifies sinks by name, not array index) and say
-    // what to do about it, not just that "the config" is invalid.
-    const result = sinkEntrySchema.safeParse(lokiSink({ static: {}, fromFields: [] }));
-    expect(result.success).toBe(false);
-    if (result.success) return;
-    expect(result.error.issues).toHaveLength(1);
-    const message = result.error.issues[0]?.message ?? '';
-    expect(message).toContain('"loki-prod"');
-    expect(message).toMatch(/static/);
-    expect(message).toMatch(/fromFields/);
-  });
-
-  it('accepts a loki sink with only a static label', () => {
-    expect(
-      sinkEntrySchema.safeParse(lokiSink({ static: { job: 'vercel' }, fromFields: [] })),
-    ).toMatchObject({ success: true });
-  });
-
-  it('accepts a loki sink with only a fromFields entry', () => {
-    expect(
-      sinkEntrySchema.safeParse(lokiSink({ static: {}, fromFields: ['environment'] })),
-    ).toMatchObject({ success: true });
-  });
-
-  it('rejects a loki sink whose only static label has an empty value', () => {
-    // A key with a blank value is structurally "at least one entry" but
-    // resolveLabels (loki-payload.ts) skips empty-string values, so this
-    // would otherwise slip past the "at least one label" check while still
-    // resolving to no label at all.
-    expect(
-      sinkEntrySchema.safeParse(lokiSink({ static: { job: '' }, fromFields: [] })).success,
-    ).toBe(false);
-  });
-
-  it('rejects a loki sink whose only fromFields entry is an empty string', () => {
-    expect(sinkEntrySchema.safeParse(lokiSink({ static: {}, fromFields: [''] })).success).toBe(
-      false,
-    );
+  it('accepts a loki sink with no static labels and no fromFields', () => {
+    // sinkEntrySchema is the STRUCTURAL schema -- the one ConfigStore.load()
+    // parses -- and it must stay tolerant of this shape. See
+    // appConfigWriteSchema below for where "does this loki sink have any
+    // usable labels" is actually enforced, and why it is not enforced here.
+    expect(sinkEntrySchema.safeParse(lokiSink({ static: {}, fromFields: [] })).success).toBe(true);
   });
 });
 
@@ -171,6 +139,23 @@ describe('appConfigSchema', () => {
 
   it('rejects a wrong version', () => {
     expect(appConfigSchema.safeParse({ ...defaultAppConfig(), version: 2 }).success).toBe(false);
+  });
+
+  it('accepts a loki sink with no usable labels -- ConfigStore.load() must stay tolerant', () => {
+    // This is the shape ConfigStore.load() parses config.json through. If it
+    // rejected a pre-existing loki sink with no usable labels, one bad sink
+    // in config.json would crash-loop the WHOLE container on restart,
+    // taking every other sink and drain down with it -- with no way back in
+    // through the (now-unreachable) admin UI to fix it. See
+    // appConfigWriteSchema below for the strict counterpart, applied only at
+    // the admin-write boundary, and LokiSink's constructor
+    // (src/sinks/loki.ts) for the safety net that isolates this sink
+    // instead of letting it silently dead-letter forever.
+    const config = {
+      ...defaultAppConfig(),
+      sinks: [lokiSink({ static: {}, fromFields: [] })],
+    };
+    expect(appConfigSchema.safeParse(config).success).toBe(true);
   });
 
   it('rejects duplicate sink names, and for that reason alone', () => {
@@ -216,6 +201,65 @@ describe('appConfigSchema', () => {
     if (result.success) return;
     expect(result.error.issues).toHaveLength(1);
     expect(result.error.issues[0]?.path.join('.')).toBe('drains.0.secret');
+  });
+});
+
+describe('appConfigWriteSchema', () => {
+  it('rejects a loki sink with no static labels and no fromFields, naming the sink and the fix', () => {
+    // Issue #9: labels: { static: {}, fromFields: [] } is schema-valid at
+    // the bare lokiSinkConfigSchema level (and at appConfigSchema, which
+    // load() uses -- see the tolerance test above) and resolves every
+    // event to `stream: {}`, which Loki answers with a permanent 400 that
+    // dead-letters the whole batch forever. This is the write boundary, so
+    // the rejection has to name the sink (an operator identifies sinks by
+    // name, not array index) and say what to do about it, not just that
+    // "the config" is invalid.
+    const result = appConfigWriteSchema.safeParse(
+      configWithLokiSink(lokiSink({ static: {}, fromFields: [] })),
+    );
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toHaveLength(1);
+    const message = result.error.issues[0]?.message ?? '';
+    expect(message).toContain('"loki-prod"');
+    expect(message).toMatch(/static/);
+    expect(message).toMatch(/fromFields/);
+  });
+
+  it('accepts a loki sink with only a static label', () => {
+    expect(
+      appConfigWriteSchema.safeParse(
+        configWithLokiSink(lokiSink({ static: { job: 'vercel' }, fromFields: [] })),
+      ).success,
+    ).toBe(true);
+  });
+
+  it('accepts a loki sink with only a fromFields entry', () => {
+    expect(
+      appConfigWriteSchema.safeParse(
+        configWithLokiSink(lokiSink({ static: {}, fromFields: ['environment'] })),
+      ).success,
+    ).toBe(true);
+  });
+
+  it('rejects a loki sink whose only static label has an empty value', () => {
+    // A key with a blank value is structurally "at least one entry" but
+    // resolveLabels (loki-payload.ts) skips empty-string values, so this
+    // would otherwise slip past a bare "at least one entry" check while
+    // still resolving to no label at all. hasNoUsableLabels looks at the
+    // values, not just the key count, so this is still rejected.
+    expect(
+      appConfigWriteSchema.safeParse(
+        configWithLokiSink(lokiSink({ static: { job: '' }, fromFields: [] })),
+      ).success,
+    ).toBe(false);
+  });
+
+  it('rejects a loki sink whose only fromFields entry is an empty string', () => {
+    expect(
+      appConfigWriteSchema.safeParse(configWithLokiSink(lokiSink({ static: {}, fromFields: [''] })))
+        .success,
+    ).toBe(false);
   });
 });
 

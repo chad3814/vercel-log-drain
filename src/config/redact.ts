@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appConfigSchema } from './schema.js';
+import { appConfigWriteSchema } from './schema.js';
 import type { AppConfig, DrainEntry, ServerConfig, SinkEntry } from './schema.js';
 import type { JsonValue } from '../../types/json.js';
 
@@ -49,7 +49,11 @@ export function redactConfig(config: AppConfig): RedactedConfig {
 
 // The incoming payload mirrors RedactedConfig but with secrets optionally
 // replaced by real strings, so it is validated loosely here and strictly by
-// appConfigSchema once secrets have been restored.
+// appConfigWriteSchema once secrets have been restored. appConfigWriteSchema,
+// not appConfigSchema: this is the PUT /api/admin/config write boundary, the
+// one place that can still afford to reject a loki sink with no usable
+// labels outright, rather than the load-time tolerance appConfigSchema
+// provides. See appConfigWriteSchema's doc comment in schema.ts.
 const incomingSchema = z.object({
   version: z.literal(1),
   drains: z.array(
@@ -103,7 +107,7 @@ export function restoreSecrets(incoming: JsonValue, current: AppConfig): AppConf
   });
 
   const candidate = { version: 1 as const, drains, sinks, server: parsed.data.server };
-  const validated = appConfigSchema.safeParse(candidate);
+  const validated = appConfigWriteSchema.safeParse(candidate);
   if (!validated.success) {
     throw new SecretRestoreError(`configuration is invalid:\n${z.prettifyError(validated.error)}`);
   }
