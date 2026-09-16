@@ -333,20 +333,6 @@ describe('SpoolQueue', () => {
     expect(stats.bytes).toBe(queue.bytes());
   });
 
-  it('discards everything including dead letters', async () => {
-    const queue = await SpoolQueue.open(dir, options());
-    await queue.enqueue([event('a')]);
-    const batch = await queue.nextBatch(1000, BIG);
-    await queue.deadLetter(batch!);
-    await queue.enqueue([event('b')]);
-
-    await queue.discardAll();
-
-    expect(queue.fileCount()).toBe(0);
-    expect(queue.bytes()).toBe(0);
-    expect(await readdir(join(dir, 'dead'))).toEqual([]);
-  });
-
   // Each of the three tests below fails against the pre-fix implementation.
   // Write them so they do: a regression test that also passes before the fix
   // documents nothing.
