@@ -110,10 +110,33 @@ describe('admin routes', () => {
     });
   }
 
+  /**
+   * Sends a literal, unencoded body -- unlike `put()`, which always
+   * `JSON.stringify`s its argument. Malformed and empty-body cases need the
+   * raw bytes on the wire, not a validly re-encoded string, so this is the
+   * only way to exercise the `c.req.json()` parse failure itself rather than
+   * the schema check one line after it.
+   */
+  async function putRaw(rawBody: string) {
+    return app().request('/api/admin/config', {
+      method: 'PUT',
+      body: rawBody,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
   function postDrain(name: string) {
     return app().request('/api/admin/drains', {
       method: 'POST',
       body: JSON.stringify({ name }),
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  async function postDrainRaw(rawBody: string) {
+    return app().request('/api/admin/drains', {
+      method: 'POST',
+      body: rawBody,
       headers: { 'content-type': 'application/json' },
     });
   }
@@ -137,6 +160,18 @@ describe('admin routes', () => {
     expect(after.config.drains[0]?.id).toBe(created.id);
     expect(after.config.drains[0]?.secret).toBeNull();
     expect(after.config.drains[0]?.hasSecret).toBe(true);
+  });
+
+  it('returns 400 for a malformed JSON drain-creation body instead of a 500', async () => {
+    const response = await postDrainRaw('{nope');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
+  });
+
+  it('returns 400 for an empty drain-creation body instead of a 500', async () => {
+    const response = await postDrainRaw('');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
   });
 
   it('applies a saved config and starts the sink', async () => {
@@ -261,6 +296,26 @@ describe('admin routes', () => {
       etag,
     });
     expect(response.status).toBe(400);
+    expect(current.sinks).toHaveLength(0);
+  });
+
+  it('returns 400 for a malformed JSON body instead of a 500', async () => {
+    // Issue #1: `c.req.json()` throws a SyntaxError from JSON.parse before
+    // the schema check ever runs, and that error used to reach Hono's
+    // default handler unhandled -- an unlogged 500. A truncated PUT from a
+    // flaky browser connection should read as a bad request, not a server
+    // fault, so this must match the shape the schema-failure path one line
+    // below already uses.
+    const response = await putRaw('{not json');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
+    expect(current.sinks).toHaveLength(0);
+  });
+
+  it('returns 400 for an empty PUT body instead of a 500', async () => {
+    const response = await putRaw('');
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'bad_request' });
     expect(current.sinks).toHaveLength(0);
   });
 
