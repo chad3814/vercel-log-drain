@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { resetSinks } from './reset.ts';
 
 /**
  * Regression test for a bug a human had to report, because nothing in this
@@ -13,6 +14,12 @@ import { expect, test } from '@playwright/test';
  * to whatever was typed last -- so typing "local-files" into a re-created
  * input produces "l", or "s", not the name anybody intended.
  */
+// Leftover sinks from another spec make every Name field and source
+// checkbox ambiguous, so isolation is a precondition here, not hygiene.
+test.beforeEach(async ({ request }) => {
+  await resetSinks(request);
+});
+
 test('typing a sink name keeps focus and keeps every character', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Sinks' }).click();

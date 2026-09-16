@@ -94,6 +94,54 @@ button.primary {
 .state-failed {
   color: #d13438;
 }
+/* The filter block. `label` is column-flex globally, so the checkbox group
+   needs its own row-flex wrapper, and `.check` has to override the global
+   label direction or every source would stack vertically. */
+.filters {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem 0.5rem;
+  margin: 0.75rem 0;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: end;
+}
+.filters legend {
+  font-size: 0.8rem;
+  opacity: 0.7;
+  padding: 0 0.35rem;
+}
+.filters > p {
+  flex-basis: 100%;
+  margin: 0.25rem 0 0;
+}
+.filters .group {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.filters .group legend {
+  font-size: 0.85rem;
+  opacity: 1;
+  padding: 0;
+}
+.checks {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 0.35rem 0;
+}
+label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
 .warn {
   border-left: 3px solid #b8860b;
   padding-left: 0.75rem;

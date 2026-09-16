@@ -224,8 +224,41 @@ Two sink types, configured on the **Sinks** tab or via
 `PUT /api/admin/config`. Every sink has its own spool directory under
 `/spool/<name>`, its own `maxSpoolBytes` budget, its own
 `maxBatchEvents`/`maxBatchBytes` (how much one delivery attempt carries), and
-an optional `filter` (minimum level, allowed sources/environments/project
-ids).
+an optional `filter`.
+
+### Filters
+
+Each sink has four independent filter criteria, all editable on the **Sinks**
+tab. An event is delivered to a sink only if it satisfies every criterion that
+is set:
+
+| Criterion        | Meaning                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------ |
+| **Min level**    | Delivers at that level or higher (`info` < `warning` < `error`)                      |
+| **Sources**      | Delivers only these `source` values: `build`, `lambda`, `static`, `edge`, `external` |
+| **Environments** | Delivers only these `environment` values, e.g. `production`, `preview`               |
+| **Project IDs**  | Delivers only these Vercel project ids                                               |
+
+A criterion left blank is not applied at all, so a sink with nothing set
+receives every event the drain accepts. The panel shows in words what the
+current filter admits, which is worth reading before saving — a filter is the
+one part of a sink that can be perfectly valid and still deliver nothing.
+
+Sources are checkboxes rather than a text box deliberately: a mistyped source
+is not a validation error, it is a filter that matches nothing, and the result
+would be a healthy-looking sink receiving no events with nothing to explain
+why.
+
+For the same reason, clearing a criterion **removes** it rather than storing
+an empty list. The two are not equivalent: an absent criterion is not applied,
+while an empty list is applied and admits nothing. `PUT /api/admin/config`
+accepts an empty list, so a hand-written config can still express "deliver
+nothing" — and if one arrives, the panel says so rather than looking like an
+unfiltered sink.
+
+A sink whose filter matches nothing is not an error and is not reported as
+one: deliveries are still accepted with `200`, and the events simply go to
+whichever other sinks match. That is the filter working as configured.
 
 ### File sink
 

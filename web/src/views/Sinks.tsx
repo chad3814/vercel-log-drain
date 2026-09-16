@@ -8,6 +8,7 @@ import type {
   LokiSinkConfigDto,
   RedactedConfigDto,
   SinkEntryDto,
+  SinkFilterDto,
 } from '@shared/api';
 
 const MIB = 1_048_576;
@@ -63,6 +64,75 @@ function newLokiSink(index: number): SinkEntryDto {
       timeoutMs: 10_000,
     },
   };
+}
+
+/**
+ * The `source` values Vercel actually sends (design spec section 2). Offered
+ * as checkboxes rather than a text box on purpose: a mistyped source is not a
+ * validation error, it is a filter that silently matches nothing, and the
+ * operator would see a healthy sink receiving no events with no indication
+ * why.
+ */
+const KNOWN_SOURCES = ['build', 'lambda', 'static', 'edge', 'external'] as const;
+
+/**
+ * Writes one of the list fields, OMITTING it when the list is empty rather
+ * than storing `[]`.
+ *
+ * That distinction is the entire reason this helper exists. `compileFilter`
+ * adds no check for an absent field, so the sink matches everything; for `[]`
+ * it adds a check against an empty Set, so the sink matches NOTHING. An
+ * operator who clears a box means "stop filtering on this", never "drop every
+ * event" -- and `sinkFilterSchema` accepts `[]`, so nothing downstream would
+ * have caught the difference.
+ */
+function withListField(
+  filter: SinkFilterDto,
+  field: 'sources' | 'environments' | 'projectIds',
+  values: string[],
+): SinkFilterDto {
+  const next: SinkFilterDto = { ...filter };
+  if (values.length === 0) {
+    delete next[field];
+    return next;
+  }
+  next[field] = values;
+  return next;
+}
+
+function parseList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+/**
+ * Plain-language description of what a filter admits, shown live under the
+ * controls. This is the real defence against the empty-list footgun: it is
+ * the one place an operator can see "matches nothing" before saving, and it
+ * also surfaces an empty list that arrived from a hand-edited config.json or
+ * a raw PUT, which the controls above cannot produce but the schema permits.
+ */
+function describeFilter(filter: SinkFilterDto): string {
+  const parts: string[] = [];
+  if (filter.minLevel !== undefined) parts.push(`level is ${filter.minLevel} or higher`);
+
+  const lists: [string, string[] | undefined][] = [
+    ['source', filter.sources],
+    ['environment', filter.environments],
+    ['project', filter.projectIds],
+  ];
+  for (const [label, values] of lists) {
+    if (values === undefined) continue;
+    if (values.length === 0) {
+      return `Matches nothing: the ${label} list is empty, so every event is filtered out.`;
+    }
+    parts.push(`${label} is one of ${values.join(', ')}`);
+  }
+
+  if (parts.length === 0) return 'Matches every event this drain receives.';
+  return `Matches when ${parts.join(', and ')}.`;
 }
 
 export function Sinks(): React.JSX.Element {
@@ -393,6 +463,94 @@ export function Sinks(): React.JSX.Element {
               />
             </label>
           </div>
+
+          <fieldset className="filters">
+            <legend>Filter</legend>
+
+            {/* A nested fieldset, NOT a label. A <label> must label exactly
+                one control, so wrapping five checkboxes in one made the
+                browser associate it with the first of them: that checkbox's
+                accessible name became "Sources build lambda static edge
+                external", which a screen reader would read out verbatim.
+                Caught by a Playwright selector matching two elements. */}
+            <fieldset className="group">
+              <legend>Sources</legend>
+              <span className="checks">
+                {KNOWN_SOURCES.map((source) => {
+                  const selected = sink.filter.sources ?? [];
+                  return (
+                    <label key={source} className="check">
+                      <input
+                        type="checkbox"
+                        checked={selected.includes(source)}
+                        onChange={(changed) => {
+                          const next = changed.target.checked
+                            ? [...selected, source]
+                            : selected.filter((item) => item !== source);
+                          update(index, {
+                            ...sink,
+                            // Keep the declared order rather than click order,
+                            // so the saved config does not churn its diff
+                            // depending on which box was ticked first.
+                            filter: withListField(
+                              sink.filter,
+                              'sources',
+                              KNOWN_SOURCES.filter((item) => next.includes(item)),
+                            ),
+                          });
+                        }}
+                      />
+                      {source}
+                    </label>
+                  );
+                })}
+              </span>
+            </fieldset>
+
+            <label>
+              Environments
+              <input
+                placeholder="production, preview — blank for any"
+                value={(sink.filter.environments ?? []).join(', ')}
+                onChange={(changed) =>
+                  update(index, {
+                    ...sink,
+                    filter: withListField(
+                      sink.filter,
+                      'environments',
+                      parseList(changed.target.value),
+                    ),
+                  })
+                }
+              />
+            </label>
+
+            <label>
+              Project IDs
+              <input
+                placeholder="blank for any"
+                value={(sink.filter.projectIds ?? []).join(', ')}
+                onChange={(changed) =>
+                  update(index, {
+                    ...sink,
+                    filter: withListField(
+                      sink.filter,
+                      'projectIds',
+                      parseList(changed.target.value),
+                    ),
+                  })
+                }
+              />
+            </label>
+
+            <p
+              className={
+                describeFilter(sink.filter).startsWith('Matches nothing') ? 'warn' : 'muted'
+              }
+            >
+              {describeFilter(sink.filter)}
+            </p>
+          </fieldset>
 
           {sink.config.type === 'file'
             ? renderFileFields(sink, index, sink.config)
