@@ -8,7 +8,7 @@ services:
     # that follows :latest can change version on any restart without anyone
     # choosing to. Bump this when you intend to upgrade; releases are listed
     # at https://github.com/chad3814/vercel-log-drain/releases
-    image: ghcr.io/chad3814/vercel-log-drain:1.0.0
+    image: ghcr.io/chad3814/vercel-log-drain:1.1.1
     # To run your own build instead, comment out `image:` above and use:
     #   build:
     #     context: .

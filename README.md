@@ -20,7 +20,7 @@ docker run -d --name vercel-log-drain -p 8080:8080 \
 
 The image is published to GHCR on each release and is publicly pullable, so
 no login or local build is needed. Every release is also tagged with its
-version — `ghcr.io/chad3814/vercel-log-drain:1.0.0` — and a real deployment
+version — `ghcr.io/chad3814/vercel-log-drain:1.1.1` — and a real deployment
 should pin one of those rather than tracking `:latest`, so that restarting a
 container cannot quietly change the version it runs. `linux/amd64` only.
 
