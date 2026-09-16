@@ -462,16 +462,4 @@ export class SpoolQueue {
       return null;
     }
   }
-
-  async discardAll(): Promise<void> {
-    for (const entry of this.entries) {
-      await unlink(join(this.dir, entry.name)).catch((error: unknown) => {
-        this.reportFsError('unlink during discardAll', entry.name, error);
-      });
-    }
-    this.entries = [];
-    this.totalBytes = 0;
-    await rm(join(this.dir, DEAD_DIR), { recursive: true, force: true });
-    await mkdir(join(this.dir, DEAD_DIR), { recursive: true });
-  }
 }
