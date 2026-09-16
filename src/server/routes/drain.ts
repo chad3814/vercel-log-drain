@@ -58,7 +58,13 @@ export function drainRoutes(deps: DrainDeps): Hono<AppEnv> {
     // decompression, no JSON parsing, until the caller has proven it holds
     // this drain's secret.
     const signature = c.req.header('x-vercel-signature');
-    if (signature === undefined) {
+    // A present-but-empty (or whitespace-only) header is indistinguishable
+    // from a missing one to whoever sent the request: nothing was proven
+    // either way. Spec 5, step 3 calls that case 401, not 403 -- 403 is
+    // reserved for a signature that was actually supplied and did not
+    // match, which is a distinct fact worth a distinct code in the
+    // Troubleshooting table.
+    if (signature === undefined || signature.trim().length === 0) {
       deps.metrics.recordDrainRequest(drain.id, 'badSignature');
       return c.json({ code: 'missing_signature' }, 401);
     }

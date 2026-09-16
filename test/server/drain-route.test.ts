@@ -175,6 +175,22 @@ describe('drain route', () => {
     expect(await spooledFiles()).toBe(0);
   });
 
+  it('rejects an empty signature header with 401, not 403', async () => {
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': '' });
+
+    expect(response.status).toBe(401);
+    expect(await spooledFiles()).toBe(0);
+  });
+
+  it('rejects a whitespace-only signature header with 401, not 403', async () => {
+    const body = JSON.stringify([event('a')]);
+    const response = await post('/api/drain/drain1', body, { 'x-vercel-signature': '   ' });
+
+    expect(response.status).toBe(401);
+    expect(await spooledFiles()).toBe(0);
+  });
+
   it('returns 413 from the declared content-length, before reading the body', async () => {
     // The other 413 test sends an oversized body, so it only ever exercises
     // the raw.byteLength fallback -- which runs after the whole body has been
