@@ -718,6 +718,45 @@ export class Dispatcher {
     return orphans;
   }
 
+  /**
+   * Removes every currently-orphaned spool directory that never held any
+   * data at all -- zero live files, zero dead-lettered files, zero bytes
+   * either way. Called from `PUT /config`'s rollback (see admin.ts) right
+   * after a losing, etag-conflicted request's reconcile is undone.
+   *
+   * The case this exists for: a losing PUT that renamed a sink has its own
+   * reconcile run (ordering means reconciliation cannot wait to find out
+   * which PUT will win the etag race), which briefly creates a spool
+   * directory for the new name via `startSink`'s `mkdir`. The rollback then
+   * reconciles back to the config actually on disk, which does not include
+   * that name, so the sink -- and the directory backing it -- is torn down
+   * again within the same request. Nothing was ever routed to it in that
+   * window (it was in `active` for one reconcile cycle, never a delivery),
+   * so it is permanently empty, and `reconcileNow` deliberately leaves a
+   * removed sink's directory on disk. Without this, it sits forever as an
+   * orphan that offers an operator a discard button for a directory that
+   * never held anything.
+   *
+   * Never removes a directory with anything in it -- live or dead-lettered
+   * -- because that is a real orphan with real data, which stays exactly
+   * what `discardOrphan` is for: an operator's decision, not this method's.
+   */
+  async pruneEmptyOrphans(): Promise<string[]> {
+    const orphans = await this.listOrphanedSpools();
+    const removed: string[] = [];
+    for (const orphan of orphans) {
+      const empty =
+        orphan.files === 0 &&
+        orphan.bytes === 0 &&
+        orphan.dead.files === 0 &&
+        orphan.dead.bytes === 0;
+      if (!empty) continue;
+      await rm(join(this.options.spoolRoot, orphan.name), { recursive: true, force: true });
+      removed.push(orphan.name);
+    }
+    return removed;
+  }
+
   async discardOrphan(name: string): Promise<void> {
     // Pattern-checked before the orphan-membership lookup, and unconditionally
     // -- not only when a matching directory happens to exist -- so a
