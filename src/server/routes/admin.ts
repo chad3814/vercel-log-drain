@@ -86,7 +86,17 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
   });
 
   app.put('/config', async (c) => {
-    const body = putBodySchema.safeParse(await c.req.json<JsonValue>());
+    let payload: JsonValue;
+    try {
+      payload = await c.req.json<JsonValue>();
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return c.json({ code: 'bad_request', error: error.message }, 400);
+      }
+      throw error;
+    }
+
+    const body = putBodySchema.safeParse(payload);
     if (!body.success) {
       return c.json({ code: 'bad_request', error: z.prettifyError(body.error) }, 400);
     }
@@ -134,7 +144,17 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
   });
 
   app.post('/drains', async (c) => {
-    const body = createDrainSchema.safeParse(await c.req.json<JsonValue>());
+    let payload: JsonValue;
+    try {
+      payload = await c.req.json<JsonValue>();
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        return c.json({ code: 'bad_request', error: error.message }, 400);
+      }
+      throw error;
+    }
+
+    const body = createDrainSchema.safeParse(payload);
     if (!body.success) {
       return c.json({ code: 'bad_request', error: z.prettifyError(body.error) }, 400);
     }
