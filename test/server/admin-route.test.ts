@@ -9,7 +9,7 @@ import { adminRoutes } from '../../src/server/routes/admin.js';
 import { ConfigStore, EtagMismatchError } from '../../src/config/store.js';
 import type { LoadedConfig } from '../../src/config/store.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
-import { SpoolQueue } from '../../src/pipeline/spool.js';
+import { readSpoolDirStats, SpoolQueue } from '../../src/pipeline/spool.js';
 import { Metrics } from '../../src/status/metrics.js';
 import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
 import type { AppEnv } from '../../src/server/types.js';
@@ -270,6 +270,82 @@ describe('admin routes', () => {
       const codes = [first.status, second.status].toSorted((a, b) => a - b);
       expect(codes).toEqual([200, 409]);
       expect(openSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it('a losing PUT that only touches an unrelated sink still churns it, but loses no data, and a losing rename leaves no phantom orphan', async () => {
+    // Pins the three things issue #6 asked to confirm or fix, in one race
+    // so the interleaving is the real one and not three separately staged
+    // approximations of it:
+    //
+    // 1. A losing PUT that never named "unrelated" in its own diff still
+    //    gets it torn down and reopened, because `Dispatcher.applyConfig`
+    //    reconciles in arrival order, not etag-win order, and the rollback
+    //    reconciles a second time. Pinned by counting `SpoolQueue.open`
+    //    calls for "unrelated" specifically.
+    // 2. Every event enqueued to "mover" before the race is still there
+    //    afterward -- the rollback reopens the same spool directory rather
+    //    than losing what was queued to it.
+    // 3. The losing PUT renames "mover" to "mover2"; that briefly creates
+    //    "mover2"'s spool directory, and the rollback undoes the rename
+    //    without deleting the now-empty directory itself (reconcileNow
+    //    deliberately leaves a removed sink's directory on disk). Without
+    //    `pruneEmptyOrphans` in admin.ts, "mover2" would sit forever in
+    //    `listOrphanedSpools` holding nothing. This asserts it is gone.
+    const baseline = { ...current, sinks: [fileSink('unrelated'), fileSink('mover')] };
+    const setupResponse = await put({ config: baseline, etag });
+    expect(setupResponse.status).toBe(200);
+    const raceEtag = etag;
+
+    await dispatcher.enqueue([{ id: 'queued-1', timestamp: 1, source: 'lambda', projectId: 'p' }]);
+    const moverDir = join(spoolRoot, 'mover');
+    const beforeMover = await readSpoolDirStats(moverDir);
+    expect(beforeMover.files).toBeGreaterThan(0);
+
+    const openSpy = vi.spyOn(SpoolQueue, 'open');
+    try {
+      // Winner: edits only "unrelated". Loser: leaves "unrelated" alone but
+      // renames "mover" -> "mover2".
+      const winner = {
+        ...current,
+        sinks: [{ ...fileSink('unrelated'), maxBatchEvents: 42 }, fileSink('mover')],
+      };
+      const loser = {
+        ...current,
+        sinks: [fileSink('unrelated'), fileSink('mover2')],
+      };
+
+      const [first, second] = await Promise.all([
+        put({ config: winner, etag: raceEtag }),
+        put({ config: loser, etag: raceEtag }),
+      ]);
+
+      const codes = [first.status, second.status].toSorted((a, b) => a - b);
+      expect(codes).toEqual([200, 409]);
+
+      // Effect 1: "unrelated" was reopened more than once, though neither
+      // PUT's own diff ever named it as the thing being changed.
+      const unrelatedDir = join(spoolRoot, 'unrelated');
+      const unrelatedOpens = openSpy.mock.calls.filter((call) => call[0] === unrelatedDir);
+      expect(unrelatedOpens.length).toBeGreaterThan(1);
+
+      // Effect 2 (survival, not a residual cost): the queued event is still
+      // on disk under "mover" -- the rollback did not drop it.
+      const afterMover = await readSpoolDirStats(moverDir);
+      expect(afterMover.files).toBe(beforeMover.files);
+      expect(afterMover.bytes).toBe(beforeMover.bytes);
+
+      // Effect 3, fixed: the phantom "mover2" directory the losing rename
+      // created does not linger as a permanent empty orphan.
+      const orphans = await dispatcher.listOrphanedSpools();
+      expect(orphans.find((orphan) => orphan.name === 'mover2')).toBeUndefined();
+      const mover2Exists = await stat(join(spoolRoot, 'mover2')).then(
+        () => true,
+        () => false,
+      );
+      expect(mover2Exists).toBe(false);
     } finally {
       openSpy.mockRestore();
     }

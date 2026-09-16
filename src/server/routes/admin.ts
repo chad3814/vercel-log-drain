@@ -115,6 +115,38 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
     // fail before anything is persisted. A schema-invalid or
     // path-escaping config must never reach disk, because a partially
     // applied config is worse than a rejected one.
+    //
+    // Do NOT "optimise" this by saving first and reconciling second, even
+    // though that would look like it removes the two costs below -- it
+    // would reintroduce the hazard this ordering exists to prevent, a bad
+    // config landing on disk. Those costs are accepted, not fixed, because
+    // reordering is worse:
+    //
+    // - `Dispatcher.applyConfig` reconciles in the order calls ARRIVE, not
+    //   the order the matching `store.save` calls land (see
+    //   `reconcileChain` on Dispatcher). So a losing PUT's own reconcile
+    //   can touch a sink it never asked to change, merely because the
+    //   winner's reconcile already changed that sink's entry and the
+    //   loser's (older) copy now reads as different; the rollback below
+    //   then touches that same sink AGAIN to restore the persisted state.
+    //   Measured: two concurrent PUTs, one touching only sink A, the other
+    //   only sink B, and sink B's `SpoolQueue.open` is called three times
+    //   before the request settles, even though neither PUT's own diff
+    //   ever named it.
+    // - If the losing PUT renamed a sink, that reconcile briefly creates a
+    //   spool directory for the new name (`startSink`'s `mkdir`) before the
+    //   rollback tears it down again. Measured: the directory survives as a
+    //   permanently empty orphan, because a removed sink's directory is
+    //   deliberately left on disk and nothing ever routed a delivery to a
+    //   sink that existed for one reconcile cycle. `pruneEmptyOrphans()`
+    //   below cleans up exactly that -- and only that: an orphan with zero
+    //   files, zero bytes, zero dead letters. A real orphan (any content at
+    //   all) is untouched and stays a `discardOrphan` decision.
+    //
+    // Queued data is never at risk from any of this: the rollback
+    // reconciles against the config that is actually on disk, which
+    // reopens the same spool directories every affected sink was already
+    // using, so nothing enqueued before or during the race is lost.
     try {
       await deps.dispatcher.applyConfig(candidate);
     } catch (error) {
@@ -126,12 +158,20 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
     try {
       saved = await deps.store.save(candidate, body.data.etag);
     } catch (error) {
+      // mapSaveError is shared with POST /drains, so the two routes cannot
+      // drift on which failure means what. It collapsed what used to be two
+      // rollback paths into one, so the orphan cleanup below is needed in
+      // only one place rather than two.
       const failure = mapSaveError(error);
       if (failure.code === 'save_failed') {
         deps.log.error({ err: failure.error }, 'failed to persist config');
       }
       // Roll the dispatcher back to the config that is actually persisted.
       await deps.dispatcher.applyConfig(deps.getConfig());
+      // See pruneEmptyOrphans' doc comment: cleans up an empty spool
+      // directory the losing reconcile above may have just created for a
+      // renamed sink. Never touches an orphan that holds any data.
+      await deps.dispatcher.pruneEmptyOrphans();
       return c.json({ code: failure.code, error: failure.error }, failure.status);
     }
 
