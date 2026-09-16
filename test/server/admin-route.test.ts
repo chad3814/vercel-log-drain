@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
 import { adminRoutes } from '../../src/server/routes/admin.js';
-import { ConfigStore } from '../../src/config/store.js';
+import { ConfigStore, EtagMismatchError } from '../../src/config/store.js';
 import type { LoadedConfig } from '../../src/config/store.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
 import { SpoolQueue } from '../../src/pipeline/spool.js';
@@ -110,6 +110,14 @@ describe('admin routes', () => {
     });
   }
 
+  function postDrain(name: string) {
+    return app().request('/api/admin/drains', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
   it('returns the redacted config with its etag', async () => {
     const response = await app().request('/api/admin/config');
     expect(response.status).toBe(200);
@@ -117,11 +125,7 @@ describe('admin routes', () => {
   });
 
   it('creates a drain and reveals the secret exactly once', async () => {
-    const response = await app().request('/api/admin/drains', {
-      method: 'POST',
-      body: JSON.stringify({ name: 'prod' }),
-      headers: { 'content-type': 'application/json' },
-    });
+    const response = await postDrain('prod');
     expect(response.status).toBe(201);
 
     const created = await jsonBody<{ id: string; secret: string }>(response);
@@ -364,6 +368,57 @@ describe('admin routes', () => {
 
       store = new FailingStore(new Error('permission denied'));
       expect((await put({ config: current, etag })).status).toBe(500);
+    } finally {
+      store = real;
+    }
+  });
+
+  it('returns 409 on a stale etag when creating a drain', async () => {
+    // Unlike PUT /config, POST /drains never takes an etag in its request
+    // body -- it always reads the live `deps.getEtag()` -- so a client can
+    // never send a stale one. The conflict path is still reachable, though:
+    // `config.json` can change on disk between boot and this request (a
+    // second process, a manual edit), which is exactly what a rejected
+    // `EtagMismatchError` from `store.save` models. Same store-swapping
+    // technique as the 507-vs-500 test below.
+    class FailingStore extends ConfigStore {
+      constructor() {
+        super(configDir);
+      }
+      override save(): Promise<LoadedConfig> {
+        return Promise.reject(new EtagMismatchError('etag mismatch'));
+      }
+    }
+
+    const real = store;
+    try {
+      store = new FailingStore();
+      const response = await postDrain('prod');
+      expect(response.status).toBe(409);
+    } finally {
+      store = real;
+    }
+  });
+
+  it('answers 507 only when the config volume is full, and 500 otherwise, when creating a drain', async () => {
+    class FailingStore extends ConfigStore {
+      constructor(private readonly failure: Error) {
+        super(configDir);
+      }
+      override save(): Promise<LoadedConfig> {
+        return Promise.reject(this.failure);
+      }
+    }
+
+    const real = store;
+    try {
+      store = new FailingStore(
+        Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }),
+      );
+      expect((await postDrain('prod')).status).toBe(507);
+
+      store = new FailingStore(new Error('permission denied'));
+      expect((await postDrain('prod')).status).toBe(500);
     } finally {
       store = real;
     }

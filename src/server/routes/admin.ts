@@ -34,6 +34,28 @@ function warningsForConfig(config: AppConfig): string[] {
   );
 }
 
+type SaveFailure =
+  | { code: 'conflict'; error: string; status: 409 }
+  | { code: 'save_failed'; error: string; status: 500 | 507 };
+
+/**
+ * Maps a `ConfigStore.save` rejection onto the two failure shapes the spec
+ * distinguishes. Shared by every route that calls `store.save`, so a fix or
+ * a new case only has to happen once.
+ */
+function mapSaveError(error: unknown): SaveFailure {
+  if (error instanceof EtagMismatchError) {
+    return { code: 'conflict', error: error.message, status: 409 };
+  }
+  const failure = error instanceof Error ? error : new Error(String(error));
+  // The spec reserves 507 for one case: a full config volume. Everything
+  // else -- a permission change, a failed rename, an unexpected throw -- is
+  // a plain 500. Answering 507 for those sends an operator to go free disk
+  // space that was never the problem.
+  const status: 500 | 507 = 'code' in failure && failure.code === 'ENOSPC' ? 507 : 500;
+  return { code: 'save_failed', error: failure.message, status };
+}
+
 /**
  * Admin API. Handles secrets, so the one rule that matters everywhere in
  * this file is: every response that carries a config is built with
@@ -94,20 +116,13 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
     try {
       saved = await deps.store.save(candidate, body.data.etag);
     } catch (error) {
-      if (error instanceof EtagMismatchError) {
-        // Roll the dispatcher back to the config that is actually persisted.
-        await deps.dispatcher.applyConfig(deps.getConfig());
-        return c.json({ code: 'conflict', error: error.message }, 409);
+      const failure = mapSaveError(error);
+      if (failure.code === 'save_failed') {
+        deps.log.error({ err: failure.error }, 'failed to persist config');
       }
-      const failure = error instanceof Error ? error : new Error(String(error));
-      deps.log.error({ err: failure.message }, 'failed to persist config');
+      // Roll the dispatcher back to the config that is actually persisted.
       await deps.dispatcher.applyConfig(deps.getConfig());
-      // The spec reserves 507 for one case: a full config volume. Everything
-      // else -- a permission change, a failed rename, an unexpected throw --
-      // is a plain 500. Answering 507 for those sends an operator to go free
-      // disk space that was never the problem.
-      const status: 500 | 507 = 'code' in failure && failure.code === 'ENOSPC' ? 507 : 500;
-      return c.json({ code: 'save_failed', error: failure.message }, status);
+      return c.json({ code: failure.code, error: failure.error }, failure.status);
     }
 
     deps.setConfig(saved.config, saved.etag);
@@ -135,7 +150,19 @@ export function adminRoutes(deps: AdminDeps): Hono<AppEnv> {
     const current = deps.getConfig();
     const next: AppConfig = { ...current, drains: [...current.drains, drain] };
 
-    const saved = await deps.store.save(next, deps.getEtag());
+    let saved;
+    try {
+      saved = await deps.store.save(next, deps.getEtag());
+    } catch (error) {
+      const failure = mapSaveError(error);
+      if (failure.code === 'save_failed') {
+        deps.log.error({ err: failure.error }, 'failed to persist config');
+      }
+      // Unlike PUT /config, this route never called dispatcher.applyConfig
+      // -- drains do not feed the dispatcher -- so there is no speculative
+      // dispatcher state to roll back here.
+      return c.json({ code: failure.code, error: failure.error }, failure.status);
+    }
     deps.setConfig(saved.config, saved.etag);
 
     // The only time a secret is ever returned by the API.
