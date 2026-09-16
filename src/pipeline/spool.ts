@@ -31,23 +31,49 @@ export type SpoolOptions = {
 };
 
 export type SpoolBatch = { files: string[]; events: LogEvent[]; bytes: number };
+/**
+ * A batch that WAS written. `droppedEvents` counts what a drop-oldest
+ * overflow eviction reclaimed to fit it inside this sink's `maxSpoolBytes`.
+ *
+ * There is no field for the free-space floor: a volume below its floor
+ * refuses, and `enqueue` throws `SpoolFloorError` rather than returning. An
+ * earlier version reported it here as a `floorDrop` the caller could ignore,
+ * and the caller carried on to answer Vercel 200 for events that reached no
+ * disk anywhere.
+ */
 export type EnqueueResult = {
   writtenBytes: number;
   droppedEvents: number;
-  /**
-   * Non-null only when the WHOLE batch was discarded because the spool volume
-   * sits below its free-space floor -- the single loss point the design allows
-   * (spec §4), and the one the caller must report as `degraded`.
-   *
-   * Deliberately distinct from a drop-oldest overflow eviction, which also
-   * moves `droppedEvents` but is a budgeted trade inside one sink that still
-   * commits the incoming batch. Collapsing the two into one number is what
-   * made the floor drop invisible: `counters.dropped` climbed for both, so no
-   * caller could tell "this sink is over its budget" from "nothing is
-   * reaching disk at all".
-   */
-  floorDrop: { freeBytes: number; floorBytes: number } | null;
 };
+
+/**
+ * The spool volume sits below its free-space floor, so `enqueue` wrote
+ * NOTHING and the caller must refuse the delivery (spec §4).
+ *
+ * Backpressure, not shedding. Vercel redelivers on a 500, which is what makes
+ * refusing safe, and it is what makes "no acknowledged delivery is ever lost"
+ * hold without qualification: the service never acknowledges what it could
+ * not store. The accepted cost is that a full volume stops ingest for every
+ * sink, including healthy ones -- no sink can free a volume that some other
+ * sink, or something outside this service entirely, has filled.
+ *
+ * Deliberately NOT how a drop-oldest overflow eviction is reported. That is a
+ * budgeted trade inside one sink that still commits the incoming batch, so it
+ * stays a `droppedEvents` count on a successful `EnqueueResult`. Only a full
+ * volume refuses.
+ */
+export class SpoolFloorError extends Error {
+  constructor(
+    readonly freeBytes: number,
+    readonly floorBytes: number,
+  ) {
+    super(
+      'spool volume is below its free-space floor ' +
+        `(${String(freeBytes)} B free, floor ${String(floorBytes)} B)`,
+    );
+    this.name = 'SpoolFloorError';
+  }
+}
 
 type Entry = { name: string; bytes: number };
 
@@ -214,16 +240,16 @@ export class SpoolQueue {
   }
 
   async enqueue(events: LogEvent[]): Promise<EnqueueResult> {
-    if (events.length === 0) return { writtenBytes: 0, droppedEvents: 0, floorDrop: null };
+    if (events.length === 0) return { writtenBytes: 0, droppedEvents: 0 };
 
+    // Throws rather than returning a "nothing was written" result: the caller
+    // has to fail the delivery so Vercel redelivers, and a result it is free
+    // to ignore is exactly how this condition came to answer 200 for events
+    // that reached no disk anywhere. See SpoolFloorError.
     if (this.options.freeSpaceFloorBytes > 0) {
       const available = await this.freeSpace(this.dir);
       if (available < this.options.freeSpaceFloorBytes) {
-        return {
-          writtenBytes: 0,
-          droppedEvents: events.length,
-          floorDrop: { freeBytes: available, floorBytes: this.options.freeSpaceFloorBytes },
-        };
+        throw new SpoolFloorError(available, this.options.freeSpaceFloorBytes);
       }
     }
 
@@ -272,7 +298,7 @@ export class SpoolQueue {
 
     this.entries.push({ name, bytes: payload.byteLength });
     this.totalBytes += payload.byteLength;
-    return { writtenBytes: payload.byteLength, droppedEvents, floorDrop: null };
+    return { writtenBytes: payload.byteLength, droppedEvents };
   }
 
   private async makeRoom(incoming: number): Promise<number> {

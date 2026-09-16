@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
-import { Dispatcher } from '../../src/pipeline/dispatcher.js';
-import { SpoolQueue } from '../../src/pipeline/spool.js';
+import { Dispatcher, NoEnabledSinkError } from '../../src/pipeline/dispatcher.js';
+import { SpoolFloorError, SpoolQueue } from '../../src/pipeline/spool.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
 import { Metrics } from '../../src/status/metrics.js';
 import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
@@ -87,10 +87,16 @@ describe('Dispatcher', () => {
   });
 
   it('does not enqueue to a disabled sink', async () => {
-    await dispatcher.applyConfig(configWith([fileSink('off', { enabled: false })]));
+    // Paired with an ENABLED sink deliberately. A disabled sink on its own
+    // leaves zero enabled sinks, which `enqueue` now refuses outright, and
+    // the refusal would satisfy "nothing in the disabled sink's spool" for
+    // the wrong reason -- covering the zero-sink guard twice and the
+    // per-sink `enabled` check not at all.
+    await dispatcher.applyConfig(configWith([fileSink('off', { enabled: false }), fileSink('on')]));
     await dispatcher.enqueue([event('a')]);
     const statuses = await dispatcher.snapshotSinks();
     expect(statuses.find((s) => s.name === 'off')?.queue.files).toBe(0);
+    expect(statuses.find((s) => s.name === 'on')?.queue.files).toBe(1);
   });
 
   it('preserves the spool when a sink is removed, and reports it as orphaned', async () => {
@@ -366,7 +372,11 @@ describe('Dispatcher', () => {
     await pending;
 
     const before = await batchCount();
-    await dispatcher.enqueue([event('a')]);
+    // The reconcile was skipped, so there is no config and no enabled sink,
+    // and `enqueue` now refuses rather than accepting into nothing. Both
+    // halves matter: a resurrected worker would make this RESOLVE (the
+    // config having been applied after all) and push the batch count up.
+    await expect(dispatcher.enqueue([event('a')])).rejects.toThrow(NoEnabledSinkError);
     expect(await batchCount()).toBe(before);
   });
 
@@ -386,7 +396,11 @@ describe('Dispatcher', () => {
     await dispatcher.applyConfig(configWith([fileSink('too-late')]));
 
     const before = await batchCount();
-    await dispatcher.enqueue([event('a')]);
+    // The reconcile was skipped, so there is no config and no enabled sink,
+    // and `enqueue` now refuses rather than accepting into nothing. Both
+    // halves matter: a resurrected worker would make this RESOLVE (the
+    // config having been applied after all) and push the batch count up.
+    await expect(dispatcher.enqueue([event('a')])).rejects.toThrow(NoEnabledSinkError);
     expect(await batchCount()).toBe(before);
   });
 
@@ -518,7 +532,10 @@ describe('Dispatcher', () => {
     config.server.spoolFreeSpaceFloorBytes = 1_000_000;
 
     await floored.applyConfig(config);
-    await floored.enqueue([event('a')]);
+    // Rejecting is the observable: with the floor silently at 0 the probe is
+    // never consulted, the enqueue SUCCEEDS, and both of these flip -- the
+    // rejection to a resolve and the file count to 1.
+    await expect(floored.enqueue([event('a')])).rejects.toThrow(SpoolFloorError);
 
     const statuses = await floored.snapshotSinks();
     expect(statuses.find((s) => s.name === 'floor-test')?.queue.files).toBe(0);
@@ -526,13 +543,15 @@ describe('Dispatcher', () => {
     await floored.stop(500);
   });
 
-  it('reports degraded and records an error when the spool floor drops a batch', async () => {
-    // The Critical this fix exists for: with the floor above actual free
-    // space the batch is discarded, the drain route has already answered
-    // 200, and before this every surface an operator reads said `ok` --
-    // service.state, sink health, /readyz and recent.errors alike, with only
-    // counters.dropped moving. Assert all three of the signals that must now
-    // move, since the drop counter alone was never enough to notice.
+  it('refuses the delivery and reports it when the spool volume is below its floor', async () => {
+    // The backpressure decision (spec §4), from the dispatcher's side. Two
+    // things must both hold: the error reaches the caller, so the route can
+    // answer 500 and Vercel redelivers; AND the condition is recorded before
+    // it leaves, because the status page's whole view of a full volume is
+    // built from what an enqueue observed. Recording without propagating was
+    // the old behaviour (200 over a batch stored nowhere); propagating
+    // without recording would leave /readyz 200 and `recent.errors` empty
+    // while every delivery was refused.
     const floored = new Dispatcher({
       spoolRoot,
       logsRoot,
@@ -547,14 +566,23 @@ describe('Dispatcher', () => {
       await floored.applyConfig(config);
       expect(floored.isDegraded()).toBe(false);
 
-      await floored.enqueue([event('a'), event('b')]);
+      const failure = await floored.enqueue([event('a'), event('b')]).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(SpoolFloorError);
 
       // Nothing reached disk, and the service says so.
       expect((await floored.snapshotSinks()).find((s) => s.name === 'floored')?.queue.files).toBe(
         0,
       );
       expect(floored.isDegraded()).toBe(true);
-      expect(metrics.snapshot().sinkCounters['floored']?.dropped).toBe(2);
+      expect(floored.spoolBelowFloor()).toBe(true);
+      // Nothing was DROPPED: the delivery was refused, and Vercel still has
+      // it. That counter means "shed inside a sink's byte budget", and it
+      // used to move for both conditions, which is what made them
+      // indistinguishable.
+      expect(metrics.snapshot().sinkCounters['floored']?.dropped ?? 0).toBe(0);
       const errors = metrics.snapshot().recent.errors;
       expect(errors).toHaveLength(1);
       expect(errors[0]?.scope).toBe('floored');
@@ -583,7 +611,7 @@ describe('Dispatcher', () => {
 
     try {
       await flapping.applyConfig(config);
-      await flapping.enqueue([event('a')]);
+      await expect(flapping.enqueue([event('a')])).rejects.toThrow(SpoolFloorError);
       expect(flapping.isDegraded()).toBe(true);
 
       freeBytes = 50_000_000;
@@ -620,7 +648,7 @@ describe('Dispatcher', () => {
 
     try {
       await floored.applyConfig(config);
-      await floored.enqueue([event('a')]);
+      await expect(floored.enqueue([event('a')])).rejects.toThrow(SpoolFloorError);
       expect(floored.isDegraded()).toBe(true);
       expect(floored.spoolBelowFloor()).toBe(true);
 
@@ -668,7 +696,7 @@ describe('Dispatcher', () => {
 
     try {
       await floored.applyConfig(config);
-      await floored.enqueue([event('a')]);
+      await expect(floored.enqueue([event('a')])).rejects.toThrow(SpoolFloorError);
       expect(floored.spoolBelowFloor()).toBe(true);
 
       const next = configWith(nextSinks());
@@ -695,14 +723,79 @@ describe('Dispatcher', () => {
     expect(dispatcher.isDegraded()).toBe(true);
   });
 
-  it('records an error when a delivery arrives with nowhere to store it', async () => {
-    await dispatcher.applyConfig(configWith([]));
-    await dispatcher.enqueue([event('a'), event('b')]);
+  it.each([
+    ['no sink is configured', (): SinkEntry[] => []],
+    ['the only sink is disabled', (): SinkEntry[] => [fileSink('off', { enabled: false })]],
+  ])('refuses a delivery when %s, and records it', async (_label, sinks) => {
+    // Nothing can ever store this batch, so acknowledging it is silent loss
+    // (spec §4). It used to log and return, which answered 200. Refusing
+    // keeps the events at Vercel, which retries, while an operator enables a
+    // sink -- and the recorded error is still the thing that tells them to.
+    //
+    // Both shapes, because spec §8.3 treats "removed" and "disabled" alike
+    // as "stop enqueuing" and only the second one leaves a sink entry behind
+    // for the count to get wrong.
+    await dispatcher.applyConfig(configWith(sinks()));
+
+    await expect(dispatcher.enqueue([event('a'), event('b')])).rejects.toThrow(NoEnabledSinkError);
 
     const errors = metrics.snapshot().recent.errors;
     expect(errors).toHaveLength(1);
     expect(errors[0]?.scope).toBe('ingest');
     expect(errors[0]?.message).toContain('no sink is enabled');
+  });
+
+  it('still accepts a delivery that no sink filter matches', async () => {
+    // The distinction backpressure must not blur. A sink exists and can
+    // store events; this delivery simply contains none it wants, which is
+    // the operator's INTENT expressed as a filter. Refusing it would make
+    // Vercel redeliver forever -- the same events would match nothing on
+    // every retry -- so only "no enabled sink at all", above, refuses.
+    await dispatcher.applyConfig(
+      configWith([fileSink('errors-only', { filter: { minLevel: 'error' } })]),
+    );
+
+    await expect(dispatcher.enqueue([event('a', { level: 'info' })])).resolves.toBeUndefined();
+
+    expect((await dispatcher.snapshotSinks())[0]?.queue.files).toBe(0);
+    expect(metrics.snapshot().recent.errors).toHaveLength(0);
+    expect(dispatcher.isDegraded()).toBe(false);
+  });
+
+  it('refuses the whole delivery when one of several sinks is below the floor', async () => {
+    // Partial fan-out, and it is ACCEPTED rather than worked around. The
+    // spools are written one sink at a time, so 'takes-it' commits before
+    // 'refuses-it' is even probed: this throws with the batch already on
+    // disk for the first sink, the route answers 500, and Vercel's
+    // redelivery hands 'takes-it' a duplicate. That is the at-least-once
+    // trade the design already makes (spec §5) -- a duplicate is
+    // recoverable, loss is not. The wrong "fix" is to swallow the error and
+    // answer 200, which trades a duplicate in one sink for silent loss in
+    // the other.
+    const mixed = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      // The probe is called with the sink's own spool directory, which is
+      // what lets one volume look full and the other not.
+      freeSpace: (path: string) => Promise.resolve(path.endsWith('refuses-it') ? 0 : 50_000_000),
+    });
+    const config = configWith([fileSink('takes-it'), fileSink('refuses-it')]);
+    config.server.spoolFreeSpaceFloorBytes = 1_000_000;
+
+    try {
+      await mixed.applyConfig(config);
+
+      await expect(mixed.enqueue([event('a')])).rejects.toThrow(SpoolFloorError);
+
+      const statuses = await mixed.snapshotSinks();
+      expect(statuses.find((s) => s.name === 'takes-it')?.queue.files).toBe(1);
+      expect(statuses.find((s) => s.name === 'refuses-it')?.queue.files).toBe(0);
+      expect(mixed.spoolBelowFloor()).toBe(true);
+    } finally {
+      await mixed.stop(500);
+    }
   });
 
   it('waits for an in-flight delivery to finish before removing a sink', async () => {

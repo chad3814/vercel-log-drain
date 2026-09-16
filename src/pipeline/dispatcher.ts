@@ -1,14 +1,14 @@
 import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { compileFilter } from './filter.js';
-import { readSpoolDirStats, SpoolQueue } from './spool.js';
+import { readSpoolDirStats, SpoolFloorError, SpoolQueue } from './spool.js';
 import { createSink } from '../sinks/registry.js';
 import { resolveLogsDirectory } from '../sinks/file.js';
 import { SINK_NAME_PATTERN } from '../config/schema.js';
 import { EscalatingDeliveryError, PermanentDeliveryError } from '../sinks/types.js';
 import { initialSinkHealth } from '../status/metrics.js';
 import type { AppConfig, SinkEntry } from '../config/schema.js';
-import type { DeadStats } from './spool.js';
+import type { DeadStats, EnqueueResult } from './spool.js';
 import type { EventPredicate } from './filter.js';
 import type { Logger } from '../log.js';
 import type { Metrics } from '../status/metrics.js';
@@ -279,6 +279,23 @@ export class InvalidSinkNameError extends Error {
   }
 }
 
+/**
+ * A delivery arrived and no sink is enabled to store it, so it is refused
+ * rather than acknowledged.
+ *
+ * Same reasoning as `SpoolFloorError`, one step earlier: nothing can ever
+ * store this batch, and answering 200 for it is silent loss. Refusing makes
+ * Vercel hold the events and redeliver while an operator enables a sink.
+ * Distinct from a filter matching nothing, which is the operator's intent and
+ * is still acknowledged.
+ */
+export class NoEnabledSinkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoEnabledSinkError';
+  }
+}
+
 export type DispatcherOptions = {
   spoolRoot: string;
   logsRoot: string;
@@ -331,7 +348,7 @@ export class Dispatcher {
   /** Set by `stop()`; makes any later or still-queued reconcile a no-op. */
   private stopped = false;
   /**
-   * Sinks whose last enqueue was discarded because the spool volume is below
+   * Sinks whose last enqueue was REFUSED because the spool volume is below
    * `spoolFreeSpaceFloorBytes`. Held here rather than in sink HEALTH, which
    * describes delivery: a sink at the floor may be delivering perfectly, and
    * conflating the two would report "the sink is broken" for a problem that
@@ -404,14 +421,17 @@ export class Dispatcher {
       // The floor latch survives a RECONFIGURE, and must. Recreating a sink
       // against the same spool directory (spec §8.3, "settings changed")
       // does not empty a full volume, and clearing it here reported
-      // `service.state: ok` and /readyz 200 over active data loss --
-      // measured: drop, /readyz 503, then an ordinary PUT changing one
+      // `service.state: ok` and /readyz 200 over a volume that was still
+      // refusing every delivery -- measured: refusal, /readyz 503, then an
+      // ordinary PUT changing one
       // setting, and the page went green with the volume still full. Nothing
       // re-checks until the next enqueue, so on a quiet drain that reads
       // green for hours and a load balancer returns the instance to
       // rotation on it. Worse, it happens while the operator is doing
       // exactly the right thing: they saw `degraded` and went to lower
-      // maxSpoolBytes or disable the noisy sink.
+      // maxSpoolBytes or disable the noisy sink. Now that a full volume
+      // refuses ingest outright, a false green is worse still: it says the
+      // service is taking traffic it is in fact answering 500 for.
       //
       // It is cleared only when this sink stops being an enqueue
       // destination -- removed, or disabled, which §8.3 treats together as
@@ -520,71 +540,108 @@ export class Dispatcher {
     if (this.started) worker.start();
   }
 
+  /**
+   * Spool a delivery to every sink whose filter matches it.
+   *
+   * Throws if the delivery could not be stored, and the caller must fail the
+   * request on that: the drain route answers 500 and Vercel redelivers. This
+   * is what makes "no acknowledged delivery is ever lost" hold without
+   * qualification, and it is the whole of the backpressure decision recorded
+   * in spec §4.
+   *
+   * The fan-out is sequential and NOT atomic. If sink A commits and sink B
+   * then refuses, this throws with A's copy already on disk, and the
+   * redelivery gives A a duplicate. That is correct and accepted: delivery is
+   * at-least-once by design (spec §5), a duplicate is recoverable and loss is
+   * not, and Loki collapses identical entries anyway. Do NOT "fix" it by
+   * catching here and answering 200 -- that trades a duplicate in A for
+   * silent loss in B, which is the behaviour this replaced.
+   */
   async enqueue(events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
 
-    // Nowhere to put them. The drain route has already decided to answer 200
-    // by the time this resolves, so the events are gone: say so, loudly,
-    // rather than letting the status page report `ok` for a service that can
-    // deliver to nothing. `isDegraded()` reports this state independently of
-    // whether any delivery has arrived, so a first-boot deployment with no
-    // sink yet is visible before the first batch is lost rather than after.
+    // Nowhere to put them, and no redelivery of THIS batch can change that --
+    // but refusing it keeps the events at Vercel, which retries, instead of
+    // acknowledging them into nothing. This used to log and return, so the
+    // route answered 200 and the batch was stored nowhere. `isDegraded()`
+    // reports the state independently of whether a delivery has arrived, so a
+    // first-boot deployment with no sink yet is visible before the first
+    // refusal rather than after.
     if (this.enabledSinkCount() === 0) {
-      const message = `${String(events.length)} events were accepted but no sink is enabled to store them`;
+      const message = `${String(events.length)} events were refused because no sink is enabled to store them`;
       this.options.metrics.recordError('ingest', message);
       this.options.log.error({ events: events.length }, message);
-      return;
+      throw new NoEnabledSinkError(message);
     }
 
     for (const active of this.active.values()) {
       if (!active.entry.enabled) continue;
+      // No event matching this sink's filter is the operator's INTENT, not a
+      // failure: the sink is skipped and the delivery is still acknowledged.
+      // Only "no enabled sink at all", above, refuses.
       const matching = events.filter((event) => active.predicate(event));
       if (matching.length === 0) continue;
-      const result = await active.queue.enqueue(matching);
-      if (result.droppedEvents > 0) {
-        this.options.metrics.recordDropped(active.entry.name, result.droppedEvents);
-      }
-      if (result.floorDrop === null) {
-        // A write got through, so whatever the volume looked like last time,
-        // it is not refusing this sink now. Cleared in both directions on
-        // purpose: a latch that only ever sets leaves the service reporting
-        // `degraded` for the rest of the process's life after one transient
-        // dip below the floor.
-        this.belowFloor.delete(active.entry.name);
-        if (result.droppedEvents > 0) {
-          this.options.log.warn(
-            { sink: active.entry.name, dropped: result.droppedEvents },
-            'spool overflow dropped oldest batches',
-          );
-        }
-        continue;
+
+      let result: EnqueueResult;
+      try {
+        result = await active.queue.enqueue(matching);
+      } catch (error) {
+        // Record before propagating. The status page's view of a full volume
+        // is built entirely from what an enqueue observed, so losing these
+        // three lines would leave /readyz 200 and `recent.errors` empty while
+        // every delivery was being refused.
+        if (error instanceof SpoolFloorError) this.noteBelowFloor(active.entry.name, error);
+        throw error;
       }
 
-      // The design's one permitted loss point (spec §4), and the only place
-      // where a delivery this service has ALREADY acknowledged with 200 is
-      // discarded. Three separate surfaces have to move, because an operator
-      // reading any one of them must see it: `degraded` (and therefore
-      // /readyz 503, spec §10), a recent-errors entry on the status page, and
-      // the dropped counter. Recorded per drop rather than per transition:
-      // each one is an independent, irreversible loss, and while this
-      // condition holds it deserves to crowd the error ring -- there is no
-      // worse state for this service to be in.
-      this.belowFloor.add(active.entry.name);
-      const message =
-        `spool volume is below its free-space floor ` +
-        `(${String(result.floorDrop.freeBytes)} B free, floor ${String(result.floorDrop.floorBytes)} B): ` +
-        `dropped ${String(result.droppedEvents)} already-acknowledged events`;
-      this.options.metrics.recordError(active.entry.name, message);
-      this.options.log.error(
-        {
-          sink: active.entry.name,
-          dropped: result.droppedEvents,
-          freeBytes: result.floorDrop.freeBytes,
-          floorBytes: result.floorDrop.floorBytes,
-        },
-        message,
-      );
+      // A write got through, so whatever the volume looked like last time, it
+      // is not refusing this sink now. Cleared in both directions on purpose:
+      // a latch that only ever sets leaves the service reporting `degraded`
+      // for the rest of the process's life after one transient dip below the
+      // floor.
+      this.belowFloor.delete(active.entry.name);
+      if (result.droppedEvents > 0) {
+        // Drop-oldest inside this sink's `maxSpoolBytes`, which is a bounded
+        // buffer doing its job and NOT the volume-level condition above: the
+        // incoming batch was committed. Deliberately still shedding here --
+        // only the volume free-space floor applies backpressure.
+        this.options.metrics.recordDropped(active.entry.name, result.droppedEvents);
+        this.options.log.warn(
+          { sink: active.entry.name, dropped: result.droppedEvents },
+          'spool overflow dropped oldest batches',
+        );
+      }
     }
+  }
+
+  /**
+   * Everything an operator reads about a refused delivery, recorded before the
+   * error leaves `enqueue`.
+   *
+   * Three surfaces have to move, because an operator reading any one of them
+   * must see it: the floor latch (so `degraded`, and therefore /readyz 503,
+   * spec §10), a `recent.errors` entry naming the sink and the bytes free, and
+   * the log line. Scoped to the SINK rather than to `ingest` -- the drain
+   * route records an `ingest` entry of its own for the refusal, and the useful
+   * thing this one adds is which sink's volume it was.
+   *
+   * Recorded per refusal rather than per transition: while this condition
+   * holds it deserves to crowd the error ring, because the service is
+   * answering 500 to everything Vercel sends and there is no worse state for
+   * it to be in.
+   *
+   * `counters.dropped` deliberately does NOT move: nothing was dropped. That
+   * counter means "shed inside a sink's byte budget", and letting a refusal
+   * move it too is what made the two indistinguishable before.
+   */
+  private noteBelowFloor(sink: string, error: SpoolFloorError): void {
+    this.belowFloor.add(sink);
+    const message = `${error.message}: refusing the delivery so Vercel redelivers it`;
+    this.options.metrics.recordError(sink, message);
+    this.options.log.error(
+      { sink, freeBytes: error.freeBytes, floorBytes: error.floorBytes },
+      message,
+    );
   }
 
   private enabledSinkCount(): number {
@@ -768,7 +825,7 @@ export class Dispatcher {
 
   /**
    * Whether the spool volume is refusing writes for at least one sink, so
-   * acknowledged deliveries are being discarded (spec §4).
+   * deliveries are being answered 500 rather than stored (spec §4).
    *
    * Exposed separately from `isDegraded()` because this is the ONLY condition
    * `/readyz` may report: spec §10, "readiness must not gate the surface that
@@ -788,9 +845,9 @@ export class Dispatcher {
 
   isDegraded(): boolean {
     // A service with nowhere to put a delivery is not healthy, whatever the
-    // per-sink health says: the drain route answers 200 and the events are
-    // stored nowhere. This also covers the never-configured dispatcher, and
-    // the first-boot window where a drain exists before any sink does.
+    // per-sink health says: every delivery is refused with a 500. This also
+    // covers the never-configured dispatcher, and the first-boot window where
+    // a drain exists before any sink does.
     //
     // Reported on the status page, NOT by /readyz -- see spoolBelowFloor().
     if (this.enabledSinkCount() === 0) return true;

@@ -341,23 +341,32 @@ describe('end-to-end durability', () => {
     }
   });
 
-  it('reports a spool-floor drop on every status surface, not just the drop counter', async () => {
-    // The design's one permitted loss point, end to end through the real
-    // HTTP surface. Before this fix the measured behaviour was: 200
-    // {"accepted":1}, nothing on disk, service.state ok, sink health ok,
-    // /readyz 200, recent.errors empty -- Vercel never retries, so the data
-    // was gone with no signal anywhere an operator looks.
+  it('refuses a delivery below the spool floor and reports it on every status surface', async () => {
+    // The backpressure decision (spec §4) end to end through the real HTTP
+    // surface, driven by the real `statfs` rather than an injected probe,
+    // because the point is that all of these surfaces are wired together
+    // only on the real boot path.
+    //
+    // Two behaviours preceded this, and this test has to exclude both. The
+    // original: 200 {"accepted":1}, nothing on disk, service.state ok,
+    // /readyz 200, recent.errors empty -- data gone with no signal anywhere.
+    // Then: 200 with the loss reported, which was honest but still
+    // acknowledged a delivery it had not stored. Now the delivery is refused
+    // with a 500, so Vercel keeps it and redelivers, AND the condition is
+    // still reported.
     await writeUnwritableSpoolConfig();
     const booted = await bootService();
 
     try {
-      // Still acknowledged: that is the documented trade, and this test is
-      // about the signals, not the status code.
       const response = await post(booted, [event('dropped-1')]);
-      expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ received: 1, accepted: 1, rejected: 0 });
+      // 500 is what makes Vercel redeliver, and it is pinned here rather
+      // than "any 5xx": a 503 has not been established to behave the same
+      // way at Vercel's end.
+      expect(response.status).toBe(500);
+      expect(await jsonBody<{ code: string }>(response)).toEqual({ code: 'spool_below_floor' });
 
-      // Nothing reached disk.
+      // Nothing reached disk -- so nothing was acknowledged that is not
+      // stored somewhere, which is the claim the whole decision rests on.
       const spooled = (await readdir(join(spoolDir, 'local')).catch(() => [])).filter((f) =>
         f.endsWith('.jsonl'),
       );
@@ -370,11 +379,19 @@ describe('end-to-end durability', () => {
       }>(await booted.app.request('/api/status'));
 
       expect(snapshot.service.state).toBe('degraded');
-      expect(snapshot.sinks.find((sink) => sink.name === 'local')?.counters.dropped).toBe(1);
+      // Nothing was DROPPED: refusing is not shedding, and Vercel still
+      // holds the events. This counter now means only "shed inside a sink's
+      // `maxSpoolBytes` budget".
+      expect(snapshot.sinks.find((sink) => sink.name === 'local')?.counters.dropped).toBe(0);
+      // Two entries, from the two layers that each know something the other
+      // does not: the dispatcher names the sink whose volume it was, the
+      // route reports that the delivery itself was refused.
       const errors = snapshot.recent.errors;
-      expect(errors).toHaveLength(1);
+      expect(errors).toHaveLength(2);
       expect(errors[0]?.scope).toBe('local');
       expect(errors[0]?.message).toContain('free-space floor');
+      expect(errors[1]?.scope).toBe('ingest');
+      expect(errors[1]?.message).toContain('free-space floor');
 
       expect((await booted.app.request('/readyz')).status).toBe(503);
       // Liveness is still unconditional: a full spool volume must not get the

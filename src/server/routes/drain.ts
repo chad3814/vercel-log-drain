@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { verifySignature } from '../../vercel/signature.js';
 import { decodeBody, PayloadTooLargeError } from '../../vercel/decode.js';
+import { SpoolFloorError } from '../../pipeline/spool.js';
 import type { DecodeResult } from '../../vercel/decode.js';
 import type { AppConfig } from '../../config/schema.js';
 import type { Dispatcher } from '../../pipeline/dispatcher.js';
@@ -103,13 +104,34 @@ export function drainRoutes(deps: DrainDeps): Hono<AppEnv> {
         // resolves would turn any in-flight batch into silent loss the
         // moment the process dies, and nothing in the spool's own tests can
         // catch that, because the ordering lives here, not in the spool.
+        //
+        // This catch is also the whole of the backpressure decision at the
+        // HTTP layer (spec §4): a spool volume below its free-space floor,
+        // and a config with no enabled sink, both throw rather than letting
+        // the handler fall through to the 200 below. Nothing is acknowledged
+        // that could not be stored.
         await deps.dispatcher.enqueue(decoded.events);
       } catch (error) {
         const failure = error instanceof Error ? error : new Error(String(error));
-        deps.log.error({ drain: drain.id, err: failure.message }, 'failed to spool batch');
+        // A full volume is called out separately because it is the one
+        // refusal an operator acts on differently -- they free or resize the
+        // volume, and /readyz is already answering 503 for it -- and because
+        // it is expected to repeat for every delivery until they do, so a log
+        // line that reads like an unexpected write failure buries it.
+        const belowFloor = error instanceof SpoolFloorError;
+        deps.log.error(
+          { drain: drain.id, err: failure.message, belowFloor },
+          belowFloor
+            ? 'refused delivery: spool volume is below its free-space floor'
+            : 'failed to spool batch',
+        );
         deps.metrics.recordError('ingest', failure.message);
-        // 500 makes Vercel redeliver. At-least-once is the deliberate trade.
-        return c.json({ code: 'spool_failed' }, 500);
+        // 500, deliberately, not 503: spec §4 and §5 pin 500 as the status
+        // Vercel redelivers on, and nothing here has established that it
+        // treats 503 the same way. At-least-once is the accepted trade -- the
+        // redelivery may duplicate into a sink that already committed this
+        // batch before a later one refused.
+        return c.json({ code: belowFloor ? 'spool_below_floor' : 'spool_failed' }, 500);
       }
 
       const latest = decoded.events.reduce(

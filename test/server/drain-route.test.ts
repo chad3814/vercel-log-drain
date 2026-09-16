@@ -12,7 +12,7 @@ import { drainRoutes } from '../../src/server/routes/drain.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
 import { Metrics } from '../../src/status/metrics.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
-import type { AppConfig } from '../../src/config/schema.js';
+import type { AppConfig, SinkEntry } from '../../src/config/schema.js';
 import type { AppEnv } from '../../src/server/types.js';
 import type { LogEvent } from '../../src/vercel/event.js';
 
@@ -92,13 +92,30 @@ describe('drain route', () => {
     await rm(logsRoot, { recursive: true, force: true });
   });
 
-  function app() {
+  function appFor(target: Dispatcher) {
     const instance = new Hono<AppEnv>();
     instance.route(
       '/api/drain',
-      drainRoutes({ getConfig: () => config, dispatcher, metrics, log: silentLog }),
+      drainRoutes({ getConfig: () => config, dispatcher: target, metrics, log: silentLog }),
     );
     return instance;
+  }
+
+  function app() {
+    return appFor(dispatcher);
+  }
+
+  /** A correctly signed delivery to `drain1`, against a chosen dispatcher. */
+  async function postTo(target: Dispatcher, body: string) {
+    return appFor(target).request('/api/drain/drain1', {
+      method: 'POST',
+      body,
+      headers: { 'x-vercel-signature': sign(body) },
+    });
+  }
+
+  function sinkEntry(name: string, overrides: Partial<SinkEntry> = {}): SinkEntry {
+    return { ...config.sinks[0]!, name, config: { ...config.sinks[0]!.config }, ...overrides };
   }
 
   async function post(path: string, body: string | Buffer, headers: Record<string, string> = {}) {
@@ -256,7 +273,12 @@ describe('drain route', () => {
     expect(await response.json()).toEqual({ received: 1, accepted: 0, rejected: 1 });
   });
 
-  it('routes only matching events to a filtered sink', async () => {
+  it('routes only matching events to a filtered sink, and still answers 200', async () => {
+    // The distinction the backpressure decision must not blur: a sink exists
+    // and can store events, this delivery just holds none its filter wants,
+    // and that is the operator's INTENT. Refusing it would make Vercel
+    // redeliver a batch that matches nothing on every retry, forever. Only
+    // "no enabled sink at all" refuses -- see the test below.
     config = {
       ...config,
       sinks: [{ ...config.sinks[0]!, filter: { minLevel: 'error' } }],
@@ -275,6 +297,89 @@ describe('drain route', () => {
     await post('/api/drain/drain1', body, { 'x-vercel-signature': sign(body) });
     const drain = metrics.snapshot().drains.find((d) => d.id === 'drain1');
     expect(drain?.lastEventAt).toBe(1573817187330);
+  });
+
+  it('returns 500 and spools nothing when the spool volume is below its floor', async () => {
+    // The route layer's only floor coverage, and the layer where the floor
+    // decision is actually observable: the spool refusing is meaningless if
+    // the handler answers 200 anyway. This coverage was lost once already in
+    // this project when a test was narrowed, which is why it is asserted on
+    // the response and on disk rather than on the dispatcher.
+    const floored = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      freeSpace: () => Promise.resolve(0),
+    });
+    config = { ...config, server: { ...config.server, spoolFreeSpaceFloorBytes: 1_000_000 } };
+    await floored.applyConfig(config);
+
+    try {
+      const response = await postTo(floored, JSON.stringify([event('a')]));
+
+      // 500, not 503: spec §4 pins 500 as the status Vercel redelivers on.
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({ code: 'spool_below_floor' });
+      // Refused AND unstored: nothing was acknowledged that is not on disk
+      // somewhere, which is the claim the decision rests on.
+      expect((await floored.snapshotSinks())[0]?.queue.files).toBe(0);
+    } finally {
+      await floored.stop(500);
+    }
+  });
+
+  it('returns 500 when no sink is enabled to store the delivery', async () => {
+    // One step earlier than the floor and the same reasoning: nothing can
+    // store this batch, so answering 200 loses it silently. This path used to
+    // log and return, which did exactly that -- and the first-boot window (a
+    // drain created before any sink) is precisely this state.
+    config = { ...config, sinks: [] };
+    await dispatcher.applyConfig(config);
+
+    const response = await postTo(dispatcher, JSON.stringify([event('a')]));
+
+    expect(response.status).toBe(500);
+    const errors = metrics.snapshot().recent.errors;
+    expect(errors.some((entry) => entry.message.includes('no sink is enabled'))).toBe(true);
+  });
+
+  it('returns 500 when one of several sinks is below the floor, after another took the batch', async () => {
+    // Partial fan-out, accepted rather than worked around. Spools are
+    // written one sink at a time, so 'takes-it' commits before 'refuses-it'
+    // is probed: the response is 500 with the batch already on disk for the
+    // first sink, and Vercel's redelivery will hand it a duplicate. That is
+    // the at-least-once trade the design already makes (spec §5) --
+    // duplicates are recoverable, loss is not. The wrong "fix" is to swallow
+    // the error and answer 200, trading a duplicate in one sink for silent
+    // loss in the other.
+    const mixed = new Dispatcher({
+      spoolRoot,
+      logsRoot,
+      metrics,
+      log: silentLog,
+      // The probe is handed the sink's own spool directory, which is what
+      // lets one look full and the other not.
+      freeSpace: (path: string) => Promise.resolve(path.endsWith('refuses-it') ? 0 : 50_000_000),
+    });
+    config = {
+      ...config,
+      server: { ...config.server, spoolFreeSpaceFloorBytes: 1_000_000 },
+      sinks: [sinkEntry('takes-it'), sinkEntry('refuses-it')],
+    };
+    await mixed.applyConfig(config);
+
+    try {
+      const response = await postTo(mixed, JSON.stringify([event('a')]));
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({ code: 'spool_below_floor' });
+      const statuses = await mixed.snapshotSinks();
+      expect(statuses.find((sink) => sink.name === 'takes-it')?.queue.files).toBe(1);
+      expect(statuses.find((sink) => sink.name === 'refuses-it')?.queue.files).toBe(0);
+    } finally {
+      await mixed.stop(500);
+    }
   });
 
   it('returns 500 when spooling fails, so Vercel retries', async () => {

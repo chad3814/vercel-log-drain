@@ -117,8 +117,8 @@ export function statusRoutes(deps: StatusDeps): Hono<AppEnv> {
  * report not-ready: it answers whether the service can durably persist a
  * delivery right now, not merely whether the process exists. It reports 503
  * for exactly one condition -- `dispatcher.spoolBelowFloor()`, the spool
- * volume below its free-space floor, where acknowledged deliveries are
- * being discarded (spec §4).
+ * volume below its free-space floor, where deliveries are being refused
+ * with a 500 rather than stored (spec §4).
  *
  * Deliberately NARROWER than `isDegraded()`, which also covers a failed
  * sink and a config with no sinks. Spec §10: "readiness must not gate the

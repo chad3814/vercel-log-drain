@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readSpoolDirStats, SpoolQueue } from '../../src/pipeline/spool.js';
+import { readSpoolDirStats, SpoolFloorError, SpoolQueue } from '../../src/pipeline/spool.js';
 
 const BIG = 1_048_576;
 
@@ -165,10 +165,12 @@ describe('SpoolQueue', () => {
     for (let index = 0; index < 8; index += 1) {
       const result = await queue.enqueue([event(`b${String(index)}`)]);
       dropped += result.droppedEvents;
-      // Evicting to stay inside a sink's own budget is not a volume-level
-      // loss, and must not be reported as one: the incoming batch was
-      // written.
-      expect(result.floorDrop).toBeNull();
+      // Evicting to stay inside a sink's own budget is not the volume-level
+      // condition, and must not be reported as one: this resolves rather
+      // than throwing SpoolFloorError, and the incoming batch WAS written.
+      // A bounded buffer per sink still sheds -- only a full volume refuses
+      // (spec §4).
+      expect(result.writtenBytes).toBeGreaterThan(0);
     }
 
     expect(dropped).toBeGreaterThan(0);
@@ -180,22 +182,27 @@ describe('SpoolQueue', () => {
     expect(ids).not.toContain('a1');
   });
 
-  it('drops the whole batch when free space is below the floor', async () => {
+  it('refuses the batch when free space is below the floor', async () => {
     const queue = await SpoolQueue.open(dir, {
       maxSpoolBytes: BIG,
       freeSpaceFloorBytes: 1_000_000,
       freeSpace: () => Promise.resolve(500),
     });
 
-    const result = await queue.enqueue([event('a'), event('b')]);
+    // Backpressure, not shedding (spec §4). It THROWS rather than returning
+    // a "nothing written" result, because a result is something the caller
+    // can ignore -- and ignoring it is exactly how this condition came to
+    // answer Vercel 200 for events that reached no disk anywhere. The
+    // observed free bytes and the floor ride on the error because the
+    // dispatcher's `recent.errors` entry names them.
+    const failure = await queue.enqueue([event('a'), event('b')]).catch((error: unknown) => error);
 
-    expect(result.droppedEvents).toBe(2);
-    expect(result.writtenBytes).toBe(0);
+    expect(failure).toBeInstanceOf(SpoolFloorError);
+    expect(failure).toMatchObject({ freeBytes: 500, floorBytes: 1_000_000 });
     expect(queue.fileCount()).toBe(0);
-    // The caller degrades the service on THIS, not on droppedEvents, which a
-    // routine overflow eviction also moves -- see the assertion in the
-    // overflow test above that floorDrop stays null there.
-    expect(result.floorDrop).toEqual({ freeBytes: 500, floorBytes: 1_000_000 });
+    // And nothing half-written either: no batch file, and no `.tmp` for boot
+    // recovery to sweep. The floor check runs before the first open().
+    expect(await readdir(dir)).toEqual(['dead']);
   });
 
   it('writes normally when free space is above the floor', async () => {

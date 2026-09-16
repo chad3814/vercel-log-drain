@@ -7,6 +7,7 @@ import { Writable } from 'node:stream';
 import { createLogger } from '../../src/log.js';
 import { healthRoutes, statusRoutes } from '../../src/server/routes/status.js';
 import { Dispatcher } from '../../src/pipeline/dispatcher.js';
+import { SpoolFloorError } from '../../src/pipeline/spool.js';
 import { Metrics } from '../../src/status/metrics.js';
 import { defaultAppConfig } from '../../src/config/schema.js';
 import type { AppConfig } from '../../src/config/schema.js';
@@ -317,7 +318,12 @@ describe('status routes', () => {
       // Nothing dropped yet, so the volume has not refused anything.
       expect((await instance.request('/readyz')).status).toBe(200);
 
-      await floored.enqueue([{ id: 'a', timestamp: 1000, source: 'lambda', projectId: 'p1' }]);
+      // The enqueue is REFUSED, not shed (spec §4), so it rejects -- and the
+      // readiness latch is set before the error leaves `enqueue`, which is
+      // the whole point of recording it there rather than at the route.
+      await expect(
+        floored.enqueue([{ id: 'a', timestamp: 1000, source: 'lambda', projectId: 'p1' }]),
+      ).rejects.toThrow(SpoolFloorError);
 
       expect((await instance.request('/readyz')).status).toBe(503);
       // And liveness still says yes: killing the process does not free disk.

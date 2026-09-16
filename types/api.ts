@@ -48,7 +48,7 @@ export type SinkStatus = {
    * nothing removes automatically and that no byte figure used to include,
    * so it could grow without bound -- outside `maxSpoolBytes`, invisible in
    * `queue.bytes` -- until it took the whole spool volume below its
-   * free-space floor and every later delivery was dropped.
+   * free-space floor and ingest stopped for every sink.
    */
   dead: { files: number; bytes: number };
   counters: SinkCounters;
