@@ -767,8 +767,17 @@ to `zlib.gunzipSync`, so the async-over-sync rule is enforced in CI rather than
 in review. `react/react-in-jsx-scope` is disabled because the project uses the
 modern JSX transform. Prettier at two-space indentation with semicolons.
 `tsc --noEmit` over both projects with `strict`, `noUncheckedIndexedAccess`,
-and `exactOptionalPropertyTypes`. GitHub Actions runs lint → typecheck → test →
-build → docker smoke. No image is published.
+and `exactOptionalPropertyTypes`. GitHub Actions runs format → lint → typecheck →
+test → build → docker smoke. Those steps live in one reusable workflow
+(`gate.yml`) that both `ci.yml` and `release.yml` call, so the gate cannot
+drift between the two — a tag push does not match `ci.yml`'s `push.branches`,
+so without that a release could publish an image no test had seen.
+
+Pushing a `v*.*.*` tag publishes a release: the image is built with
+`APP_VERSION` from the tag, smoke-tested as the exact artifact about to ship,
+pushed to `ghcr.io/<owner>/vercel-log-drain` as `:<version>` and `:latest`,
+and a GitHub Release is created. `linux/amd64` only. The workflow refuses to
+run if the tag disagrees with `package.json`'s version.
 
 There is no lint rule banning `unknown`; oxlint has no such rule and neither
 does ESLint. That prohibition is upheld by design — `JsonValue` exists so no

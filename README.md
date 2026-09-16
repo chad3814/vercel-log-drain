@@ -39,21 +39,23 @@ and paste in that secret. Back in the UI, on the **Sinks** tab, add a file
 and/or Loki sink and enable it.
 
 For a fuller example — the service behind a reverse proxy with SSO, plus Loki
-and Grafana — see `docker-compose.example.yml`. **As shipped, that example
-cannot be used to reach the admin UI at all**, for two separate reasons:
+and Grafana — see `docker-compose.example.yml`. It pins a released image
+rather than tracking `:latest`, which is the right default for a deployment:
+following `:latest` means a restart can change the running version without
+anyone choosing to.
 
-1. `examples/Caddyfile` ships with a placeholder password hash
-   (`$2a$14$REPLACE_WITH_YOUR_OWN_BCRYPT_HASH`) that cannot authenticate
-   anyone. Generate a real one and paste it in:
+**One thing must be changed before that example can reach the admin UI:**
+`examples/Caddyfile` ships with a placeholder password hash
+(`$2a$14$REPLACE_WITH_YOUR_OWN_BCRYPT_HASH`) that cannot authenticate anyone.
+Generate a real one and paste it in:
 
-   ```
-   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<a password>'
-   ```
+```
+docker run --rm caddy:2-alpine caddy hash-password --plaintext '<a password>'
+```
 
-2. `AUTH_MODE=proxy` is the mode to deploy with. The `docker run` line above
-   uses `AUTH_MODE=disabled` only because it has no proxy in front of it;
-   that mode leaves the admin API open to anyone who can reach the port, so
-   use it for a local look and nothing else.
+That example uses `AUTH_MODE=proxy`, which is the mode to deploy with. The
+`docker run` line above uses `AUTH_MODE=disabled` only because it has no proxy
+in front of it.
 
 ## Configuring the Vercel side
 

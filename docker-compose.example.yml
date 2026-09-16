@@ -2,10 +2,18 @@
 # Grafana. Copy to docker-compose.yml and adjust before using.
 services:
   drain:
-    build:
-      context: .
-      args:
-        APP_VERSION: '0.1.0'
+    # Pinned to a release rather than :latest, deliberately and unlike the
+    # README's Quick start. That one is for a look around, where tracking
+    # :latest is convenient; this is a deployment example, and a deployment
+    # that follows :latest can change version on any restart without anyone
+    # choosing to. Bump this when you intend to upgrade; releases are listed
+    # at https://github.com/chad3814/vercel-log-drain/releases
+    image: ghcr.io/chad3814/vercel-log-drain:1.0.0
+    # To run your own build instead, comment out `image:` above and use:
+    #   build:
+    #     context: .
+    #     args:
+    #       APP_VERSION: dev
     init: true
     # Boot fails fast (and loudly) on a malformed AUTH_MODE, AUTH_TRUSTED_PROXIES,
     # AUTH_USER_HEADER, RETRY_BASE_MS, or RETRY_MAX_MS, or on an unwritable
